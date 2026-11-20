@@ -108,6 +108,8 @@ export class FulfillmentService {
   public static pollBatchBudget = 50;
   public static pollPageSize = 100;
   public static checkpointBackoffBaseMs = 2000;
+  public static checkpointTransactionMaxAttempts = 4;
+  public static checkpointConflictRetryDelayMs = 25;
   public static workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
@@ -331,6 +333,29 @@ export class FulfillmentService {
     this.checkpointRetryAfterMs = 0;
   }
 
+  private static sanitizeCheckpointForStorage(
+    checkpoint: MyStarsPollCheckpoint,
+  ): MyStarsPollCheckpoint {
+    const clean: MyStarsPollCheckpoint = {
+      key: 'mystars_poll_cursor',
+      cyclesCompleted: checkpoint.cyclesCompleted,
+      lastPolledCount: checkpoint.lastPolledCount,
+      updatedAt: checkpoint.updatedAt,
+    };
+    if (checkpoint.cursorCreatedAt && checkpoint.cursorOrderId) {
+      clean.cursorCreatedAt = checkpoint.cursorCreatedAt;
+      clean.cursorOrderId = checkpoint.cursorOrderId;
+    }
+    if (
+      typeof checkpoint.resetEpoch === 'number' &&
+      Number.isInteger(checkpoint.resetEpoch) &&
+      checkpoint.resetEpoch >= 0
+    ) {
+      clean.resetEpoch = checkpoint.resetEpoch;
+    }
+    return clean;
+  }
+
   private static parseValidPollCheckpoint(raw: unknown): MyStarsPollCheckpoint | null {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       return null;
@@ -345,6 +370,17 @@ export class FulfillmentService {
       obj.cyclesCompleted < 0
     ) {
       return null;
+    }
+    let resetEpoch: number | undefined;
+    if (obj.resetEpoch !== undefined && obj.resetEpoch !== null) {
+      if (
+        typeof obj.resetEpoch !== 'number' ||
+        !Number.isInteger(obj.resetEpoch) ||
+        obj.resetEpoch < 0
+      ) {
+        return null;
+      }
+      resetEpoch = obj.resetEpoch;
     }
     const hasCreatedAt = obj.cursorCreatedAt !== undefined && obj.cursorCreatedAt !== null;
     const hasOrderId = obj.cursorOrderId !== undefined && obj.cursorOrderId !== null;
@@ -377,20 +413,26 @@ export class FulfillmentService {
         ? obj.updatedAt
         : new Date().toISOString();
 
-    return {
+    return this.sanitizeCheckpointForStorage({
       key: 'mystars_poll_cursor',
       cursorCreatedAt,
       cursorOrderId,
       cyclesCompleted: obj.cyclesCompleted,
       lastPolledCount,
       updatedAt,
-    };
+      ...(resetEpoch !== undefined ? { resetEpoch } : {}),
+    });
   }
 
   private static comparePollCheckpoints(
     a: MyStarsPollCheckpoint,
     b: MyStarsPollCheckpoint,
   ): number {
+    if (a.resetEpoch !== undefined && b.resetEpoch !== undefined) {
+      if (a.resetEpoch !== b.resetEpoch) {
+        return a.resetEpoch - b.resetEpoch;
+      }
+    }
     if (a.cyclesCompleted !== b.cyclesCompleted) {
       return a.cyclesCompleted - b.cyclesCompleted;
     }
@@ -415,6 +457,82 @@ export class FulfillmentService {
     return 0;
   }
 
+  private static isRetryableTransactionConflictError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      return false;
+    }
+    const errObj = error as { code?: unknown; message?: unknown };
+    const code = errObj.code;
+    if (code === 10 || code === 'ABORTED' || code === 'aborted') {
+      return true;
+    }
+    const msg =
+      typeof errObj.message === 'string' ? errObj.message.toLowerCase() : '';
+    return (
+      msg.includes('aborted') ||
+      msg.includes('contention') ||
+      msg.includes('transaction conflict') ||
+      msg.includes('optimistic') ||
+      msg.includes('concurrent modification')
+    );
+  }
+
+  private static async runCheckpointTransactionWithRetry<T>(
+    operation: 'load' | 'save',
+    fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0],
+  ): Promise<T> {
+    const maxAttempts = Math.max(1, this.checkpointTransactionMaxAttempts);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await firestoreRepo.runTransaction<T>(fn);
+      } catch (error) {
+        lastError = error;
+        if (
+          this.isRetryableTransactionConflictError(error) &&
+          attempt < maxAttempts
+        ) {
+          const delayMs = Math.max(0, this.checkpointConflictRetryDelayMs) * attempt;
+          console.warn(
+            `[FulfillmentService:MyStarsPolling] Конфликт транзакции Firestore при ${operation === 'load' ? 'восстановлении' : 'записи'} checkpoint (попытка ${attempt}/${maxAttempts}), повтор...`,
+          );
+          if (delayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastError;
+  }
+
+  private static updateLocalConfirmedCheckpoint(
+    effective: MyStarsPollCheckpoint | null,
+    options?: { force?: boolean },
+  ): void {
+    if (!effective) {
+      if (options?.force || !this.lastConfirmedPollCheckpoint) {
+        this.lastConfirmedPollCheckpoint = null;
+      }
+      return;
+    }
+    if (
+      options?.force ||
+      !this.lastConfirmedPollCheckpoint ||
+      this.comparePollCheckpoints(this.lastConfirmedPollCheckpoint, effective) <= 0
+    ) {
+      this.lastConfirmedPollCheckpoint = { ...effective };
+    }
+    if (
+      options?.force ||
+      !this.pendingUnsavedCheckpoint ||
+      this.comparePollCheckpoints(this.pendingUnsavedCheckpoint, effective) <= 0
+    ) {
+      this.pendingUnsavedCheckpoint = null;
+    }
+  }
+
   public static async loadMyStarsPollCheckpoint(): Promise<MyStarsPollCheckpoint | null> {
     try {
       const doc = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
@@ -429,27 +547,63 @@ export class FulfillmentService {
       const valid = this.parseValidPollCheckpoint(doc);
       if (!valid) {
         console.warn(
-          '[FulfillmentService:MyStarsPolling] Обнаружен повреждённый документ checkpoint settings/mystars_poll_cursor — выполняется безопасный сброс курсора.',
+          '[FulfillmentService:MyStarsPolling] Обнаружен повреждённый документ checkpoint settings/mystars_poll_cursor — запускается атомарное восстановление в транзакции.',
         );
-        const sanitized: MyStarsPollCheckpoint = {
-          key: 'mystars_poll_cursor',
-          cursorCreatedAt: undefined,
-          cursorOrderId: undefined,
-          cyclesCompleted: 0,
-          lastPolledCount: 0,
-          updatedAt: new Date().toISOString(),
-        };
-        await firestoreRepo.setDoc<MyStarsPollCheckpoint>(
-          'settings',
-          'mystars_poll_cursor',
-          sanitized,
-        );
-        this.lastConfirmedPollCheckpoint = { ...sanitized };
-        this.pendingUnsavedCheckpoint = null;
+        const repairResult = await this.runCheckpointTransactionWithRetry<{
+          repaired: boolean;
+          checkpoint: MyStarsPollCheckpoint | null;
+        }>('load', async (tx) => {
+          const currentRaw = await tx.get<MyStarsPollCheckpoint>(
+            'settings',
+            'mystars_poll_cursor',
+          );
+          if (currentRaw === null || currentRaw === undefined) {
+            return { repaired: false, checkpoint: null };
+          }
+          const currentValid = this.parseValidPollCheckpoint(currentRaw);
+          if (currentValid) {
+            // Another worker already repaired or advanced the checkpoint — never overwrite it!
+            return { repaired: false, checkpoint: currentValid };
+          }
+          const sanitized = this.sanitizeCheckpointForStorage({
+            key: 'mystars_poll_cursor',
+            cyclesCompleted: 0,
+            lastPolledCount: 0,
+            updatedAt: new Date().toISOString(),
+            resetEpoch: 0,
+          });
+          tx.set<MyStarsPollCheckpoint>(
+            'settings',
+            'mystars_poll_cursor',
+            sanitized,
+          );
+          return { repaired: true, checkpoint: null };
+        });
+
+        if (repairResult.repaired) {
+          const cleanConfirmed = this.sanitizeCheckpointForStorage({
+            key: 'mystars_poll_cursor',
+            cyclesCompleted: 0,
+            lastPolledCount: 0,
+            updatedAt: new Date().toISOString(),
+            resetEpoch: 0,
+          });
+          this.updateLocalConfirmedCheckpoint(cleanConfirmed, { force: true });
+          this.clearCheckpointDegradedState();
+          return null;
+        }
+
+        if (repairResult.checkpoint) {
+          this.updateLocalConfirmedCheckpoint(repairResult.checkpoint);
+          this.clearCheckpointDegradedState();
+          return repairResult.checkpoint;
+        }
+
+        this.lastConfirmedPollCheckpoint = null;
         this.clearCheckpointDegradedState();
         return null;
       }
-      this.lastConfirmedPollCheckpoint = { ...valid };
+      this.updateLocalConfirmedCheckpoint(valid);
       this.clearCheckpointDegradedState();
       return valid;
     } catch (error) {
@@ -459,52 +613,93 @@ export class FulfillmentService {
 
   public static async saveMyStarsPollCheckpoint(
     checkpoint: MyStarsPollCheckpoint,
-    options?: { allowReset?: boolean },
-  ): Promise<void> {
+  ): Promise<MyStarsPollCheckpoint> {
     try {
-      if (!options?.allowReset) {
-        const remoteRaw = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+      const normalizedIncoming = this.parseValidPollCheckpoint(checkpoint);
+      if (!normalizedIncoming) {
+        throw new Error('Попытка сохранить некорректный объект MyStarsPollCheckpoint.');
+      }
+
+      const txOutcome = await this.runCheckpointTransactionWithRetry<{
+        written: boolean;
+        effective: MyStarsPollCheckpoint;
+      }>('save', async (tx) => {
+        const remoteRaw = await tx.get<MyStarsPollCheckpoint>(
           'settings',
           'mystars_poll_cursor',
         );
         const remoteValid = this.parseValidPollCheckpoint(remoteRaw);
-        if (remoteValid && this.comparePollCheckpoints(remoteValid, checkpoint) > 0) {
-          this.lastConfirmedPollCheckpoint = { ...remoteValid };
-          this.pendingUnsavedCheckpoint = null;
-          this.clearCheckpointDegradedState();
-          console.info(
-            `[FulfillmentService:MyStarsPolling] Пропущена запись устаревшего checkpoint (cycle=${checkpoint.cyclesCompleted}, cursor=${checkpoint.cursorOrderId ?? 'none'}): в Firestore уже сохранён более новый (cycle=${remoteValid.cyclesCompleted}, cursor=${remoteValid.cursorOrderId ?? 'none'}).`,
-          );
-          return;
+
+        if (
+          remoteValid &&
+          this.comparePollCheckpoints(remoteValid, normalizedIncoming) > 0
+        ) {
+          return { written: false, effective: remoteValid };
         }
+
+        const toWrite = this.sanitizeCheckpointForStorage({
+          ...normalizedIncoming,
+          ...(normalizedIncoming.resetEpoch === undefined &&
+          remoteValid?.resetEpoch !== undefined
+            ? { resetEpoch: remoteValid.resetEpoch }
+            : {}),
+        });
+        tx.set<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+          toWrite,
+        );
+        return { written: true, effective: toWrite };
+      });
+
+      if (!txOutcome.written) {
+        console.info(
+          `[FulfillmentService:MyStarsPolling] Атомарно пропущена запись устаревшего checkpoint (epoch=${normalizedIncoming.resetEpoch ?? 'legacy'}, cycle=${normalizedIncoming.cyclesCompleted}, cursor=${normalizedIncoming.cursorOrderId ?? 'none'}): в Firestore уже сохранён более новый (epoch=${txOutcome.effective.resetEpoch ?? 'legacy'}, cycle=${txOutcome.effective.cyclesCompleted}, cursor=${txOutcome.effective.cursorOrderId ?? 'none'}).`,
+        );
       }
-      await firestoreRepo.setDoc<MyStarsPollCheckpoint>(
-        'settings',
-        'mystars_poll_cursor',
-        checkpoint,
-      );
-      this.lastConfirmedPollCheckpoint = { ...checkpoint };
-      this.pendingUnsavedCheckpoint = null;
+
+      this.updateLocalConfirmedCheckpoint(txOutcome.effective);
       this.clearCheckpointDegradedState();
+      return txOutcome.effective;
     } catch (error) {
       throw this.recordCheckpointFailure('save', error);
     }
   }
 
-  public static async resetMyStarsPollCheckpoint(): Promise<void> {
+  public static async resetMyStarsPollCheckpoint(): Promise<MyStarsPollCheckpoint> {
     this.pendingUnsavedCheckpoint = null;
     this.checkpointRetryAfterMs = 0;
-    await this.saveMyStarsPollCheckpoint(
-      {
-        key: 'mystars_poll_cursor',
-        cursorCreatedAt: undefined,
-        cursorOrderId: undefined,
-        cyclesCompleted: 0,
-        lastPolledCount: 0,
-        updatedAt: new Date().toISOString(),
-      },
-      { allowReset: true },
-    );
+    try {
+      const resetDoc = await this.runCheckpointTransactionWithRetry<MyStarsPollCheckpoint>(
+        'save',
+        async (tx) => {
+          const remoteRaw = await tx.get<MyStarsPollCheckpoint>(
+            'settings',
+            'mystars_poll_cursor',
+          );
+          const remoteValid = this.parseValidPollCheckpoint(remoteRaw);
+          const nextResetEpoch = (remoteValid?.resetEpoch ?? 0) + 1;
+          const nextCheckpoint = this.sanitizeCheckpointForStorage({
+            key: 'mystars_poll_cursor',
+            cyclesCompleted: 0,
+            lastPolledCount: 0,
+            updatedAt: new Date().toISOString(),
+            resetEpoch: nextResetEpoch,
+          });
+          tx.set<MyStarsPollCheckpoint>(
+            'settings',
+            'mystars_poll_cursor',
+            nextCheckpoint,
+          );
+          return nextCheckpoint;
+        },
+      );
+      this.updateLocalConfirmedCheckpoint(resetDoc, { force: true });
+      this.clearCheckpointDegradedState();
+      return resetDoc;
+    } catch (error) {
+      throw this.recordCheckpointFailure('save', error);
+    }
   }
 
   public static getMyStarsPollingStatus(): {
@@ -2444,6 +2639,7 @@ export class FulfillmentService {
     // Persist cursor checkpoint for multi-page sweeps so next tick & restarts resume fairly.
     // Never advance the confirmed cursor if Firestore save fails; queue pendingUnsavedCheckpoint
     // so subsequent ticks flush it before scanning any new orders (preventing head-of-queue loops).
+    const sweepResetEpoch = checkpoint?.resetEpoch ?? 0;
     let checkpointToPersist: MyStarsPollCheckpoint | null = null;
     if (isMultiPageSweep) {
       if (interruptedByRateLimit) {
@@ -2455,6 +2651,7 @@ export class FulfillmentService {
             cyclesCompleted: lastCompletedOrderInSweep.cycle,
             lastPolledCount: summary.polled,
             updatedAt: new Date().toISOString(),
+            resetEpoch: sweepResetEpoch,
           };
         }
         // If the very first order in batchToPoll hit HTTP 429, keep the previous checkpoint
@@ -2474,6 +2671,7 @@ export class FulfillmentService {
           cyclesCompleted,
           lastPolledCount: summary.polled,
           updatedAt: new Date().toISOString(),
+          resetEpoch: sweepResetEpoch,
         };
       }
     } else if (checkpoint?.cursorOrderId && !interruptedByRateLimit) {
@@ -2484,6 +2682,7 @@ export class FulfillmentService {
         cyclesCompleted: cyclesCompleted + 1,
         lastPolledCount: summary.polled,
         updatedAt: new Date().toISOString(),
+        resetEpoch: sweepResetEpoch,
       };
     }
 
@@ -2496,7 +2695,15 @@ export class FulfillmentService {
         const msg = redactSecretsFromText(
           error instanceof Error ? error.message : String(error),
         );
-        this.pendingUnsavedCheckpoint = checkpointToPersist;
+        if (
+          !this.pendingUnsavedCheckpoint ||
+          this.comparePollCheckpoints(
+            this.pendingUnsavedCheckpoint,
+            checkpointToPersist,
+          ) <= 0
+        ) {
+          this.pendingUnsavedCheckpoint = checkpointToPersist;
+        }
         summary.checkpointSaved = false;
         summary.checkpointDegraded = true;
         summary.checkpointError = msg;

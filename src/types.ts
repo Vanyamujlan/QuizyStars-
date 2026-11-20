@@ -354,6 +354,8 @@ export interface MyStarsPollCheckpoint {
   cyclesCompleted: number;
   lastPolledCount: number;
   updatedAt: string;
+  /** Monotonic administrative reset generation; prevents pre-reset in-flight workers from undoing a reset. */
+  resetEpoch?: number;
 }
 
 export interface PaymentRecord {

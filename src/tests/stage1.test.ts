@@ -6,6 +6,8 @@ import type { Request, Response } from 'express';
 import {
   firestoreRepo,
   StorageUnavailableError,
+  type RepoTransaction,
+  type StoreCollectionName,
 } from '../db/firestore.ts';
 import {
   OrderService,
@@ -136,7 +138,14 @@ import {
   validateMyStarsQuantity,
   validateMyStarsUsername,
 } from '../services/MyStarsService.ts';
-import type { Order, PaymentRecord, Product, StoreTransaction, StoreUser } from '../types.ts';
+import type {
+  MyStarsPollCheckpoint,
+  Order,
+  PaymentRecord,
+  Product,
+  StoreTransaction,
+  StoreUser,
+} from '../types.ts';
 
 // Force isolated test environment so production Firestore and .data/ are NEVER touched
 process.env.NODE_ENV = 'test';
@@ -10290,6 +10299,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       const prevWorkerId = FulfillmentService.workerInstanceId;
       const origGetDoc = firestoreRepo.getDoc.bind(firestoreRepo);
       const origSetDoc = firestoreRepo.setDoc.bind(firestoreRepo);
+      const origRunTransaction = firestoreRepo.runTransaction.bind(firestoreRepo);
 
       let failCheckpointRead = false;
       let failCheckpointWrite = false;
@@ -10307,6 +10317,28 @@ async function runFullAuditTestSuite(): Promise<void> {
         }
         return origSetDoc<T>(collection as never, docId, data);
       }) as typeof firestoreRepo.setDoc;
+
+      firestoreRepo.runTransaction = (async <R>(
+        updateFn: (tx: RepoTransaction) => Promise<R>,
+      ): Promise<R> => {
+        return origRunTransaction(async (tx) => {
+          const wrappedTx: RepoTransaction = {
+            get: async <T>(collection: StoreCollectionName, docId: string): Promise<T | null> => {
+              if (collection === 'settings' && docId === 'mystars_poll_cursor' && failCheckpointRead) {
+                throw new Error('Simulated Firestore UNAVAILABLE on checkpoint read');
+              }
+              return tx.get<T>(collection, docId);
+            },
+            set: <T extends object>(collection: StoreCollectionName, docId: string, data: T): void => {
+              if (collection === 'settings' && docId === 'mystars_poll_cursor' && failCheckpointWrite) {
+                throw new Error('Simulated Firestore DEADLINE_EXCEEDED on checkpoint write');
+              }
+              tx.set<T>(collection, docId, data);
+            },
+          };
+          return updateFn(wrappedTx);
+        });
+      }) as typeof firestoreRepo.runTransaction;
 
       try {
         FulfillmentService.resetAdapterToDefault();
@@ -10454,6 +10486,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       } finally {
         firestoreRepo.getDoc = origGetDoc;
         firestoreRepo.setDoc = origSetDoc;
+        firestoreRepo.runTransaction = origRunTransaction;
         FulfillmentService.pollBatchBudget = prevBudget;
         FulfillmentService.pollPageSize = prevPageSize;
         FulfillmentService.checkpointBackoffBaseMs = prevBackoff;
@@ -10528,6 +10561,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       const prevPageSize = FulfillmentService.pollPageSize;
       const prevBackoff = FulfillmentService.checkpointBackoffBaseMs;
       const origSetDoc = firestoreRepo.setDoc.bind(firestoreRepo);
+      const origRunTransaction = firestoreRepo.runTransaction.bind(firestoreRepo);
       let failCheckpointWrite = false;
 
       firestoreRepo.setDoc = (async <T extends object>(collection: string, docId: string, data: T): Promise<void> => {
@@ -10536,6 +10570,23 @@ async function runFullAuditTestSuite(): Promise<void> {
         }
         return origSetDoc<T>(collection as never, docId, data);
       }) as typeof firestoreRepo.setDoc;
+
+      firestoreRepo.runTransaction = (async <R>(
+        updateFn: (tx: RepoTransaction) => Promise<R>,
+      ): Promise<R> => {
+        return origRunTransaction(async (tx) => {
+          const wrappedTx: RepoTransaction = {
+            get: <T>(collection: StoreCollectionName, docId: string) => tx.get<T>(collection, docId),
+            set: <T extends object>(collection: StoreCollectionName, docId: string, data: T): void => {
+              if (collection === 'settings' && docId === 'mystars_poll_cursor' && failCheckpointWrite) {
+                throw new Error('Simulated Worker-A checkpoint write failure');
+              }
+              tx.set<T>(collection, docId, data);
+            },
+          };
+          return updateFn(wrappedTx);
+        });
+      }) as typeof firestoreRepo.runTransaction;
 
       try {
         FulfillmentService.resetAdapterToDefault();
@@ -10674,6 +10725,7 @@ async function runFullAuditTestSuite(): Promise<void> {
         assert.equal(polledThisTick[0], 'ms_s444_001');
       } finally {
         firestoreRepo.setDoc = origSetDoc;
+        firestoreRepo.runTransaction = origRunTransaction;
         FulfillmentService.pollBatchBudget = prevBudget;
         FulfillmentService.pollPageSize = prevPageSize;
         FulfillmentService.checkpointBackoffBaseMs = prevBackoff;
@@ -10895,6 +10947,687 @@ async function runFullAuditTestSuite(): Promise<void> {
       }
 
       return 'Конкурентная доставка partial_sent, смена ADMIN_IDS, краш с сохранением recipientDeliveries, защита sent от пустого ADMIN_IDS и RBAC админ-колбэков подтверждены.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 4.5 — ATOMIC CHECKPOINT & MULTI-WORKER INTEGRITY TESTS
+  // =========================================================================
+
+  await runTest(
+    'S450-01',
+    'Database',
+    'Stage 4.5: Конкурентная запись checkpoint двумя workers (разные курсоры, смена цикла, tie-breaker по orderId и старый pending checkpoint Worker A после записи Worker B)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevMaxAttempts = FulfillmentService.checkpointTransactionMaxAttempts;
+      const prevRetryDelay = FulfillmentService.checkpointConflictRetryDelayMs;
+      const prevBackoff = FulfillmentService.checkpointBackoffBaseMs;
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+      const origRunTransaction = firestoreRepo.runTransaction.bind(firestoreRepo);
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.checkpointBackoffBaseMs = 0;
+        FulfillmentService.checkpointConflictRetryDelayMs = 1;
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 3_600_000;
+        const makeCkpt = (
+          orderNum: number | null,
+          cyclesCompleted: number,
+          resetEpoch = 1,
+          sameTimestampOffsetMs?: number,
+        ): MyStarsPollCheckpoint => ({
+          key: 'mystars_poll_cursor',
+          ...(orderNum !== null
+            ? {
+                cursorCreatedAt: new Date(
+                  baseMs + (sameTimestampOffsetMs ?? orderNum * 1000),
+                ).toISOString(),
+                cursorOrderId: `ord_s450_${String(orderNum).padStart(3, '0')}`,
+              }
+            : {}),
+          cyclesCompleted,
+          lastPolledCount: 10,
+          updatedAt: new Date().toISOString(),
+          resetEpoch,
+        });
+
+        // 1a. Worker A (#020) и Worker B (#050) одновременно сохраняют разные курсоры -> в Firestore строго #050
+        await Promise.all([
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(20, 0, 1)),
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(50, 0, 1)),
+        ]);
+        const stored1 = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(
+          stored1?.cursorOrderId,
+          'ord_s450_050',
+          'При конкурентной записи #020 и #050 в Firestore обязан победить #050',
+        );
+        assert.equal(
+          FulfillmentService.getMyStarsPollingStatus().lastConfirmedCursorOrderId,
+          'ord_s450_050',
+        );
+
+        // 1b. Обратный порядок (#080 vs #030) с искусственной задержкой внутри транзакции -> в Firestore строго #080
+        await Promise.all([
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(80, 0, 1)),
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(30, 0, 1)),
+        ]);
+        const stored2 = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(
+          stored2?.cursorOrderId,
+          'ord_s450_080',
+          'Обратный конкурентный порядок не должен откатывать #080 к #030',
+        );
+
+        // 1c. Одинаковый createdAt, разный cursorOrderId (#085 vs #082) -> tie-breaker по cursorOrderId побеждает #085
+        await Promise.all([
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(82, 0, 1, 90_000)),
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(85, 0, 1, 90_000)),
+        ]);
+        const storedTie = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(storedTie?.cursorOrderId, 'ord_s450_085');
+
+        // 1d. Завершение цикла (cyclesCompleted=1, без курсора) vs старый курсор (cyclesCompleted=0, #099) -> побеждает cycle=1
+        await Promise.all([
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(99, 0, 1)),
+          FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(null, 1, 1)),
+        ]);
+        const storedWrap = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(storedWrap?.cyclesCompleted, 1);
+        assert.equal(storedWrap?.cursorOrderId, undefined);
+        assert.equal(storedWrap?.cursorCreatedAt, undefined);
+
+        // 2. Worker A пытается дозаписать старый pendingUnsavedCheckpoint после записи Worker B (полный цикл pollMyStarsOrders)
+        const buyer = { id: 450001, username: 's450_buyer', first_name: 'Buyer450' };
+        await UserService.upsertFromTelegram(buyer);
+        const mockBot = createMockBot([]);
+        let polledThisTick: string[] = [];
+
+        myStarsClient.setCredentialsOverride({
+          apiBaseUrl: 'https://api.mystars.tg',
+          apiKey: 'ms_live_s450_key',
+          paymentCurrency: 'usdt_ton',
+        });
+        const prevRetries = myStarsClient.maxTransientGetRetries;
+        myStarsClient.maxTransientGetRetries = 0;
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+          if (req.method === 'GET' && match) {
+            const extId = decodeURIComponent(match[1]);
+            polledThisTick.push(extId);
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                order_id: extId,
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's450_buyer',
+                quantity: 100,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected URL in S450-01: ${req.method} ${req.url}`);
+        });
+
+        try {
+          FulfillmentService.pollBatchBudget = 10;
+          FulfillmentService.pollPageSize = 15;
+          const resetDoc = await FulfillmentService.resetMyStarsPollCheckpoint();
+          const currentEpoch = resetDoc.resetEpoch!;
+
+          for (let i = 1; i <= 50; i++) {
+            const ordId = `ord_s450p_${String(i).padStart(3, '0')}`;
+            await firestoreRepo.setDoc<Order>('orders', ordId, {
+              orderId: ordId,
+              userId: `tg_${buyer.id}`,
+              userTelegramId: buyer.id,
+              username: buyer.username,
+              recipientUsername: buyer.username,
+              productId: 'stars_custom',
+              productName: 'Telegram Stars',
+              category: 'stars',
+              quantity: 100,
+              totalPriceUsdCents: 200,
+              totalPrice: 200,
+              currency: 'USD',
+              paymentMethod: 'balance',
+              paymentStatus: 'paid',
+              fulfillmentStatus: 'processing',
+              mystarsOrderId: `ms_s450p_${String(i).padStart(3, '0')}`,
+              mystarsOrderStatus: 'awaiting_payment',
+              createdAt: new Date(baseMs + i * 1000).toISOString(),
+              updatedAt: new Date(baseMs + i * 1000).toISOString(),
+            });
+          }
+
+          // Тик 1: успешно доходит до #010
+          polledThisTick = [];
+          const t1 = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(t1.checkpointSaved, true);
+          assert.equal(
+            (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+            'ord_s450p_010',
+          );
+
+          // Тик 2 (Worker A): опрашивает #011..#020, но транзакция сохранения checkpoint падает
+          let failWorkerATx = true;
+          firestoreRepo.runTransaction = (async <R>(
+            updateFn: (tx: RepoTransaction) => Promise<R>,
+          ): Promise<R> => {
+            return origRunTransaction(async (tx) => {
+              const wrappedTx: RepoTransaction = {
+                get: <T>(c: StoreCollectionName, id: string) => tx.get<T>(c, id),
+                set: <T extends object>(c: StoreCollectionName, id: string, data: T): void => {
+                  if (c === 'settings' && id === 'mystars_poll_cursor' && failWorkerATx) {
+                    throw new Error('Simulated Worker-A Firestore transaction error');
+                  }
+                  tx.set<T>(c, id, data);
+                },
+              };
+              return updateFn(wrappedTx);
+            });
+          }) as typeof firestoreRepo.runTransaction;
+
+          polledThisTick = [];
+          const t2Fail = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(t2Fail.checkpointSaved, false);
+          assert.equal(t2Fail.checkpointDegraded, true);
+          assert.equal(FulfillmentService.getMyStarsPollingStatus().hasPendingUnsavedCheckpoint, true);
+          assert.equal(
+            (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+            'ord_s450p_010',
+            'После ошибки транзакции Worker A в Firestore обязан остаться #010',
+          );
+
+          // Worker B (через реальную транзакцию) продвигает Firestore до #035
+          failWorkerATx = false;
+          const ord35 = (await OrderService.getOrderById('ord_s450p_035'))!;
+          await origRunTransaction(async (tx) => {
+            tx.set<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor', {
+              key: 'mystars_poll_cursor',
+              cursorCreatedAt: ord35.createdAt,
+              cursorOrderId: ord35.orderId,
+              cyclesCompleted: 0,
+              lastPolledCount: 10,
+              updatedAt: new Date().toISOString(),
+              resetEpoch: currentEpoch,
+            });
+          });
+
+          // Worker A восстанавливается, сбрасывает старый pending (#020) и НЕ откатывает #035 -> опрашивает #036..#045!
+          polledThisTick = [];
+          const t3Recover = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(t3Recover.checkpointSaved, true);
+          assert.equal(t3Recover.checkpointDegraded, false);
+          assert.equal(FulfillmentService.getMyStarsPollingStatus().hasPendingUnsavedCheckpoint, false);
+          assert.equal(polledThisTick[0], 'ms_s450p_036');
+          assert.equal(
+            (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+            'ord_s450p_045',
+            'Конечное состояние Firestore обязано продвинуться от #035 к #045 без отката к #020',
+          );
+        } finally {
+          myStarsClient.maxTransientGetRetries = prevRetries;
+          myStarsClient.resetHttpTransport();
+          myStarsClient.setCredentialsOverride(null);
+        }
+      } finally {
+        firestoreRepo.runTransaction = origRunTransaction;
+        FulfillmentService.checkpointTransactionMaxAttempts = prevMaxAttempts;
+        FulfillmentService.checkpointConflictRetryDelayMs = prevRetryDelay;
+        FulfillmentService.checkpointBackoffBaseMs = prevBackoff;
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Атомарная монотонность checkpoint при конкурентной записи и сбросе старого pending подтверждена по конечному состоянию Firestore.';
+    },
+  );
+
+  await runTest(
+    'S450-02',
+    'Database',
+    'Stage 4.5: Атомарное восстановление повреждённого checkpoint двумя workers и конкурентный reset vs сохранение checkpoint',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const origGetDoc = firestoreRepo.getDoc.bind(firestoreRepo);
+      const prevRetryDelay = FulfillmentService.checkpointConflictRetryDelayMs;
+
+      try {
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.checkpointConflictRetryDelayMs = 1;
+
+        // 1. Два worker одновременно обнаруживают повреждённый документ -> атомарный ремонт без ошибок и гонок
+        await firestoreRepo.setDoc('settings', 'mystars_poll_cursor', {
+          key: 'mystars_poll_cursor',
+          cyclesCompleted: 'corrupted_value',
+          cursorOrderId: 'ord_broken',
+        });
+        const [loadA, loadB] = await Promise.all([
+          FulfillmentService.loadMyStarsPollCheckpoint(),
+          FulfillmentService.loadMyStarsPollCheckpoint(),
+        ]);
+        // Первый возвращает null (выполнил ремонт), второй видит уже отремонтированный валидный документ (cyclesCompleted=0, без курсора)
+        assert.equal(loadA === null || loadB === null, true);
+        const afterDualRepair = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(afterDualRepair?.key, 'mystars_poll_cursor');
+        assert.equal(afterDualRepair?.cyclesCompleted, 0);
+        assert.equal(afterDualRepair?.cursorOrderId, undefined);
+        assert.equal(afterDualRepair?.cursorCreatedAt, undefined);
+
+        // 2. Гонка: Worker A прочитал повреждённый документ, но до входа в repair-транзакцию
+        // Worker B успел сохранить валидный checkpoint #030 -> Worker A НЕ перезаписывает #030!
+        await firestoreRepo.setDoc('settings', 'mystars_poll_cursor', {
+          key: 'mystars_poll_cursor',
+          cyclesCompleted: -7,
+          cursorCreatedAt: 'invalid-iso',
+          cursorOrderId: 'ord_corrupt',
+        });
+
+        const validB: MyStarsPollCheckpoint = {
+          key: 'mystars_poll_cursor',
+          cursorCreatedAt: new Date(Date.now() - 60_000).toISOString(),
+          cursorOrderId: 'ord_s450_valid_030',
+          cyclesCompleted: 0,
+          lastPolledCount: 15,
+          updatedAt: new Date().toISOString(),
+          resetEpoch: 0,
+        };
+
+        let injectedConcurrentValidWrite = false;
+        firestoreRepo.getDoc = (async <T>(collection: string, docId: string): Promise<T | null> => {
+          const res = await origGetDoc<T>(collection as never, docId);
+          if (
+            collection === 'settings' &&
+            docId === 'mystars_poll_cursor' &&
+            !injectedConcurrentValidWrite
+          ) {
+            injectedConcurrentValidWrite = true;
+            // Имитируем параллельного Worker B, который прямо сейчас сохранил валидный checkpoint #030
+            await FulfillmentService.saveMyStarsPollCheckpoint(validB);
+          }
+          return res;
+        }) as typeof firestoreRepo.getDoc;
+
+        const loadedAfterRace = await FulfillmentService.loadMyStarsPollCheckpoint();
+        firestoreRepo.getDoc = origGetDoc;
+
+        assert.equal(
+          loadedAfterRace?.cursorOrderId,
+          'ord_s450_valid_030',
+          'Worker A обязан увидеть валидный #030 внутри транзакции ремонта и вернуть его без перезаписи',
+        );
+        const persistedAfterRace = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(
+          persistedAfterRace?.cursorOrderId,
+          'ord_s450_valid_030',
+          'Восстановление повреждённого документа одним worker НЕ должно перезаписывать валидный checkpoint другого worker',
+        );
+
+        // 3. Конкурентный reset vs сохранение checkpoint:
+        // 3a. Worker B стартовал ДО reset (resetEpoch=0, cycle=3, cursor=#090), а Admin выполнил reset (resetEpoch -> 1).
+        // Попытка Worker B сохранить устаревший pre-reset checkpoint обязана быть отклонена!
+        const beforeResetEpoch = persistedAfterRace?.resetEpoch ?? 0;
+        const stalePreResetCkpt: MyStarsPollCheckpoint = {
+          key: 'mystars_poll_cursor',
+          cursorCreatedAt: new Date(Date.now() - 10_000).toISOString(),
+          cursorOrderId: 'ord_s450_stale_090',
+          cyclesCompleted: 3,
+          lastPolledCount: 25,
+          updatedAt: new Date().toISOString(),
+          resetEpoch: beforeResetEpoch,
+        };
+
+        // Запускаем reset и stale-save конкурентно в обоих порядках
+        await Promise.all([
+          FulfillmentService.resetMyStarsPollCheckpoint(),
+          FulfillmentService.saveMyStarsPollCheckpoint(stalePreResetCkpt),
+        ]);
+        const afterConcurrentReset1 = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(afterConcurrentReset1?.resetEpoch, beforeResetEpoch + 1);
+        assert.equal(afterConcurrentReset1?.cyclesCompleted, 0);
+        assert.equal(
+          afterConcurrentReset1?.cursorOrderId,
+          undefined,
+          'Pre-reset checkpoint со старым resetEpoch не может отменить явный административный reset',
+        );
+
+        // Повторная попытка stale-save ПОСЛЕ reset тоже отклоняется
+        await FulfillmentService.saveMyStarsPollCheckpoint(stalePreResetCkpt);
+        const afterLateStaleSave = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(afterLateStaleSave?.resetEpoch, beforeResetEpoch + 1);
+        assert.equal(afterLateStaleSave?.cyclesCompleted, 0);
+        assert.equal(afterLateStaleSave?.cursorOrderId, undefined);
+
+        // 3b. Новый checkpoint ПОСЛЕ reset (с актуальным resetEpoch) сохраняется успешно,
+        // а обычная запись с нулевым курсором НЕ может случайно сбросить его назад
+        const postResetNewCkpt: MyStarsPollCheckpoint = {
+          key: 'mystars_poll_cursor',
+          cursorCreatedAt: new Date(Date.now() - 5_000).toISOString(),
+          cursorOrderId: 'ord_s450_post_reset_010',
+          cyclesCompleted: 0,
+          lastPolledCount: 10,
+          updatedAt: new Date().toISOString(),
+          resetEpoch: afterLateStaleSave!.resetEpoch,
+        };
+        await FulfillmentService.saveMyStarsPollCheckpoint(postResetNewCkpt);
+        const afterPostResetSave = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(afterPostResetSave?.cursorOrderId, 'ord_s450_post_reset_010');
+
+        // Попытка обычной saveMyStarsPollCheckpoint записать «пустой» checkpoint в ту же эпоху не должна сбрасывать курсор
+        await FulfillmentService.saveMyStarsPollCheckpoint({
+          key: 'mystars_poll_cursor',
+          cyclesCompleted: 0,
+          lastPolledCount: 0,
+          updatedAt: new Date().toISOString(),
+          resetEpoch: afterLateStaleSave!.resetEpoch,
+        });
+        const stillPostReset = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        assert.equal(
+          stillPostReset?.cursorOrderId,
+          'ord_s450_post_reset_010',
+          'Обычный saveMyStarsPollCheckpoint не должен позволять случайный сброс курсора',
+        );
+      } finally {
+        firestoreRepo.getDoc = origGetDoc;
+        FulfillmentService.checkpointConflictRetryDelayMs = prevRetryDelay;
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Атомарный ремонт повреждённого checkpoint (без перезаписи валидного курсора другого worker) и изоляция административного reset через resetEpoch подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S450-03',
+    'Database',
+    'Stage 4.5: Конфликт транзакции Firestore (ABORTED + retry), исчерпание попыток без ложного подтверждения, backoff и рестарт процесса',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const origRunTransaction = firestoreRepo.runTransaction.bind(firestoreRepo);
+      const prevMaxAttempts = FulfillmentService.checkpointTransactionMaxAttempts;
+      const prevRetryDelay = FulfillmentService.checkpointConflictRetryDelayMs;
+      const prevBackoff = FulfillmentService.checkpointBackoffBaseMs;
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.checkpointTransactionMaxAttempts = 4;
+        FulfillmentService.checkpointConflictRetryDelayMs = 1;
+        FulfillmentService.checkpointBackoffBaseMs = 0;
+
+        const baseMs = Date.now() - 3_600_000;
+        const resetDoc = await FulfillmentService.resetMyStarsPollCheckpoint();
+        const epoch = resetDoc.resetEpoch!;
+
+        const makeCkpt = (num: number): MyStarsPollCheckpoint => ({
+          key: 'mystars_poll_cursor',
+          cursorCreatedAt: new Date(baseMs + num * 1000).toISOString(),
+          cursorOrderId: `ord_s450tx_${String(num).padStart(3, '0')}`,
+          cyclesCompleted: 0,
+          lastPolledCount: 10,
+          updatedAt: new Date().toISOString(),
+          resetEpoch: epoch,
+        });
+
+        // 1. Конфликт транзакции Firestore (2 раза ABORTED/contention, на 3-й раз успех):
+        // Во время 1-го конфликта другой worker успевает зафиксировать #020.
+        // 1a. Наш worker сохраняет #040 (> #020) -> после retry в Firestore #040!
+        let conflictAttempts = 0;
+        let conflictsRemaining = 2;
+        let workerBInjected = false;
+
+        firestoreRepo.runTransaction = (async <R>(
+          updateFn: (tx: RepoTransaction) => Promise<R>,
+        ): Promise<R> => {
+          conflictAttempts += 1;
+          if (conflictsRemaining > 0) {
+            conflictsRemaining -= 1;
+            if (!workerBInjected) {
+              workerBInjected = true;
+              await origRunTransaction(async (innerTx) => {
+                innerTx.set<MyStarsPollCheckpoint>(
+                  'settings',
+                  'mystars_poll_cursor',
+                  makeCkpt(20),
+                );
+              });
+            }
+            const conflictErr = new Error('10 ABORTED: Cross-transaction contention on settings/mystars_poll_cursor') as Error & { code?: number };
+            conflictErr.code = 10;
+            throw conflictErr;
+          }
+          return origRunTransaction(updateFn);
+        }) as typeof firestoreRepo.runTransaction;
+
+        const savedAfterRetry = await FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(40));
+        assert.equal(conflictAttempts, 3, 'Транзакция должна автоматически повториться после 2 конфликтов ABORTED');
+        assert.equal(savedAfterRetry.cursorOrderId, 'ord_s450tx_040');
+        assert.equal(
+          (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+          'ord_s450tx_040',
+        );
+
+        // 1b. Конфликт при попытке записать более старый #015 (пока в Firestore уже #040) -> retry видит #040 и НЕ откатывает!
+        conflictAttempts = 0;
+        conflictsRemaining = 1;
+        const keptAfterRetry = await FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(15));
+        assert.equal(conflictAttempts, 2);
+        assert.equal(keptAfterRetry.cursorOrderId, 'ord_s450tx_040');
+        assert.equal(
+          (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+          'ord_s450tx_040',
+        );
+
+        // 2. Исчерпание всех попыток конфликта транзакции -> явная ошибка, НЕТ ложного подтверждения, Firestore не изменён
+        conflictAttempts = 0;
+        conflictsRemaining = 10;
+        await assert.rejects(
+          () => FulfillmentService.saveMyStarsPollCheckpoint(makeCkpt(60)),
+          (err: unknown) => err instanceof MyStarsCheckpointError && err.operation === 'save',
+        );
+        assert.equal(
+          conflictAttempts,
+          FulfillmentService.checkpointTransactionMaxAttempts,
+          'Должно выполняться ровно checkpointTransactionMaxAttempts попыток при непрекращающемся конфликте',
+        );
+        assert.equal(FulfillmentService.getMyStarsPollingStatus().checkpointDegraded, true);
+        assert.equal(
+          FulfillmentService.getMyStarsPollingStatus().lastConfirmedCursorOrderId,
+          'ord_s450tx_040',
+          'lastConfirmedCursorOrderId НЕ должен ложно обновляться до #060 при ошибке транзакции',
+        );
+        assert.equal(
+          (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+          'ord_s450tx_040',
+          'Документ в Firestore обязан остаться на #040 после провала транзакции',
+        );
+
+        // 3. Проверка backoff + рестарт процесса после ошибки транзакции в pollMyStarsOrders
+        firestoreRepo.runTransaction = origRunTransaction;
+        const buyer = { id: 450003, username: 's450_tx_buyer', first_name: 'Buyer450Tx' };
+        await UserService.upsertFromTelegram(buyer);
+        const mockBot = createMockBot([]);
+        let polledThisTick: string[] = [];
+
+        myStarsClient.setCredentialsOverride({
+          apiBaseUrl: 'https://api.mystars.tg',
+          apiKey: 'ms_live_s450tx_key',
+          paymentCurrency: 'usdt_ton',
+        });
+        const prevRetries = myStarsClient.maxTransientGetRetries;
+        myStarsClient.maxTransientGetRetries = 0;
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+          if (req.method === 'GET' && match) {
+            const extId = decodeURIComponent(match[1]);
+            polledThisTick.push(extId);
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                order_id: extId,
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's450_tx_buyer',
+                quantity: 100,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected URL in S450-03: ${req.method} ${req.url}`);
+        });
+
+        try {
+          FulfillmentService.resetMyStarsPollingState();
+          FulfillmentService.pollBatchBudget = 5;
+          FulfillmentService.pollPageSize = 10;
+          FulfillmentService.checkpointBackoffBaseMs = 5_000;
+          await FulfillmentService.resetMyStarsPollCheckpoint();
+
+          for (let i = 1; i <= 20; i++) {
+            const ordId = `ord_s450b_${String(i).padStart(3, '0')}`;
+            await firestoreRepo.setDoc<Order>('orders', ordId, {
+              orderId: ordId,
+              userId: `tg_${buyer.id}`,
+              userTelegramId: buyer.id,
+              username: buyer.username,
+              recipientUsername: buyer.username,
+              productId: 'stars_custom',
+              productName: 'Telegram Stars',
+              category: 'stars',
+              quantity: 100,
+              totalPriceUsdCents: 200,
+              totalPrice: 200,
+              currency: 'USD',
+              paymentMethod: 'balance',
+              paymentStatus: 'paid',
+              fulfillmentStatus: 'processing',
+              mystarsOrderId: `ms_s450b_${String(i).padStart(3, '0')}`,
+              mystarsOrderStatus: 'awaiting_payment',
+              createdAt: new Date(baseMs + i * 1000).toISOString(),
+              updatedAt: new Date(baseMs + i * 1000).toISOString(),
+            });
+          }
+
+          // Тик 1 успешен (#001..#005 -> checkpoint=#005)
+          polledThisTick = [];
+          const tOk = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(tOk.checkpointSaved, true);
+          assert.equal(
+            (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+            'ord_s450b_005',
+          );
+
+          // Тик 2: не-конфликтная ошибка транзакции на записи #010 -> ставится backoff и pendingUnsavedCheckpoint
+          let failTxNonRetryable = true;
+          firestoreRepo.runTransaction = (async <R>(
+            updateFn: (tx: RepoTransaction) => Promise<R>,
+          ): Promise<R> => {
+            return origRunTransaction(async (tx) => {
+              const wrappedTx: RepoTransaction = {
+                get: <T>(c: StoreCollectionName, id: string) => tx.get<T>(c, id),
+                set: <T extends object>(c: StoreCollectionName, id: string, data: T): void => {
+                  if (c === 'settings' && id === 'mystars_poll_cursor' && failTxNonRetryable) {
+                    throw new Error('4 DEADLINE_EXCEEDED: Firestore commit timed out');
+                  }
+                  tx.set<T>(c, id, data);
+                },
+              };
+              return updateFn(wrappedTx);
+            });
+          }) as typeof firestoreRepo.runTransaction;
+
+          polledThisTick = [];
+          const tFail = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(tFail.checkpointSaved, false);
+          assert.equal(tFail.checkpointDegraded, true);
+          assert.equal(FulfillmentService.getMyStarsPollingStatus().hasPendingUnsavedCheckpoint, true);
+          assert.equal(
+            (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+            'ord_s450b_005',
+          );
+
+          // Во время активного backoff тик пропускается без повторного опроса очереди
+          polledThisTick = [];
+          const tBackoff = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(tBackoff.deferredByCooldown, true);
+          assert.equal(tBackoff.polled, 0);
+          assert.equal(polledThisTick.length, 0);
+
+          // Рестарт процесса + восстановление Firestore: продолжает с подтверждённого #005 -> опрашивает #006..#010!
+          failTxNonRetryable = false;
+          FulfillmentService.resetMyStarsPollingState();
+          polledThisTick = [];
+          const tRestart = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(tRestart.checkpointSaved, true);
+          assert.equal(tRestart.checkpointDegraded, false);
+          assert.equal(polledThisTick[0], 'ms_s450b_006');
+          assert.equal(polledThisTick[4], 'ms_s450b_010');
+          assert.equal(
+            (await firestoreRepo.getDoc<MyStarsPollCheckpoint>('settings', 'mystars_poll_cursor'))?.cursorOrderId,
+            'ord_s450b_010',
+          );
+        } finally {
+          myStarsClient.maxTransientGetRetries = prevRetries;
+          myStarsClient.resetHttpTransport();
+          myStarsClient.setCredentialsOverride(null);
+        }
+      } finally {
+        firestoreRepo.runTransaction = origRunTransaction;
+        FulfillmentService.checkpointTransactionMaxAttempts = prevMaxAttempts;
+        FulfillmentService.checkpointConflictRetryDelayMs = prevRetryDelay;
+        FulfillmentService.checkpointBackoffBaseMs = prevBackoff;
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Повтор транзакции при конфликте ABORTED, защита от ложного подтверждения при исчерпании попыток/ошибке, backoff и рестарт процесса подтверждены.';
     },
   );
 
