@@ -1,0 +1,224 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Telegram store user profile",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "telegramId": { "type": "number" },
+        "username": { "type": "string", "maxLength": 64 },
+        "firstName": { "type": "string", "maxLength": 128 },
+        "lastName": { "type": "string", "maxLength": 128 },
+        "languageCode": { "type": "string", "maxLength": 16 },
+        "isBlocked": { "type": "boolean" },
+        "totalOrders": { "type": "number" },
+        "totalSpentStars": { "type": "number" },
+        "balanceUsdCents": { "type": "number" },
+        "totalSpentUsdCents": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "telegramId", "firstName", "isBlocked", "totalOrders", "totalSpentStars", "createdAt", "updatedAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Digital product in QuizyStars (Stars, Premium, Gifts)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "category": { "type": "string", "enum": ["stars", "premium", "gifts"], "maxLength": 32 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "priceUsdCents": { "type": "number" },
+        "price": { "type": "number" },
+        "currency": { "type": "string", "enum": ["USD", "XTR"], "maxLength": 8 },
+        "imageUrl": { "type": "string", "maxLength": 500 },
+        "isActive": { "type": "boolean" },
+        "fulfillmentType": { "type": "string", "enum": ["manual", "provider_adapter", "mystars"], "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "category", "description", "price", "currency", "imageUrl", "isActive", "fulfillmentType", "createdAt", "updatedAt"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Customer order in QuizyStars with MyStars P&L readiness and reconciliation state",
+      "type": "object",
+      "properties": {
+        "orderId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userTelegramId": { "type": "number" },
+        "username": { "type": "string", "maxLength": 64 },
+        "recipientUsername": { "type": "string", "maxLength": 64 },
+        "productId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "productName": { "type": "string", "maxLength": 120 },
+        "category": { "type": "string", "enum": ["stars", "premium", "gifts"], "maxLength": 32 },
+        "quantity": { "type": "number" },
+        "unitPriceUsdCents": { "type": "number" },
+        "totalPriceUsdCents": { "type": "number" },
+        "totalPrice": { "type": "number" },
+        "currency": { "type": "string", "enum": ["USD", "XTR"], "maxLength": 8 },
+        "paymentMethod": { "type": "string", "enum": ["cryptobot", "xrocket", "balance", "internal_balance", "stars", "telegram_stars"], "maxLength": 32 },
+        "activePaymentId": { "type": "string", "maxLength": 128 },
+        "externalInvoiceId": { "type": "string", "maxLength": 128 },
+        "paymentStatus": { "type": "string", "enum": ["pending", "paid", "processing", "completed", "cancelled", "refunded", "failed"], "maxLength": 32 },
+        "fulfillmentStatus": { "type": "string", "enum": ["pending", "paid", "processing", "completed", "cancelled", "refunded", "failed"], "maxLength": 32 },
+        "grossRevenueUsdCents": { "type": "number" },
+        "providerFeeUsdCents": { "type": "number" },
+        "mystarsCurrency": { "type": "string", "enum": ["usdt_ton"], "maxLength": 16 },
+        "netProfitUsdCents": { "type": "number" },
+        "telegramPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "providerPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "fulfillmentNote": { "type": "string", "maxLength": 500 },
+        "fulfillmentStartedAt": { "type": "string", "format": "date-time" },
+        "fulfillmentAttempts": { "type": "number" },
+        "fulfillmentLastError": { "type": "string", "maxLength": 500 },
+        "fulfillmentNextRetryAt": { "type": "string", "format": "date-time" },
+        "fulfillmentIdempotencyKey": { "type": "string", "maxLength": 128 },
+        "externalExecutionReference": { "type": "string", "maxLength": 256 },
+        "needsManualReconciliation": { "type": "boolean" },
+        "adminNotifiedAt": { "type": "string", "format": "date-time" },
+        "buyerNotifiedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "paidAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["orderId", "userId", "userTelegramId", "productId", "productName", "category", "quantity", "totalPrice", "currency", "paymentStatus", "fulfillmentStatus", "createdAt", "updatedAt"]
+    },
+    "Payment": {
+      "title": "Payment",
+      "description": "Verified CryptoBot / xRocket / internal USD balance payment record",
+      "type": "object",
+      "properties": {
+        "paymentId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "provider": { "type": "string", "enum": ["cryptobot", "xrocket", "balance", "telegram_stars"], "maxLength": 32 },
+        "providerPaymentId": { "type": "string", "maxLength": 128 },
+        "telegramPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "providerPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "orderId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userTelegramId": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "expectedUsdCents": { "type": "number" },
+        "feeUsdCents": { "type": "number" },
+        "netUsdCents": { "type": "number" },
+        "expectedAmountStr": { "type": "string", "maxLength": 64 },
+        "actualAmountStr": { "type": "string", "maxLength": 64 },
+        "exchangeRateUsdStr": { "type": "string", "maxLength": 64 },
+        "currency": { "type": "string", "maxLength": 16 },
+        "network": { "type": "string", "maxLength": 32 },
+        "invoicePayload": { "type": "string", "maxLength": 256 },
+        "status": { "type": "string", "enum": ["pending", "paid", "underpaid", "overpaid", "expired", "cancelled", "failed", "refunded"], "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "refundedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["paymentId", "orderId", "userId", "userTelegramId", "totalAmount", "currency", "invoicePayload", "status", "createdAt"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Audit log of payment, order, fulfillment, and admin events",
+      "type": "object",
+      "properties": {
+        "transactionId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "orderId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "invoice_created",
+            "pre_checkout_ok",
+            "payment_received",
+            "order_underpaid",
+            "order_overpaid",
+            "order_expired",
+            "fulfillment_completed",
+            "fulfillment_failed",
+            "fulfillment_retry",
+            "order_cancelled",
+            "payment_refunded",
+            "balance_topup_created",
+            "balance_topup_paid",
+            "balance_topup_underpaid",
+            "balance_topup_overpaid",
+            "balance_topup_failed",
+            "balance_topup_expired",
+            "balance_deducted",
+            "balance_refunded",
+            "exchange_rate_locked",
+            "key_added",
+            "key_generated",
+            "key_delivered",
+            "key_disabled",
+            "key_stock_empty",
+            "admin_action",
+            "error"
+          ],
+          "maxLength": 32
+        },
+        "amount": { "type": "number" },
+        "amountUsdCents": { "type": "number" },
+        "currency": { "type": "string", "maxLength": 16 },
+        "details": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["transactionId", "orderId", "userId", "type", "amount", "currency", "details", "createdAt"]
+    },
+    "Admin": {
+      "title": "Admin",
+      "description": "Store administrator record",
+      "type": "object",
+      "properties": {
+        "adminId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "telegramId": { "type": "number" },
+        "role": { "type": "string", "enum": ["admin", "superadmin"], "maxLength": 32 },
+        "addedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["adminId", "telegramId", "role", "addedAt"]
+    },
+    "Setting": {
+      "title": "Setting",
+      "description": "Store global configuration document",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "storeName": { "type": "string", "maxLength": 120 },
+        "supportUsername": { "type": "string", "maxLength": 64 },
+        "maintenanceMode": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["key", "storeName", "supportUsername", "maintenanceMode", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "Telegram store users indexed by Telegram ID string"
+    },
+    "/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Digital store products (Stars, Premium, Gifts)"
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Customer orders"
+    },
+    "/payments/{paymentId}": {
+      "schema": { "$ref": "#/entities/Payment" },
+      "description": "Idempotent CryptoBot/xRocket/Balance payment records"
+    },
+    "/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "Audit log of store transactions"
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/Admin" },
+      "description": "Store administrators"
+    },
+    "/settings/{settingKey}": {
+      "schema": { "$ref": "#/entities/Setting" },
+      "description": "Global store settings"
+    }
+  }
+}
