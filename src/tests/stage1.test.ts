@@ -36,6 +36,7 @@ import {
 import { registerPaymentHandlers } from '../bot/handlers/paymentHandler.ts';
 import {
   buildAdminMainKeyboard,
+  buildAdminNotificationReviewKeyboard,
   buildAdminOrderActionKeyboard,
   buildAdminOrderRefundConfirmKeyboard,
   buildCatalogCategoriesKeyboard,
@@ -92,6 +93,7 @@ import {
   oeSvg,
 } from '../bot/outlineEmoji.ts';
 import {
+  formatAdminNotificationReviewMessage,
   formatAdminOrderCard,
   formatCatalogOverviewMessage,
   formatHelpMessage,
@@ -7912,9 +7914,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Fulfillment',
     'Stage 4.4.1: awaiting_payment lifecycle, показ реквизитов поставщика админу и переход до delivered без автоперевода крипты',
     async () => {
-      await resetIsolatedState();
+      firestoreRepo.enableIsolatedTestMode(true);
       const buyer = { id: 441001, username: 's441_await_buyer', first_name: 'AwaitBuyer' };
-      await UserService.getOrCreateUser(buyer);
+      await UserService.upsertFromTelegram(buyer);
       const sentMessages: Array<{ chatId: number | string; text: string }> = [];
       const mockBot = createMockBot(sentMessages);
 
@@ -8055,9 +8057,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Fulfillment',
     'Stage 4.4.1: Строгая валидация схем MyStars (MyStarsValidationError), безопасная обработка неизвестного статуса и алерт зависания >15 мин',
     async () => {
-      await resetIsolatedState();
+      firestoreRepo.enableIsolatedTestMode(true);
       const buyer = { id: 441002, username: 's441_schema_buyer', first_name: 'SchemaBuyer' };
-      await UserService.getOrCreateUser(buyer);
+      await UserService.upsertFromTelegram(buyer);
       const sentMessages: Array<{ chatId: number | string; text: string }> = [];
       const mockBot = createMockBot(sentMessages);
 
@@ -8160,19 +8162,20 @@ async function runFullAuditTestSuite(): Promise<void> {
         const afterUnknown = (await OrderService.getOrderById(ord.orderId))!;
         assert.equal(afterUnknown.fulfillmentStatus, 'processing');
         assert.equal(afterUnknown.mystarsUnknownStatusSeen, 'custom_manual_review_v2');
+        const expectedAdminAlertCount = getEnvConfig().adminIds.length;
         const unknownAlertsAfter1 = sentMessages.filter((m) =>
           m.text.includes('Неизвестный статус MyStars'),
         ).length;
-        assert.equal(unknownAlertsAfter1, 1);
+        assert.equal(unknownAlertsAfter1, expectedAdminAlertCount);
 
         // Повторный polling с тем же неизвестным статусом не спамит админа
         await FulfillmentService.pollMyStarsOrders(mockBot);
         assert.equal(
           sentMessages.filter((m) => m.text.includes('Неизвестный статус MyStars')).length,
-          1,
+          expectedAdminAlertCount,
         );
 
-        // 4. Зависший >15 мин заказ -> отправляет 1 алерт админу и ставит mystarsStuckAlertedAt, продолжая polling
+        // 4. Зависший >15 мин заказ -> отправляет 1 алерт каждому админу и ставит mystarsStuckAlertedAt, продолжая polling
         getMode = 'stuck_awaiting';
         await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
           fulfillmentStartedAt: new Date(Date.now() - 16 * 60_000).toISOString(),
@@ -8184,14 +8187,14 @@ async function runFullAuditTestSuite(): Promise<void> {
         assert.equal(afterStuck.fulfillmentStatus, 'processing');
         assert.equal(
           sentMessages.filter((m) => m.text.includes('более 15 минут')).length,
-          1,
+          expectedAdminAlertCount,
         );
 
         // Второй проход не дублирует алерт зависания
         await FulfillmentService.pollMyStarsOrders(mockBot);
         assert.equal(
           sentMessages.filter((m) => m.text.includes('более 15 минут')).length,
-          1,
+          expectedAdminAlertCount,
         );
       } finally {
         myStarsClient.maxTransientGetRetries = prevRetries;
@@ -8210,9 +8213,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Database',
     'Stage 4.4.1: Справедливый round-robin polling при >50 активных заказах (65 шт.) и legacy-документах без mystarsLastPolledAt',
     async () => {
-      await resetIsolatedState();
+      firestoreRepo.enableIsolatedTestMode(true);
       const buyer = { id: 441003, username: 's441_fair_buyer', first_name: 'FairBuyer' };
-      await UserService.getOrCreateUser(buyer);
+      await UserService.upsertFromTelegram(buyer);
       const mockBot = createMockBot([]);
 
       const polledIdsPerTick: string[][] = [];
@@ -8342,9 +8345,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Database',
     'Stage 4.4.1: Распределённые Firestore Timestamp leases (acquire/renew/release с проверкой leaseOwner и operationId)',
     async () => {
-      await resetIsolatedState();
+      firestoreRepo.enableIsolatedTestMode(true);
       const buyer = { id: 441004, username: 's441_lease_buyer', first_name: 'LeaseBuyer' };
-      await UserService.getOrCreateUser(buyer);
+      await UserService.upsertFromTelegram(buyer);
       const ord = await OrderService.createOrder({
         telegramUser: buyer,
         recipientUsername: 's441_lease_buyer',
@@ -8447,9 +8450,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Fulfillment',
     'Stage 4.4.1: Устойчивый notification state machine (pending/sending/sent, eventId) и безопасное восстановление после падения в sending',
     async () => {
-      await resetIsolatedState();
+      firestoreRepo.enableIsolatedTestMode(true);
       const buyer = { id: 441005, username: 's441_notify_buyer', first_name: 'NotifyBuyer' };
-      await UserService.getOrCreateUser(buyer);
+      await UserService.upsertFromTelegram(buyer);
       const sentMessages: Array<{ chatId: number | string; text: string }> = [];
       const slowBot = {
         telegram: {
@@ -8507,17 +8510,18 @@ async function runFullAuditTestSuite(): Promise<void> {
       });
       const crashedOrd2 = (await OrderService.getOrderById(ord2.orderId))!;
 
-      // Выживший воркер обнаруживает истёкший sending-lease -> переводит в sent с deliveryUncertainAfterCrash=true БЕЗ дубль-спама покупателю
+      // Выживший воркер обнаруживает истёкший sending-lease -> переводит в delivery_uncertain БЕЗ отметки sent и БЕЗ авто-дубля
       const recoveredOrd2 = await FulfillmentService.ensureBuyerNotified(crashedOrd2, slowBot);
       assert.equal(sentMessages.length, 1, 'Не должно быть повторной отправки при истёкшем sending-lease');
-      assert.equal(recoveredOrd2.buyerNotificationState?.status, 'sent');
+      assert.equal(recoveredOrd2.buyerNotificationState?.status, 'delivery_uncertain');
       assert.equal(recoveredOrd2.buyerNotificationState?.deliveryUncertainAfterCrash, true);
+      assert.equal(recoveredOrd2.buyerNotifiedAt, undefined);
 
-      // 3. Явный forceResend от администратора всё же позволяет переотправить уведомление вручную
+      // 3. Явный forceResend от администратора позволяет переотправить уведомление вручную
       await FulfillmentService.ensureBuyerNotified(recoveredOrd2, slowBot, true);
       assert.equal(sentMessages.length, 2);
 
-      return 'Notification state machine (pending/sending/sent + eventId) защищает от параллельных дублей и безопасно восстанавливается после падения в sending.';
+      return 'Notification state machine (pending/sending/sent/delivery_uncertain + eventId) защищает от параллельных дублей и безопасно восстанавливается после падения в sending.';
     },
   );
 
@@ -8526,9 +8530,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Fulfillment',
     'Stage 4.4.1: Защита от дублирования при таймауте POST /v1/orders (сверка GET /v1/orders и карантин при неоднозначности)',
     async () => {
-      await resetIsolatedState();
+      firestoreRepo.enableIsolatedTestMode(true);
       const buyer = { id: 441006, username: 's441_ambig_buyer', first_name: 'AmbigBuyer' };
-      await UserService.getOrCreateUser(buyer);
+      await UserService.upsertFromTelegram(buyer);
       const mockBot = createMockBot([]);
 
       let postOrderCalls = 0;
@@ -8701,9 +8705,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Payments',
     'Stage 4.4.1: Параллельный возврат средств на внутренний баланс USD (race-safe идемпотентность + tx_bal_refund)',
     async () => {
-      await resetIsolatedState();
+      firestoreRepo.enableIsolatedTestMode(true);
       const buyer = { id: 441007, username: 's441_refund_buyer', first_name: 'RefundBuyer' };
-      await UserService.getOrCreateUser(buyer);
+      await UserService.upsertFromTelegram(buyer);
       const bs = new BalanceService();
 
       const ord = await OrderService.createOrder({
@@ -8781,7 +8785,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       const requestedUrls: string[] = [];
       let simulate404OnSingleEndpoint = false;
 
-      gw.setHttpTransport(async (req) => {
+      gw.setTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
         requestedUrls.push(req.url);
         if (req.url.includes('/api/v1/invoice?')) {
           if (simulate404OnSingleEndpoint) {
@@ -8829,7 +8833,7 @@ async function runFullAuditTestSuite(): Promise<void> {
         throw new Error(`Unexpected xRocket URL: ${req.url}`);
       });
 
-      // 1. Основной официальный endpoint GET /api/v1/invoice?invoiceId=...&clientInvoiceId=...
+      // 1. Основной официальный endpoint GET /api/v1/invoice?invoiceId=... (строго один параметр без одновременного clientInvoiceId)
       const verified1 = await gw.verifyInvoiceStatus({
         provider: 'xrocket',
         externalInvoiceId: 'xr_inv_s441_1',
@@ -8838,11 +8842,10 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(verified1.status, 'paid');
       assert.equal(verified1.externalInvoiceId, 'xr_inv_s441_1');
       assert.equal(verified1.paymentId, 'pay_s441_1');
-      assert.ok(
-        requestedUrls[0].includes('/api/v1/invoice?invoiceId=xr_inv_s441_1&clientInvoiceId=pay_s441_1'),
-      );
+      assert.ok(requestedUrls[0].includes('/api/v1/invoice?invoiceId=xr_inv_s441_1'));
+      assert.equal(requestedUrls[0].includes('clientInvoiceId='), false);
 
-      // 2. Fallback на GET /api/v1/invoices?ids=... при 404 на одиночном endpoint
+      // 2. Fallback на GET /api/v1/invoice?clientInvoiceId=... и GET /api/v1/invoices?ids=... при 404 на одиночном endpoint
       simulate404OnSingleEndpoint = true;
       const verified2 = await gw.verifyInvoiceStatus({
         provider: 'xrocket',
@@ -8851,6 +8854,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       });
       assert.equal(verified2.status, 'paid');
       assert.equal(verified2.externalInvoiceId, 'xr_inv_s441_2');
+      assert.ok(requestedUrls.some((u) => u.includes('/api/v1/invoice?clientInvoiceId=pay_s441_2')));
       assert.ok(requestedUrls.some((u) => u.includes('/api/v1/invoices?ids=xr_inv_s441_2')));
 
       // 3. Проверка, что firestoreErrorHandler.ts использует изолированный ephemeral app + terminate + deleteApp
@@ -8862,7 +8866,1135 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.ok(probeSource.includes('terminate(probeDb)'));
       assert.ok(probeSource.includes('deleteApp(probeApp)'));
 
-      return 'Официальный xRocket GET /api/v1/invoice (с fallback) и ephemeral Firestore probe cleanup подтверждены.';
+      return 'Официальный xRocket GET /api/v1/invoice (с раздельным fallback) и ephemeral Firestore probe cleanup подтверждены.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 4.4.2 TARGETED AUDIT & CRITICAL FIXES TESTS
+  // =========================================================================
+
+  await runTest(
+    'S442-01',
+    'Fulfillment',
+    'Stage 4.4.2: Telegram Notification Recovery (delivery_uncertain, сохранение метаданных, ручная проверка/переотправка и защита forceResend от параллельного запуска)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 442001, username: 's442_notify_buyer', first_name: 'NotifyS442' };
+      await UserService.upsertFromTelegram(buyer);
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      let sendDelayMs = 35;
+      const slowBot = {
+        telegram: {
+          sendMessage: async (chatId: number | string, text: string) => {
+            await new Promise((r) => setTimeout(r, sendDelayMs));
+            sentMessages.push({ chatId, text });
+            return { message_id: Date.now() };
+          },
+        },
+      } as unknown as Telegraf;
+
+      // 1. Заказ упал в состоянии sending (lease истёк до фиксации sent)
+      const ord1 = await OrderService.createOrder({
+        telegramUser: buyer,
+        recipientUsername: 's442_notify_buyer',
+        productId: 'stars_custom',
+        quantity: 100,
+      });
+      const expiredLeaseTs = Timestamp.fromMillis(Date.now() - 15_000);
+      await firestoreRepo.updateDoc<Order>('orders', ord1.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        buyerNotificationState: {
+          status: 'sending',
+          eventId: `evt_buyer_completed_${ord1.orderId}`,
+          operationId: 'op_crash_442_buyer',
+          leaseOwner: 'worker_crashed_442',
+          leaseUntil: expiredLeaseTs,
+          attemptCount: 1,
+        },
+        adminNotificationState: {
+          status: 'sending',
+          eventId: `evt_admin_completed_${ord1.orderId}`,
+          operationId: 'op_crash_442_admin',
+          leaseOwner: 'worker_crashed_442',
+          leaseUntil: expiredLeaseTs,
+          attemptCount: 2,
+        },
+      });
+
+      const crashedOrd1 = (await OrderService.getOrderById(ord1.orderId))!;
+
+      // Автоматическое восстановление переводит в delivery_uncertain, НЕ ставит sent/NotifiedAt и сохраняет метаданные
+      const afterBuyerRecover = await FulfillmentService.ensureBuyerNotified(crashedOrd1, slowBot);
+      const afterAdminRecover = await FulfillmentService.ensureAdminNotified(afterBuyerRecover, slowBot);
+
+      assert.equal(sentMessages.length, 0, 'Неконтролируемой авто-переотправки быть не должно');
+      assert.equal(afterAdminRecover.buyerNotifiedAt, undefined);
+      assert.equal(afterAdminRecover.adminNotifiedAt, undefined);
+      assert.equal(afterAdminRecover.buyerNotificationState?.status, 'delivery_uncertain');
+      assert.equal(afterAdminRecover.buyerNotificationState?.eventId, `evt_buyer_completed_${ord1.orderId}`);
+      assert.equal(afterAdminRecover.buyerNotificationState?.operationId, 'op_crash_442_buyer');
+      assert.equal(afterAdminRecover.buyerNotificationState?.leaseOwner, 'worker_crashed_442');
+      assert.equal(afterAdminRecover.buyerNotificationState?.attemptCount, 1);
+      assert.ok(afterAdminRecover.buyerNotificationState?.uncertainSince);
+      assert.equal(afterAdminRecover.adminNotificationState?.status, 'delivery_uncertain');
+      assert.equal(afterAdminRecover.adminNotificationState?.operationId, 'op_crash_442_admin');
+      assert.equal(afterAdminRecover.adminNotificationState?.attemptCount, 2);
+
+      // Повторный автоматический вызов НЕ переотправляет сообщение
+      await FulfillmentService.ensureBuyerNotified(afterAdminRecover, slowBot);
+      await FulfillmentService.ensureAdminNotified(afterAdminRecover, slowBot);
+      assert.equal(sentMessages.length, 0);
+
+      // UI администратора показывает предупреждение и кнопки review/resend/ack
+      const adminCard = formatAdminOrderCard(afterAdminRecover);
+      assert.ok(adminCard.includes('delivery_uncertain'));
+      const cardKbJson = JSON.stringify(buildAdminOrderActionKeyboard(afterAdminRecover));
+      assert.ok(cardKbJson.includes(`adm:ord_notify_review:${ord1.orderId}`));
+      const reviewText = formatAdminNotificationReviewMessage(afterAdminRecover);
+      assert.ok(reviewText.includes('delivery_uncertain'));
+      assert.ok(reviewText.includes(`evt_buyer_completed_${ord1.orderId}`));
+      const reviewKbJson = JSON.stringify(buildAdminNotificationReviewKeyboard(afterAdminRecover));
+      assert.ok(reviewKbJson.includes(`adm:ord_notify_resend_buyer:${ord1.orderId}`));
+      assert.ok(reviewKbJson.includes(`adm:ord_notify_ack:${ord1.orderId}`));
+
+      // 2. Контролируемая переотправка с защитой от параллельного запуска (два одновременных forceResend -> ровно 1 отправка!)
+      const [resendA, resendB] = await Promise.all([
+        FulfillmentService.forceResendOrderNotification({
+          orderId: ord1.orderId,
+          target: 'buyer',
+          bot: slowBot,
+          adminTelegramId: 777000111,
+        }),
+        FulfillmentService.forceResendOrderNotification({
+          orderId: ord1.orderId,
+          target: 'buyer',
+          bot: slowBot,
+          adminTelegramId: 777000111,
+        }),
+      ]);
+
+      const sentCount = [resendA.sentBuyer, resendB.sentBuyer].filter(Boolean).length;
+      const blockedCount = [resendA.skippedInFlight, resendB.skippedInFlight].filter(Boolean).length;
+      assert.equal(sentCount, 1, 'Ровно один из параллельных forceResend должен отправить сообщение');
+      assert.equal(blockedCount, 1, 'Второй параллельный forceResend должен быть заблокирован активным lease');
+      assert.equal(sentMessages.filter((m) => m.chatId === buyer.id).length, 1);
+
+      const afterResendBuyer = (await OrderService.getOrderById(ord1.orderId))!;
+      assert.equal(afterResendBuyer.buyerNotificationState?.status, 'sent');
+      assert.ok(afterResendBuyer.buyerNotifiedAt);
+      assert.equal(afterResendBuyer.buyerNotificationState?.attemptCount, 2);
+
+      // 3. Подтверждение администратором без переотправки (acknowledgeUncertainNotification для admin)
+      sendDelayMs = 5;
+      const acked = await FulfillmentService.acknowledgeUncertainNotification({
+        orderId: ord1.orderId,
+        target: 'admin',
+        adminTelegramId: 777000111,
+      });
+      assert.equal(acked.adminNotificationState?.status, 'sent');
+      assert.equal(acked.adminNotificationState?.acknowledgedByAdminId, 777000111);
+      assert.ok(acked.adminNotificationState?.acknowledgedAt);
+      assert.ok(acked.adminNotifiedAt);
+      // После ack сообщение админу не отправлялось
+      assert.equal(sentMessages.filter((m) => m.chatId === 777000111).length, 0);
+
+      return 'delivery_uncertain, сохранение метаданных, ручная проверка/ack и блокировка параллельного forceResend подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S442-02',
+    'Database',
+    'Stage 4.4.2: Fair Polling на 1,500 активных заказах (многостраничный persistent cursor, рестарт процесса, чужие leases и изоляция падающих заказов без голодания)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 442002, username: 's442_scale_buyer', first_name: 'ScaleBuyer' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      const TOTAL_ORDERS = 1500;
+      const FAILING_ORDER_MS_ID = 'ms_scale_0750';
+      const FOREIGN_LEASED_ORDER_ID = 'ord_scale_1200';
+      const FOREIGN_LEASED_MS_ID = 'ms_scale_1200';
+
+      const polledCounts = new Map<string, number>();
+      let failingAttempts = 0;
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s442_scale_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      const prevRetries = myStarsClient.maxTransientGetRetries;
+      myStarsClient.maxTransientGetRetries = 0;
+
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          polledCounts.set(extId, (polledCounts.get(extId) ?? 0) + 1);
+          if (extId === FAILING_ORDER_MS_ID) {
+            failingAttempts += 1;
+            throw new MyStarsTransportError('Simulated per-order timeout', true);
+          }
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: 's442_scale_buyer',
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected URL in S442-02: ${req.method} ${req.url}`);
+      });
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+      const prevWorkerId = FulfillmentService.workerInstanceId;
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+        FulfillmentService.pollBatchBudget = 50;
+        FulfillmentService.pollPageSize = 100;
+
+        // Создаём 1,500 активных заказов в processing (значительно больше старого лимита 1,000!)
+        // Часть последних заказов (#1451..#1500) — legacy без mystarsLastPolledAt
+        const baseMs = Date.now() - 7_200_000;
+        for (let i = 1; i <= TOTAL_ORDERS; i++) {
+          const ordId = `ord_scale_${String(i).padStart(4, '0')}`;
+          const msId = `ms_scale_${String(i).padStart(4, '0')}`;
+          const isLegacy = i > 1450;
+          const isForeignLeased = ordId === FOREIGN_LEASED_ORDER_ID;
+          const orderDoc: Order = {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: 'Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: msId,
+            mystarsOrderStatus: 'awaiting_payment',
+            ...(isLegacy ? {} : { mystarsLastPolledAt: new Date(baseMs + i * 1000).toISOString() }),
+            ...(isForeignLeased
+              ? {
+                  mystarsPollLease: {
+                    leaseOwner: 'remote-worker-B',
+                    operationId: 'remote-op-B',
+                    acquiredAt: Timestamp.fromMillis(Date.now()),
+                    leaseUntil: Timestamp.fromMillis(Date.now() + 600_000),
+                  },
+                }
+              : {}),
+            createdAt: new Date(baseMs + i * 1000).toISOString(),
+            updatedAt: new Date(baseMs + i * 1000).toISOString(),
+          };
+          await firestoreRepo.setDoc<Order>('orders', ordId, orderDoc);
+        }
+
+        // Запускаем 30 тиков по 50 заказов:
+        // На тике 15 имитируем рестарт процесса (сброс in-memory состояния + смена workerInstanceId, но Firestore checkpoint сохранён!)
+        for (let tick = 1; tick <= 30; tick++) {
+          if (tick === 15) {
+            // Имитация перезапуска процесса на середине очереди
+            FulfillmentService.resetMyStarsPollingState();
+            FulfillmentService.workerInstanceId = 'restarted-worker-instance-2';
+            const savedCheckpoint = await FulfillmentService.loadMyStarsPollCheckpoint();
+            assert.ok(
+              savedCheckpoint?.cursorOrderId,
+              'Persistent Firestore checkpoint должен сохраняться между рестартами',
+            );
+          }
+          await FulfillmentService.pollMyStarsOrders(mockBot);
+        }
+
+        // Чужой активный lease не должен был опрашиваться нашим воркером
+        assert.equal(
+          polledCounts.get(FOREIGN_LEASED_MS_ID) ?? 0,
+          0,
+          'Заказ с активным чужим lease не должен опрашиваться другим воркером',
+        );
+
+        // Падающий заказ #750 был опрошен и НЕ заблокировал остальные 1,498 заказов
+        assert.ok(failingAttempts >= 1, 'Падающий заказ #750 должен был быть опрошен');
+
+        // Все остальные 1,499 заказов (включая #1001..#1500 за пределами старого лимита 1,000 и legacy-документы!) были опрошены!
+        assert.equal(
+          polledCounts.size,
+          TOTAL_ORDERS - 1,
+          `Ожидалось покрытие всех ${TOTAL_ORDERS - 1} доступных заказов без голодания, опрошено: ${polledCounts.size}`,
+        );
+        assert.ok(
+          polledCounts.has('ms_scale_1500'),
+          'Последний заказ #1500 (legacy за пределами 1000) гарантированно опрошен',
+        );
+        assert.ok(
+          polledCounts.has('ms_scale_1001'),
+          'Заказ #1001 (за пределами старого лимита 1000) гарантированно опрошен',
+        );
+
+        // Освобождаем чужой lease и делаем ещё 1 тик — #1200 также опрашивается после wrap-around/release
+        await firestoreRepo.updateDoc<Order>('orders', FOREIGN_LEASED_ORDER_ID, {
+          mystarsPollLease: undefined,
+        });
+        for (let t = 0; t < 30 && !polledCounts.has(FOREIGN_LEASED_MS_ID); t++) {
+          await FulfillmentService.pollMyStarsOrders(mockBot);
+        }
+        assert.equal(
+          polledCounts.size,
+          TOTAL_ORDERS,
+          `После снятия чужого lease должны быть опрошены все ${TOTAL_ORDERS} заказов`,
+        );
+      } finally {
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        FulfillmentService.workerInstanceId = prevWorkerId;
+        myStarsClient.maxTransientGetRetries = prevRetries;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return '1,500 активных заказов (15+ страниц) полностью опрошены без голодания, с рестартом по persistent checkpoint, уважением чужих leases и изоляцией сбойных заказов.';
+    },
+  );
+
+  await runTest(
+    'S442-03',
+    'Fulfillment',
+    'Stage 4.4.2: Полная runtime-валидация всех 7 endpoint-ов MyStars API (валидные варианты, неполные и битые payload -> MyStarsValidationError)',
+    async () => {
+      const client = new MyStarsClient();
+      client.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s442_val_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      client.maxTransientGetRetries = 0;
+
+      const respondWith = (payload: unknown) => {
+        client.setHttpTransport(async (): Promise<HttpTransportResponse> => ({
+          status: 200,
+          ok: true,
+          json: payload,
+        }));
+      };
+
+      const expectValidationError = async (fn: () => Promise<unknown>, expectedEndpoint: string) => {
+        await assert.rejects(fn, (err: unknown) => {
+          assert.ok(
+            err instanceof MyStarsValidationError,
+            `Ожидалась MyStarsValidationError для ${expectedEndpoint}, получено: ${String(err)}`,
+          );
+          assert.ok(
+            err.endpoint.includes(expectedEndpoint) && err.message.includes(expectedEndpoint),
+            `Endpoint "${expectedEndpoint}" должен присутствовать в ошибке: ${err.endpoint} / ${err.message}`,
+          );
+          return true;
+        });
+      };
+
+      // 1. GET /v1/currencies — валидные (массив и { currencies }) + невалидные
+      respondWith([{ code: 'usdt_ton', chain: 'ton', name: 'USDT (TON)' }]);
+      const cur1 = await client.getCurrencies();
+      assert.equal(cur1.length, 1);
+      assert.equal(cur1[0].code, 'usdt_ton');
+
+      respondWith({ currencies: [{ code: 'ton', chain: 'ton', name: 'Toncoin' }] });
+      const cur2 = await client.getCurrencies();
+      assert.equal(cur2[0].code, 'ton');
+
+      respondWith(null);
+      await expectValidationError(() => client.getCurrencies(), 'GET /v1/currencies');
+      respondWith([{ code: 'usdt_ton', chain: 'ton' }]); // missing name
+      await expectValidationError(() => client.getCurrencies(), 'GET /v1/currencies');
+      respondWith({ currencies: 'not_an_array' });
+      await expectValidationError(() => client.getCurrencies(), 'GET /v1/currencies');
+
+      // 2. GET /v1/products — валидные + невалидные
+      respondWith([
+        { type: 'stars', name: 'Telegram Stars', parameter: 'quantity', min: 50, max: 1000000, values: null },
+        { type: 'premium', name: 'Telegram Premium', parameter: 'months', min: 3, max: 12, values: [3, 6, 12] },
+      ]);
+      const prods = await client.getProducts();
+      assert.equal(prods.length, 2);
+      assert.deepEqual(prods[1].values, [3, 6, 12]);
+
+      respondWith([{ type: 'gifts', name: 'Invalid', parameter: 'quantity', min: 1, max: 10 }]);
+      await expectValidationError(() => client.getProducts(), 'GET /v1/products');
+      respondWith([{ type: 'stars', name: 'Stars', parameter: 'quantity', min: 100, max: 50 }]); // max < min
+      await expectValidationError(() => client.getProducts(), 'GET /v1/products');
+      respondWith([{ type: 'premium', name: 'Premium', parameter: 'months', min: 3, max: 12, values: ['3'] }]);
+      await expectValidationError(() => client.getProducts(), 'GET /v1/products');
+
+      // 3. GET /v1/pricing — валидный (с nested fee) + невалидные
+      respondWith({
+        type: 'stars',
+        quantity: 100,
+        amount: '1.42',
+        currency: 'usdt_ton',
+        fee: {
+          subtotal: '1.37',
+          processing_fee: '0.05',
+          total: '1.42',
+          description: 'TON fee',
+          currency: 'usdt_ton',
+        },
+        usdt_per_ton: '5.25',
+      });
+      const price = await client.getPricing({ type: 'stars', quantity: 100 });
+      assert.equal(price.amount, '1.42');
+      assert.equal(price.fee?.total, '1.42');
+
+      respondWith({ type: 'stars', amount: 'not_a_number', currency: 'usdt_ton' });
+      await expectValidationError(() => client.getPricing({ type: 'stars', quantity: 100 }), 'GET /v1/pricing');
+      respondWith({ type: 'stars', amount: '1.42', currency: 'usdt_ton', fee: { subtotal: '1.37' } }); // incomplete nested fee
+      await expectValidationError(() => client.getPricing({ type: 'stars', quantity: 100 }), 'GET /v1/pricing');
+      respondWith({ amount: '1.42', currency: 'usdt_ton' }); // missing type
+      await expectValidationError(() => client.getPricing({ type: 'stars', quantity: 100 }), 'GET /v1/pricing');
+
+      // 4. POST /v1/recipients/check — валидные + невалидные
+      respondWith({ resolved: true, eligible: true, recipient_name: 'Valid User' });
+      const checkOk = await client.checkRecipient({ type: 'stars', username: 'valid_user' });
+      assert.equal(checkOk.eligible, true);
+
+      respondWith({ resolved: 'yes', eligible: true }); // wrong type
+      await expectValidationError(
+        () => client.checkRecipient({ type: 'stars', username: 'valid_user' }),
+        'POST /v1/recipients/check',
+      );
+      respondWith({ resolved: true, eligible: true, recipient_name: 12345 }); // corrupted nullable string
+      await expectValidationError(
+        () => client.checkRecipient({ type: 'stars', username: 'valid_user' }),
+        'POST /v1/recipients/check',
+      );
+
+      // 5. POST /v1/orders — валидные (nested payment + flat variant) + невалидные
+      respondWith({
+        order_id: 'ord_val_nested_1',
+        status: 'awaiting_payment',
+        type: 'stars',
+        quantity: 100,
+        payment: {
+          currency: 'usdt_ton',
+          chain: 'ton',
+          pay_to_address: 'UQAddr1',
+          memo: 'MEMO1',
+          amount: '1.42',
+          amount_units: '1420000',
+        },
+        expires_at: new Date(Date.now() + 900_000).toISOString(),
+      });
+      const createdNested = await client.createOrder({ type: 'stars', username: 'valid_user', quantity: 100 });
+      assert.equal(createdNested.order_id, 'ord_val_nested_1');
+      assert.equal(createdNested.payment.amount, '1.42');
+
+      // Неполный nested payment (без amount_units / chain) -> ошибка валидации
+      respondWith({
+        order_id: 'ord_val_bad_pay',
+        status: 'awaiting_payment',
+        type: 'stars',
+        payment: { currency: 'usdt_ton', amount: '1.42' },
+        expires_at: new Date().toISOString(),
+      });
+      await expectValidationError(
+        () => client.createOrder({ type: 'stars', username: 'valid_user', quantity: 100 }),
+        'POST /v1/orders',
+      );
+      // awaiting_payment без expires_at -> ошибка валидации
+      respondWith({
+        order_id: 'ord_val_no_exp',
+        status: 'awaiting_payment',
+        type: 'stars',
+        payment: { currency: 'usdt_ton', chain: 'ton', amount: '1.42', amount_units: '1420000' },
+      });
+      await expectValidationError(
+        () => client.createOrder({ type: 'stars', username: 'valid_user', quantity: 100 }),
+        'POST /v1/orders',
+      );
+      // Нет ни payment, ни payment_amount -> ошибка валидации
+      respondWith({ order_id: 'ord_val_empty', status: 'delivered', type: 'stars' });
+      await expectValidationError(
+        () => client.createOrder({ type: 'stars', username: 'valid_user', quantity: 100 }),
+        'POST /v1/orders',
+      );
+
+      // 6. GET /v1/orders — валидный + невалидный next_cursor + битый элемент
+      respondWith({
+        orders: [
+          {
+            order_id: 'ord_list_1',
+            status: 'delivered',
+            type: 'stars',
+            recipient_username: 'valid_user',
+            quantity: 100,
+            created_at: new Date().toISOString(),
+          },
+        ],
+        next_cursor: 'cur_2',
+      });
+      const page = await client.listOrders({ limit: 10 });
+      assert.equal(page.orders.length, 1);
+      assert.equal(page.next_cursor, 'cur_2');
+
+      respondWith({ orders: [], next_cursor: 999 }); // invalid next_cursor type!
+      await expectValidationError(() => client.listOrders(), 'GET /v1/orders');
+      respondWith({ orders: [{ order_id: 'ord_bad_item', status: 'delivered' }] }); // missing type & created_at
+      await expectValidationError(() => client.listOrders(), 'GET /v1/orders');
+
+      // 7. GET /v1/orders/{id} — валидный + невалидные (wrong quantity type, missing created_at, corrupted rawText)
+      respondWith({
+        order_id: 'ord_get_1',
+        status: 'delivered',
+        type: 'stars',
+        quantity: 100,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      const fetched = await client.getOrder('ord_get_1');
+      assert.equal(fetched.order_id, 'ord_get_1');
+
+      respondWith({
+        order_id: 'ord_get_1',
+        status: 'delivered',
+        type: 'stars',
+        quantity: '100', // must be integer number, not string
+        created_at: new Date().toISOString(),
+      });
+      await expectValidationError(() => client.getOrder('ord_get_1'), 'GET /v1/orders/ord_get_1');
+
+      respondWith({ rawText: '<html>502 Bad Gateway</html>' });
+      await expectValidationError(() => client.getOrder('ord_get_1'), 'GET /v1/orders/ord_get_1');
+
+      return 'Все 7 endpoint-ов MyStars API проходят строгую runtime-валидацию и выбрасывают MyStarsValidationError с указанием endpoint при неполных/битых payload.';
+    },
+  );
+
+  await runTest(
+    'S442-04',
+    'Fulfillment',
+    'Stage 4.4.2: Ambiguous POST Reconciliation (многостраничный next_cursor, строгие сигналы, insufficient_data карантин, сохранение Idempotency-Key)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 442004, username: 's442_recon_buyer', first_name: 'ReconBuyer' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      let postOrderCalls = 0;
+      const postIdempotencyKeys: string[] = [];
+      let listScenario:
+        | 'multi_page_page3_match'
+        | 'incomplete_missing_username'
+        | 'incomplete_missing_quantity'
+        | 'clean_not_found' = 'multi_page_page3_match';
+      let postShouldFail = true;
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s442_recon_key',
+        paymentCurrency: 'usdt_ton',
+      });
+
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        if (req.method === 'POST' && req.url.endsWith('/v1/recipients/check')) {
+          return {
+            status: 200,
+            ok: true,
+            json: { resolved: true, eligible: true, recipient_name: 'Recon Buyer' },
+          };
+        }
+        if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+          postOrderCalls += 1;
+          const idk = req.headers['Idempotency-Key'];
+          if (idk) postIdempotencyKeys.push(idk);
+          if (postShouldFail) {
+            throw new MyStarsTransportError('Simulated POST timeout', true);
+          }
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: 'ord_s442_retried_clean_1',
+              status: 'delivered',
+              type: 'stars',
+              quantity: 100,
+              payment: {
+                currency: 'usdt_ton',
+                chain: 'ton',
+                amount: '1.40',
+                amount_units: '1400000',
+              },
+              purchase_tx: 'tx_clean_retry_442',
+            },
+          };
+        }
+        if (req.method === 'GET' && req.url.includes('/v1/orders?')) {
+          const urlObj = new URL(req.url);
+          const cursor = urlObj.searchParams.get('cursor');
+          const nowIso = new Date().toISOString();
+
+          if (listScenario === 'multi_page_page3_match') {
+            if (!cursor) {
+              return {
+                status: 200,
+                ok: true,
+                json: {
+                  orders: [
+                    {
+                      order_id: 'ord_other_p1',
+                      status: 'delivered',
+                      type: 'stars',
+                      recipient_username: 'someone_else',
+                      quantity: 100,
+                      created_at: nowIso,
+                    },
+                  ],
+                  next_cursor: 'cur_page_2',
+                },
+              };
+            }
+            if (cursor === 'cur_page_2') {
+              return {
+                status: 200,
+                ok: true,
+                json: {
+                  orders: [
+                    {
+                      order_id: 'ord_other_p2',
+                      status: 'delivered',
+                      type: 'stars',
+                      recipient_username: 's442_recon_buyer',
+                      quantity: 500, // different quantity
+                      created_at: nowIso,
+                    },
+                  ],
+                  next_cursor: 'cur_page_3',
+                },
+              };
+            }
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                orders: [
+                  {
+                    order_id: 'ord_s442_found_page3',
+                    status: 'delivered',
+                    type: 'stars',
+                    recipient_username: 's442_recon_buyer',
+                    quantity: 100,
+                    purchase_tx: 'tx_found_page3_442',
+                    created_at: nowIso,
+                  },
+                ],
+                next_cursor: null,
+              },
+            };
+          }
+
+          if (listScenario === 'incomplete_missing_username') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                orders: [
+                  {
+                    order_id: 'ord_s442_no_user',
+                    status: 'awaiting_payment',
+                    type: 'stars',
+                    recipient_username: null, // missing!
+                    quantity: 100,
+                    created_at: nowIso,
+                  },
+                ],
+                next_cursor: null,
+              },
+            };
+          }
+
+          if (listScenario === 'incomplete_missing_quantity') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                orders: [
+                  {
+                    order_id: 'ord_s442_no_qty',
+                    status: 'awaiting_payment',
+                    type: 'stars',
+                    recipient_username: 's442_recon_buyer',
+                    quantity: null, // missing!
+                    created_at: nowIso,
+                  },
+                ],
+                next_cursor: null,
+              },
+            };
+          }
+
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              orders: [
+                {
+                  order_id: 'ord_unrelated_only',
+                  status: 'delivered',
+                  type: 'stars',
+                  recipient_username: 'other_user',
+                  quantity: 50,
+                  created_at: nowIso,
+                },
+              ],
+              next_cursor: null,
+            },
+          };
+        }
+        if (req.method === 'GET' && req.url.endsWith('/v1/orders/ord_s442_found_page3')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: 'ord_s442_found_page3',
+              status: 'delivered',
+              type: 'stars',
+              recipient_username: 's442_recon_buyer',
+              quantity: 100,
+              purchase_tx: 'tx_found_page3_442',
+              created_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected URL in S442-04: ${req.method} ${req.url}`);
+      });
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+
+        // Сценарий 1: совпадение найдено на 3-й странице через next_cursor -> завершает БЕЗ второго POST!
+        const ord1 = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's442_recon_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord1.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+        postShouldFail = true;
+        await assert.rejects(() => FulfillmentService.initiateFulfillment(ord1, mockBot));
+        assert.equal(postOrderCalls, 1);
+
+        listScenario = 'multi_page_page3_match';
+        const after1 = (await OrderService.getOrderById(ord1.orderId))!;
+        const done1 = await FulfillmentService.initiateFulfillment(after1, mockBot);
+        assert.equal(postOrderCalls, 1, 'Заказ найден на странице 3 — повторного POST быть не должно');
+        assert.equal(done1.fulfillmentStatus, 'completed');
+        assert.equal(done1.mystarsOrderId, 'ord_s442_found_page3');
+
+        // Сценарий 2: неполные данные (нет recipient_username) -> insufficient_data -> карантин БЕЗ второго POST!
+        const ord2 = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's442_recon_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord2.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+        await assert.rejects(() => FulfillmentService.initiateFulfillment(ord2, mockBot));
+        const postCountBefore2 = postOrderCalls;
+        listScenario = 'incomplete_missing_username';
+        const after2 = (await OrderService.getOrderById(ord2.orderId))!;
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(after2, mockBot),
+          (err: unknown) =>
+            err instanceof MyStarsApiError && err.code === 'insufficient_reconciliation_data',
+        );
+        assert.equal(postOrderCalls, postCountBefore2, 'При отсутствии recipient_username повторный POST заблокирован');
+        const q2 = (await OrderService.getOrderById(ord2.orderId))!;
+        assert.equal(q2.needsManualReconciliation, true);
+
+        // Сценарий 3: неполные данные (нет quantity) -> insufficient_data -> карантин БЕЗ второго POST!
+        const ord3 = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's442_recon_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord3.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+        await assert.rejects(() => FulfillmentService.initiateFulfillment(ord3, mockBot));
+        const postCountBefore3 = postOrderCalls;
+        listScenario = 'incomplete_missing_quantity';
+        const after3 = (await OrderService.getOrderById(ord3.orderId))!;
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(after3, mockBot),
+          (err: unknown) =>
+            err instanceof MyStarsApiError && err.code === 'insufficient_reconciliation_data',
+        );
+        assert.equal(postOrderCalls, postCountBefore3, 'При отсутствии quantity повторный POST заблокирован');
+        assert.equal((await OrderService.getOrderById(ord3.orderId))?.needsManualReconciliation, true);
+
+        // Сценарий 4: чистый not_found -> повторный POST использует ТОТ ЖЕ fulfillmentIdempotencyKey!
+        const ord4 = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's442_recon_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord4.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+        postIdempotencyKeys.length = 0;
+        postShouldFail = true;
+        await assert.rejects(() => FulfillmentService.initiateFulfillment(ord4, mockBot));
+        listScenario = 'clean_not_found';
+        postShouldFail = false;
+        const after4 = (await OrderService.getOrderById(ord4.orderId))!;
+        const done4 = await FulfillmentService.initiateFulfillment(after4, mockBot);
+        assert.equal(done4.fulfillmentStatus, 'completed');
+        assert.equal(postIdempotencyKeys.length, 2);
+        assert.equal(
+          postIdempotencyKeys[0],
+          postIdempotencyKeys[1],
+          'При повторе после clean not_found должен сохраняться исходный fulfillmentIdempotencyKey',
+        );
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Многостраничная сверка next_cursor, карантин при insufficient_data (без username/quantity) и сохранение Idempotency-Key подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S442-05',
+    'Payments',
+    'Stage 4.4.2: xRocket Invoice Verification (раздельные запросы без смешивания параметров, fallback-цепочка, валидация unpaid/amount/currency и защита от двойного зачисления)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 442005, username: 's442_xrocket_buyer', first_name: 'XRocketBuyer' };
+      await UserService.upsertFromTelegram(buyer);
+
+      const gw = new PaymentProviderGateway();
+      gw.setCredentialsOverride({
+        xrocketApiKey: 'xr_test_s442_key',
+        xrocketApiUrl: 'https://pay.xrocket.tg/api/v1',
+      });
+
+      const urls: string[] = [];
+      let mode:
+        | 'primary_paid'
+        | 'fallback_client_id'
+        | 'fallback_batch'
+        | 'unpaid_pending'
+        | 'wrong_amount'
+        | 'wrong_currency'
+        | 'missing_currency' = 'primary_paid';
+
+      let createdInvoiceSeq = 0;
+      const invoiceToClientId = new Map<string, string>();
+      gw.setTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        urls.push(req.url);
+
+        // КРИТИЧЕСКАЯ ПРОВЕРКА: ни один запрос не смешивает invoiceId и clientInvoiceId!
+        assert.equal(
+          req.url.includes('invoiceId=') && req.url.includes('clientInvoiceId='),
+          false,
+          `Запрещено отправлять invoiceId и clientInvoiceId одновременно: ${req.url}`,
+        );
+
+        if (req.url.endsWith('/api/v1/currencies')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              data: [
+                {
+                  currency: 'USDT',
+                  name: 'Tether',
+                  minTransfer: 0.1,
+                  withdrawFees: [{ networkCode: 'TON', feeWithdraw: 0.1 }],
+                },
+              ],
+            },
+          };
+        }
+        if (req.url.endsWith('/api/v1/rates')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              data: { USDT: '1.00', TON: '5.50' },
+            },
+          };
+        }
+        if (req.url.endsWith('/api/v1/invoices') && req.method === 'POST') {
+          const body = JSON.parse(req.body || '{}');
+          createdInvoiceSeq += 1;
+          const invId = `xr_s442_topup_inv_${createdInvoiceSeq}`;
+          invoiceToClientId.set(invId, String(body.clientInvoiceId || ''));
+          return {
+            status: 201,
+            ok: true,
+            json: {
+              id: invId,
+              clientInvoiceId: body.clientInvoiceId,
+              status: 'PENDING',
+              links: { telegramBotLink: `https://t.me/xrocket?start=${invId}` },
+            },
+          };
+        }
+
+        if (mode === 'fallback_client_id') {
+          if (req.url.includes('/api/v1/invoice?invoiceId=')) {
+            return { status: 404, ok: false, json: { title: 'Not Found', status: 404 } };
+          }
+          if (req.url.includes('/api/v1/invoice?clientInvoiceId=pay_fb_client')) {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'xr_fb_client_1',
+                clientInvoiceId: 'pay_fb_client',
+                status: 'PAID',
+                payment: { amount: '10.00', currency: 'USDT', network: 'TON' },
+              },
+            };
+          }
+        }
+
+        if (mode === 'fallback_batch') {
+          if (req.url.includes('/api/v1/invoice?')) {
+            return { status: 404, ok: false, json: { title: 'Not Found', status: 404 } };
+          }
+          if (req.url.includes('/api/v1/invoices?ids=xr_fb_batch_1')) {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                data: [
+                  {
+                    id: 'xr_fb_batch_1',
+                    clientInvoiceId: 'pay_fb_batch',
+                    status: 'PAID',
+                    priceAmount: '12.00',
+                    priceCurrency: 'USDT',
+                  },
+                ],
+              },
+            };
+          }
+        }
+
+        // Responses for top-up verification scenarios on xr_s442_topup_inv_*
+        const invMatch = req.url.match(/\/api\/v1\/invoice\?invoiceId=(xr_s442_topup_inv_\d+)/);
+        if (invMatch) {
+          const invId = invMatch[1];
+          const clientInvoiceId = invoiceToClientId.get(invId) || '';
+          if (mode === 'unpaid_pending') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: invId,
+                clientInvoiceId,
+                status: 'PENDING',
+                priceAmount: '10.00',
+                priceCurrency: 'USDT',
+              },
+            };
+          }
+          if (mode === 'wrong_amount') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: invId,
+                clientInvoiceId,
+                status: 'PAID',
+                payment: { amount: '5.00', currency: 'USDT', network: 'TON' }, // underpaid vs 10.00
+              },
+            };
+          }
+          if (mode === 'wrong_currency') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: invId,
+                clientInvoiceId,
+                status: 'PAID',
+                payment: { amount: '10.00', currency: 'TON', network: 'TON' }, // wrong currency vs USDT
+              },
+            };
+          }
+          if (mode === 'missing_currency') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: invId,
+                clientInvoiceId,
+                status: 'PAID',
+                payment: { amount: '10.00' }, // missing currency -> MUST NOT default to USDT!
+              },
+            };
+          }
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              id: invId,
+              clientInvoiceId,
+              status: 'PAID',
+              payment: { amount: '10.00', currency: 'USDT', network: 'TON' },
+            },
+          };
+        }
+
+        throw new Error(`Unexpected xRocket URL in S442-05 (${mode}): ${req.url}`);
+      });
+
+      // 1. Fallback 1: invoiceId (404) -> clientInvoiceId (200)
+      mode = 'fallback_client_id';
+      const fb1 = await gw.verifyInvoiceStatus({
+        provider: 'xrocket',
+        externalInvoiceId: 'xr_fb_client_1',
+        paymentId: 'pay_fb_client',
+      });
+      assert.equal(fb1.status, 'paid');
+      assert.equal(fb1.currency, 'USDT');
+      assert.ok(urls.some((u) => u.includes('/api/v1/invoice?invoiceId=xr_fb_client_1')));
+      assert.ok(urls.some((u) => u.includes('/api/v1/invoice?clientInvoiceId=pay_fb_client')));
+
+      // 2. Fallback 2: invoiceId (404) -> clientInvoiceId (404) -> /invoices?ids= (200)
+      mode = 'fallback_batch';
+      const fb2 = await gw.verifyInvoiceStatus({
+        provider: 'xrocket',
+        externalInvoiceId: 'xr_fb_batch_1',
+        paymentId: 'pay_fb_batch',
+      });
+      assert.equal(fb2.status, 'paid');
+      assert.ok(urls.some((u) => u.includes('/api/v1/invoices?ids=xr_fb_batch_1')));
+
+      // 3. Проверка BalanceService с реальными отказами при unpaid / wrong amount / wrong currency / missing currency
+      const bs = new BalanceService(gw);
+
+      // 3a. Unpaid (PENDING) -> 0 зачислений
+      const topUp1 = await bs.createTopUp({
+        telegramId: buyer.id,
+        username: buyer.username,
+        firstName: buyer.first_name,
+        provider: 'xrocket',
+        amountUsdCents: 1000,
+        currency: 'USDT',
+        forceNew: true,
+      });
+      mode = 'unpaid_pending';
+      const resUnpaid = await bs.verifyAndProcessTopUp(topUp1.paymentId);
+      assert.equal(resUnpaid.ok, false);
+      assert.equal(await bs.getBalanceUsdCents(buyer.id), 0);
+
+      // 3b. Missing currency on HTTP 200 PAID -> XRocketApiError (нет тихого дефолта USDT) и 0 зачислений
+      mode = 'missing_currency';
+      await assert.rejects(
+        () =>
+          gw.verifyInvoiceStatus({
+            provider: 'xrocket',
+            externalInvoiceId: topUp1.externalInvoiceId,
+            paymentId: topUp1.paymentId,
+          }),
+        (err: unknown) =>
+          err instanceof XRocketApiError &&
+          err.problemDetails?.kind === 'invalid_invoice_payload',
+      );
+      assert.equal(await bs.getBalanceUsdCents(buyer.id), 0);
+
+      // 3c. Wrong amount (underpaid 5.00 vs 10.00) -> отклонено, 0 зачислений
+      const topUpWrongAmt = await bs.createTopUp({
+        telegramId: buyer.id,
+        username: buyer.username,
+        firstName: buyer.first_name,
+        provider: 'xrocket',
+        amountUsdCents: 1000,
+        currency: 'USDT',
+        forceNew: true,
+      });
+      mode = 'wrong_amount';
+      const resWrongAmt = await bs.verifyAndProcessTopUp(topUpWrongAmt.paymentId);
+      assert.equal(resWrongAmt.ok, false);
+      assert.equal(resWrongAmt.status, 'underpaid');
+      assert.equal(await bs.getBalanceUsdCents(buyer.id), 0);
+
+      // 3d. Wrong currency (TON vs USDT) -> отклонено, 0 зачислений
+      const topUpWrongCur = await bs.createTopUp({
+        telegramId: buyer.id,
+        username: buyer.username,
+        firstName: buyer.first_name,
+        provider: 'xrocket',
+        amountUsdCents: 1000,
+        currency: 'USDT',
+        forceNew: true,
+      });
+      mode = 'wrong_currency';
+      const resWrongCur = await bs.verifyAndProcessTopUp(topUpWrongCur.paymentId);
+      assert.equal(resWrongCur.ok, false);
+      assert.equal(await bs.getBalanceUsdCents(buyer.id), 0);
+
+      // 3e. Valid PAID (10.00 USDT) + повторная/параллельная проверка -> баланс зачислен ровно 1 раз ($9.80 = 980 центов с 2% комиссией)
+      const topUpValid = await bs.createTopUp({
+        telegramId: buyer.id,
+        username: buyer.username,
+        firstName: buyer.first_name,
+        provider: 'xrocket',
+        amountUsdCents: 1000,
+        currency: 'USDT',
+        forceNew: true,
+      });
+      mode = 'primary_paid';
+      const [ok1, ok2] = await Promise.all([
+        bs.verifyAndProcessTopUp(topUpValid.paymentId),
+        bs.verifyAndProcessTopUp(topUpValid.paymentId),
+      ]);
+      assert.equal(ok1.ok, true);
+      assert.equal(ok2.ok, true);
+      assert.equal(
+        await bs.getBalanceUsdCents(buyer.id),
+        980,
+        'Баланс должен быть зачислен ровно 1 раз (980 центов), без двойного зачисления',
+      );
+
+      return 'xRocket verifyInvoiceStatus (раздельные primary/fallback запросы, строгая проверка status/amount/currency без дефолта USDT и защита от двойного зачисления) подтверждён.';
     },
   );
 

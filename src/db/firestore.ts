@@ -90,7 +90,7 @@ interface LocalDatabaseState {
   payment_locks: Record<string, PaymentLockRecord>;
   transactions: Record<string, StoreTransaction>;
   admins: Record<string, AdminRecord>;
-  settings: Record<string, StoreSettings>;
+  settings: Record<string, StoreSettings | Record<string, unknown>>;
 }
 
 export interface SimulatedFailureConfig {
@@ -1169,9 +1169,12 @@ export class FirestoreRepository {
 
     await prevMutex;
 
-    const snapshot = JSON.parse(
-      JSON.stringify(this.localState),
-    ) as LocalDatabaseState;
+    const previousValues: Array<{
+      collectionName: StoreCollectionName;
+      docId: string;
+      existed: boolean;
+      value: unknown;
+    }> = [];
 
     try {
       let hasWritten = false;
@@ -1226,12 +1229,29 @@ export class FirestoreRepository {
           string,
           unknown
         >;
+        previousValues.push({
+          collectionName: write.collectionName,
+          docId: write.docId,
+          existed: Object.prototype.hasOwnProperty.call(bucket, write.docId),
+          value: bucket[write.docId],
+        });
         bucket[write.docId] = write.data;
       }
       this.saveLocalState();
       return result;
     } catch (error) {
-      this.localState = snapshot;
+      for (let i = previousValues.length - 1; i >= 0; i--) {
+        const prev = previousValues[i];
+        const bucket = this.localState[prev.collectionName] as Record<
+          string,
+          unknown
+        >;
+        if (prev.existed) {
+          bucket[prev.docId] = prev.value;
+        } else {
+          delete bucket[prev.docId];
+        }
+      }
       throw error;
     } finally {
       releaseLock();

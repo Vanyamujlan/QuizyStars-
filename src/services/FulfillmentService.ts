@@ -6,6 +6,7 @@ import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
   DistributedLeaseRecord,
   FirestoreTimestampLike,
+  MyStarsPollCheckpoint,
   NotificationDeliveryState,
   Order,
   StoreTransaction,
@@ -91,6 +92,7 @@ export class FulfillmentService {
   public static notificationLeaseTtlMs = 45_000;
   public static staleOrderAlertThresholdMs = 15 * 60 * 1000;
   public static pollBatchBudget = 50;
+  public static pollPageSize = 100;
   public static workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
@@ -262,6 +264,46 @@ export class FulfillmentService {
     this.inFlightMyStarsPollOrders.clear();
   }
 
+  public static async loadMyStarsPollCheckpoint(): Promise<MyStarsPollCheckpoint | null> {
+    try {
+      const doc = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+        'settings',
+        'mystars_poll_cursor',
+      );
+      if (doc && doc.key === 'mystars_poll_cursor') {
+        return doc;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  public static async saveMyStarsPollCheckpoint(
+    checkpoint: MyStarsPollCheckpoint,
+  ): Promise<void> {
+    try {
+      await firestoreRepo.setDoc<MyStarsPollCheckpoint>(
+        'settings',
+        'mystars_poll_cursor',
+        checkpoint,
+      );
+    } catch {
+      // Best-effort checkpoint persistence
+    }
+  }
+
+  public static async resetMyStarsPollCheckpoint(): Promise<void> {
+    await this.saveMyStarsPollCheckpoint({
+      key: 'mystars_poll_cursor',
+      cursorCreatedAt: undefined,
+      cursorOrderId: undefined,
+      cyclesCompleted: 0,
+      lastPolledCount: 0,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
   public static getMyStarsPollingStatus(): {
     mode: 'polling';
     workerActive: boolean;
@@ -314,25 +356,38 @@ export class FulfillmentService {
   }
 
   /**
-   * Sends admin notification using a resilient state machine (`pending` -> `sending` -> `sent`)
+   * Sends admin notification using a resilient state machine
+   * (`pending` -> `sending` -> `sent` | `delivery_uncertain`)
    * with atomic claim, event ID, and lease protection.
-   * If a process crashes while in `sending` (after Telegram may have accepted the request) and
-   * its lease expires, transitions to `sent` with `deliveryUncertainAfterCrash: true` to avoid
-   * duplicate spam while recording the uncertain post-crash state.
+   *
+   * Honesty contract: between Telegram Bot API and Firestore there is no distributed transaction,
+   * so absolute exactly-once delivery across process crashes is NOT guaranteed.
+   * If a process crashes while in `sending` (after Telegram may have accepted the message) and
+   * `leaseUntil` expires, we transition to explicit `delivery_uncertain` (NOT `sent` and WITHOUT
+   * setting `adminNotifiedAt`) so automatic retries never spam duplicates and admins can inspect
+   * and decide whether to perform a controlled resend or acknowledge delivery.
+   * Even `forceResend=true` respects an active `sending` lease to prevent parallel resend races.
    */
   public static async ensureAdminNotified(
     order: Order,
     bot: Telegraf | null | undefined,
     forceResend = false,
   ): Promise<Order> {
-    if (!forceResend && (order.adminNotifiedAt || order.adminNotificationState?.status === 'sent')) {
+    if (
+      !forceResend &&
+      (order.adminNotifiedAt ||
+        order.adminNotificationState?.status === 'sent' ||
+        order.adminNotificationState?.status === 'delivery_uncertain')
+    ) {
       return order;
     }
     if (!bot) {
       return order;
     }
 
-    const eventId = `evt_admin_${order.orderId}_${order.fulfillmentStatus}`;
+    const eventId =
+      order.adminNotificationState?.eventId ||
+      `evt_admin_${order.orderId}_${order.fulfillmentStatus}`;
     const operationId = `op_admin_notify_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const leaseOwner = this.workerInstanceId;
     const nowMs = Date.now();
@@ -359,46 +414,50 @@ export class FulfillmentService {
 
     type AdminNotifyClaim =
       | { action: 'already_sent'; order: Order }
+      | { action: 'delivery_uncertain'; order: Order }
       | { action: 'in_flight'; order: Order }
-      | { action: 'recovered_after_crash'; order: Order }
+      | { action: 'recovered_uncertain'; order: Order }
       | { action: 'claimed'; order: Order };
 
     const claim = await firestoreRepo.runTransaction<AdminNotifyClaim>(async (tx) => {
       const current = (await tx.get<Order>('orders', order.orderId)) || order;
       const state = current.adminNotificationState;
+      const leaseUntilMs = this.timestampToMillis(state?.leaseUntil);
+
+      // Protect BOTH normal send and forceResend against concurrent in-flight execution
+      if (state?.status === 'sending' && leaseUntilMs > nowMs) {
+        return { action: 'in_flight', order: current };
+      }
 
       if (!forceResend) {
         if (current.adminNotifiedAt || state?.status === 'sent') {
           return { action: 'already_sent', order: current };
         }
+        if (state?.status === 'delivery_uncertain') {
+          return { action: 'delivery_uncertain', order: current };
+        }
         if (state?.status === 'sending') {
-          const leaseUntilMs = this.timestampToMillis(state.leaseUntil);
-          if (leaseUntilMs > nowMs) {
-            return { action: 'in_flight', order: current };
-          }
           // Previous worker crashed during `sending` and its lease expired:
-          // Mark `sent` with `deliveryUncertainAfterCrash: true` to avoid duplicate messages
-          const recoveredState: NotificationDeliveryState = {
+          // Mark explicit `delivery_uncertain` (NOT `sent`) preserving eventId/operationId/leaseOwner/leaseUntil/attemptCount.
+          const uncertainState: NotificationDeliveryState = {
             ...state,
-            status: 'sent',
-            leaseUntil: undefined,
-            sentAt: nowIso,
+            status: 'delivery_uncertain',
+            uncertainSince: state.uncertainSince || nowIso,
             deliveryUncertainAfterCrash: true,
           };
-          const recoveredOrder: Order = {
+          const uncertainOrder: Order = {
             ...current,
-            adminNotifiedAt: current.adminNotifiedAt || nowIso,
-            adminNotificationState: recoveredState,
+            adminNotificationState: uncertainState,
             updatedAt: nowIso,
           };
-          tx.set<Order>('orders', recoveredOrder.orderId, recoveredOrder);
-          return { action: 'recovered_after_crash', order: recoveredOrder };
+          tx.set<Order>('orders', uncertainOrder.orderId, uncertainOrder);
+          return { action: 'recovered_uncertain', order: uncertainOrder };
         }
       }
 
       const claimingState: NotificationDeliveryState = {
         status: 'sending',
-        eventId,
+        eventId: state?.eventId || eventId,
         operationId,
         leaseOwner,
         leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
@@ -415,9 +474,9 @@ export class FulfillmentService {
     });
 
     if (claim.action !== 'claimed') {
-      if (claim.action === 'recovered_after_crash') {
+      if (claim.action === 'recovered_uncertain') {
         console.warn(
-          `[FulfillmentService] Восстановлено состояние adminNotificationState после истечения sending-lease для заказа #${order.orderId} (deliveryUncertainAfterCrash=true).`,
+          `[FulfillmentService] Переведено состояние adminNotificationState в delivery_uncertain после истечения sending-lease для заказа #${order.orderId} (автоповтор заблокирован, требуется проверка админом).`,
         );
       }
       return claim.order;
@@ -456,9 +515,10 @@ export class FulfillmentService {
       if (deliveredCount > 0) {
         const sentState: NotificationDeliveryState = {
           status: 'sent',
-          eventId,
+          eventId: latestState?.eventId || eventId,
           operationId,
           leaseOwner,
+          leaseUntil: latestState?.leaseUntil,
           attemptCount: latestState?.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
@@ -475,7 +535,7 @@ export class FulfillmentService {
 
       const pendingState: NotificationDeliveryState = {
         status: 'pending',
-        eventId,
+        eventId: latestState?.eventId || eventId,
         operationId,
         leaseOwner,
         attemptCount: latestState?.attemptCount ?? 1,
@@ -492,25 +552,37 @@ export class FulfillmentService {
   }
 
   /**
-   * Sends buyer completion notification using a resilient state machine (`pending` -> `sending` -> `sent`)
+   * Sends buyer completion notification using a resilient state machine
+   * (`pending` -> `sending` -> `sent` | `delivery_uncertain`)
    * with atomic claim, event ID, and lease protection.
-   * Never claims absolute `exactly-once` across process crashes right after Telegram accepts an HTTP request:
-   * if a process crashes while in `sending` and `leaseUntil` expires, transitions to `sent` with
-   * `deliveryUncertainAfterCrash: true` to prevent duplicate completion spam while logging the state.
+   *
+   * Honesty contract: never claims absolute `exactly-once` delivery across process crashes
+   * after Telegram accepts an HTTP request. If a process crashes while in `sending` and
+   * `leaseUntil` expires, transitions to explicit `delivery_uncertain` (NOT `sent` and WITHOUT
+   * setting `buyerNotifiedAt`) so automatic loops never spam duplicates while admins can inspect
+   * and trigger a controlled resend or acknowledge delivery.
+   * Even `forceResend=true` respects an active `sending` lease to prevent parallel resend races.
    */
   public static async ensureBuyerNotified(
     order: Order,
     bot: Telegraf | null | undefined,
     forceResend = false,
   ): Promise<Order> {
-    if (!forceResend && (order.buyerNotifiedAt || order.buyerNotificationState?.status === 'sent')) {
+    if (
+      !forceResend &&
+      (order.buyerNotifiedAt ||
+        order.buyerNotificationState?.status === 'sent' ||
+        order.buyerNotificationState?.status === 'delivery_uncertain')
+    ) {
       return order;
     }
     if (!bot) {
       return order;
     }
 
-    const eventId = `evt_buyer_completed_${order.orderId}`;
+    const eventId =
+      order.buyerNotificationState?.eventId ||
+      `evt_buyer_completed_${order.orderId}`;
     const operationId = `op_buyer_notify_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const leaseOwner = this.workerInstanceId;
     const nowMs = Date.now();
@@ -518,46 +590,51 @@ export class FulfillmentService {
 
     type BuyerNotifyClaim =
       | { action: 'already_sent'; order: Order }
+      | { action: 'delivery_uncertain'; order: Order }
       | { action: 'in_flight'; order: Order }
-      | { action: 'recovered_after_crash'; order: Order }
+      | { action: 'recovered_uncertain'; order: Order }
       | { action: 'claimed'; order: Order };
 
     const claim = await firestoreRepo.runTransaction<BuyerNotifyClaim>(async (tx) => {
       const current = (await tx.get<Order>('orders', order.orderId)) || order;
       const state = current.buyerNotificationState;
+      const leaseUntilMs = this.timestampToMillis(state?.leaseUntil);
+
+      // Protect BOTH normal send and forceResend against concurrent in-flight execution
+      if (state?.status === 'sending' && leaseUntilMs > nowMs) {
+        return { action: 'in_flight', order: current };
+      }
 
       if (!forceResend) {
         if (current.buyerNotifiedAt || state?.status === 'sent') {
           return { action: 'already_sent', order: current };
         }
+        if (state?.status === 'delivery_uncertain') {
+          return { action: 'delivery_uncertain', order: current };
+        }
         if (state?.status === 'sending') {
-          const leaseUntilMs = this.timestampToMillis(state.leaseUntil);
-          if (leaseUntilMs > nowMs) {
-            return { action: 'in_flight', order: current };
-          }
           // Previous worker crashed during `sending` and its lease expired:
-          // Transition to `sent` with `deliveryUncertainAfterCrash: true` so the buyer is never spammed
-          const recoveredState: NotificationDeliveryState = {
+          // Transition to explicit `delivery_uncertain` (NOT `sent`) so buyer is never auto-spammed
+          // and delivery is NOT falsely marked confirmed.
+          const uncertainState: NotificationDeliveryState = {
             ...state,
-            status: 'sent',
-            leaseUntil: undefined,
-            sentAt: nowIso,
+            status: 'delivery_uncertain',
+            uncertainSince: state.uncertainSince || nowIso,
             deliveryUncertainAfterCrash: true,
           };
-          const recoveredOrder: Order = {
+          const uncertainOrder: Order = {
             ...current,
-            buyerNotifiedAt: current.buyerNotifiedAt || nowIso,
-            buyerNotificationState: recoveredState,
+            buyerNotificationState: uncertainState,
             updatedAt: nowIso,
           };
-          tx.set<Order>('orders', recoveredOrder.orderId, recoveredOrder);
-          return { action: 'recovered_after_crash', order: recoveredOrder };
+          tx.set<Order>('orders', uncertainOrder.orderId, uncertainOrder);
+          return { action: 'recovered_uncertain', order: uncertainOrder };
         }
       }
 
       const claimingState: NotificationDeliveryState = {
         status: 'sending',
-        eventId,
+        eventId: state?.eventId || eventId,
         operationId,
         leaseOwner,
         leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
@@ -574,9 +651,9 @@ export class FulfillmentService {
     });
 
     if (claim.action !== 'claimed') {
-      if (claim.action === 'recovered_after_crash') {
+      if (claim.action === 'recovered_uncertain') {
         console.warn(
-          `[FulfillmentService] Восстановлено состояние buyerNotificationState после истечения sending-lease для заказа #${order.orderId} (deliveryUncertainAfterCrash=true).`,
+          `[FulfillmentService] Переведено состояние buyerNotificationState в delivery_uncertain после истечения sending-lease для заказа #${order.orderId} (автоповтор заблокирован, требуется проверка админом).`,
         );
       }
       return claim.order;
@@ -604,9 +681,10 @@ export class FulfillmentService {
       if (ok) {
         const sentState: NotificationDeliveryState = {
           status: 'sent',
-          eventId,
+          eventId: latestState?.eventId || eventId,
           operationId,
           leaseOwner,
+          leaseUntil: latestState?.leaseUntil,
           attemptCount: latestState?.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
@@ -623,7 +701,7 @@ export class FulfillmentService {
 
       const pendingState: NotificationDeliveryState = {
         status: 'pending',
-        eventId,
+        eventId: latestState?.eventId || eventId,
         operationId,
         leaseOwner,
         attemptCount: latestState?.attemptCount ?? 1,
@@ -639,24 +717,119 @@ export class FulfillmentService {
     });
   }
 
+  /**
+   * Controlled admin force-resend for buyer and/or admin notifications.
+   * Respects active `sending` leases so concurrent clicks or workers cannot duplicate messages.
+   */
+  public static async forceResendOrderNotification(params: {
+    orderId: string;
+    target: 'buyer' | 'admin' | 'both';
+    bot: Telegraf;
+    adminTelegramId?: number;
+  }): Promise<{
+    order: Order;
+    sentAdmin: boolean;
+    sentBuyer: boolean;
+    skippedInFlight: boolean;
+  }> {
+    let order = await OrderService.getOrderById(params.orderId);
+    if (!order) {
+      throw new Error(`Заказ #${params.orderId} не найден.`);
+    }
+
+    let sentAdmin = false;
+    let sentBuyer = false;
+    let skippedInFlight = false;
+
+    if (params.target === 'admin' || params.target === 'both') {
+      const next = await this.ensureAdminNotified(order, params.bot, true);
+      if (next.adminNotificationState?.status === 'sending') {
+        skippedInFlight = true;
+      } else {
+        sentAdmin = next.adminNotificationState?.status === 'sent';
+      }
+      order = next;
+    }
+
+    if (
+      (params.target === 'buyer' || params.target === 'both') &&
+      order.fulfillmentStatus === 'completed'
+    ) {
+      const next = await this.ensureBuyerNotified(order, params.bot, true);
+      if (next.buyerNotificationState?.status === 'sending') {
+        skippedInFlight = true;
+      } else {
+        sentBuyer = next.buyerNotificationState?.status === 'sent';
+      }
+      order = next;
+    }
+
+    return { order, sentAdmin, sentBuyer, skippedInFlight };
+  }
+
+  /**
+   * Admin inspection procedure: marks a `delivery_uncertain` notification as verified/confirmed
+   * without sending a duplicate message to Telegram.
+   */
+  public static async acknowledgeUncertainNotification(params: {
+    orderId: string;
+    target: 'buyer' | 'admin' | 'both';
+    adminTelegramId: number;
+  }): Promise<Order> {
+    const nowIso = new Date().toISOString();
+    return firestoreRepo.runTransaction<Order>(async (tx) => {
+      const current = await tx.get<Order>('orders', params.orderId);
+      if (!current) {
+        throw new Error(`Заказ #${params.orderId} не найден.`);
+      }
+
+      const updated: Order = { ...current, updatedAt: nowIso };
+      if (
+        (params.target === 'buyer' || params.target === 'both') &&
+        current.buyerNotificationState?.status === 'delivery_uncertain'
+      ) {
+        updated.buyerNotifiedAt = current.buyerNotifiedAt || nowIso;
+        updated.buyerNotificationState = {
+          ...current.buyerNotificationState,
+          status: 'sent',
+          sentAt: current.buyerNotificationState.sentAt || nowIso,
+          acknowledgedByAdminId: params.adminTelegramId,
+          acknowledgedAt: nowIso,
+        };
+      }
+      if (
+        (params.target === 'admin' || params.target === 'both') &&
+        current.adminNotificationState?.status === 'delivery_uncertain'
+      ) {
+        updated.adminNotifiedAt = current.adminNotifiedAt || nowIso;
+        updated.adminNotificationState = {
+          ...current.adminNotificationState,
+          status: 'sent',
+          sentAt: current.adminNotificationState.sentAt || nowIso,
+          acknowledgedByAdminId: params.adminTelegramId,
+          acknowledgedAt: nowIso,
+        };
+      }
+
+      tx.set<Order>('orders', updated.orderId, updated);
+      return updated;
+    });
+  }
+
   public static async retryOrderNotifications(
     orderId: string,
     bot: Telegraf,
   ): Promise<{ order: Order; adminNotified: boolean; buyerNotified: boolean }> {
-    let order = await OrderService.getOrderById(orderId);
-    if (!order) {
-      throw new Error(`Заказ #${orderId} не найден.`);
-    }
-
-    order = await this.ensureAdminNotified(order, bot, true);
-    if (order.fulfillmentStatus === 'completed') {
-      order = await this.ensureBuyerNotified(order, bot, true);
-    }
+    const res = await this.forceResendOrderNotification({
+      orderId,
+      target: 'both',
+      bot,
+    });
 
     return {
-      order,
-      adminNotified: Boolean(order.adminNotifiedAt),
-      buyerNotified: Boolean(order.buyerNotifiedAt),
+      order: res.order,
+      adminNotified: Boolean(res.order.adminNotifiedAt),
+      buyerNotified: Boolean(res.order.buyerNotifiedAt),
     };
   }
 
@@ -730,7 +903,13 @@ export class FulfillmentService {
       | { action: 'needs_admin_notification_only'; order: Order }
       | { action: 'needs_reconciliation_check'; order: Order }
       | { action: 'exhausted'; order: Order }
-      | { action: 'claimed'; order: Order; attempt: number };
+      | {
+          action: 'claimed';
+          order: Order;
+          attempt: number;
+          hadLockedIdempotencyKey: boolean;
+          wasAmbiguousBeforeClaim: boolean;
+        };
 
     // =========================================================================
     // PHASE 1: ATOMIC CLAIM BEFORE EXTERNAL ADAPTER CALL
@@ -797,6 +976,12 @@ export class FulfillmentService {
       }
 
       const nextAttempt = prevAttempts + 1;
+      const hadLockedIdempotencyKey = Boolean(
+        current.fulfillmentIdempotencyKey && current.fulfillmentIdempotencyKey.trim(),
+      );
+      const wasAmbiguousBeforeClaim = Boolean(
+        current.mystarsAmbiguousPostAt || current.mystarsCreateInFlight,
+      );
       const claimedOrder: Order = {
         ...current,
         fulfillmentStatus: 'processing',
@@ -812,7 +997,13 @@ export class FulfillmentService {
       };
 
       tx.set<Order>('orders', claimedOrder.orderId, claimedOrder);
-      return { action: 'claimed', order: claimedOrder, attempt: nextAttempt };
+      return {
+        action: 'claimed',
+        order: claimedOrder,
+        attempt: nextAttempt,
+        hadLockedIdempotencyKey,
+        wasAmbiguousBeforeClaim,
+      };
     });
 
     if (claim.action === 'already_completed') {
@@ -840,21 +1031,29 @@ export class FulfillmentService {
     // PHASE 2: EXECUTE EXTERNAL ADAPTER (ONLY FOR THE WORKER THAT WON THE CLAIM)
     // =========================================================================
     let { order: claimedOrder } = claim;
-    const { attempt } = claim;
+    const { attempt, hadLockedIdempotencyKey, wasAmbiguousBeforeClaim } = claim;
     try {
-      // If a previous attempt had an ambiguous POST /v1/orders timeout before saving mystarsOrderId,
-      // run bounded reconciliation via GET /v1/orders before sending another POST /v1/orders.
+      // If a previous attempt had an ambiguous POST /v1/orders timeout or crash before saving mystarsOrderId,
+      // run strict multi-page reconciliation via GET /v1/orders before sending another POST /v1/orders.
       if (
         activeAdapter instanceof MyStarsFulfillmentAdapter &&
         !claimedOrder.mystarsOrderId &&
-        claimedOrder.mystarsAmbiguousPostAt
+        wasAmbiguousBeforeClaim
       ) {
         const reconciled = await activeAdapter.reconcileAmbiguousCreateOrder(claimedOrder);
         if (reconciled.status === 'ambiguous_multiple') {
           throw new MyStarsApiError({
-            message: `Обнаружено несколько (${reconciled.count}) подходящих заказов в MyStars после таймаута POST /v1/orders. Автоповтор заблокирован для защиты от дублирования.`,
+            message: `Обнаружено несколько (${reconciled.count}) подходящих заказов в MyStars после таймаута POST /v1/orders (проверено стр.: ${reconciled.pagesScanned}). Автоповтор заблокирован для защиты от дублирования.`,
             httpStatus: 409,
             code: 'ambiguous_create_order',
+            retryable: false,
+          });
+        }
+        if (reconciled.status === 'insufficient_data') {
+          throw new MyStarsApiError({
+            message: reconciled.reason,
+            httpStatus: 409,
+            code: 'insufficient_reconciliation_data',
             retryable: false,
           });
         }
@@ -867,6 +1066,14 @@ export class FulfillmentService {
             mystarsCreateInFlight: false,
             mystarsAmbiguousPostAt: undefined,
           };
+        } else if (reconciled.status === 'not_found' && !hadLockedIdempotencyKey) {
+          throw new MyStarsApiError({
+            message:
+              'После неопределённого POST /v1/orders заказ не найден в GET /v1/orders, но исходный fulfillmentIdempotencyKey отсутствует. Автоповтор заблокирован для защиты от дублирования.',
+            httpStatus: 409,
+            code: 'missing_idempotency_key',
+            retryable: false,
+          });
         }
       }
 
@@ -1051,12 +1258,18 @@ export class FulfillmentService {
             mystarsCreateInFlight: false,
             mystarsAmbiguousPostAt: undefined,
           };
-        } else if (reconciled.status === 'ambiguous_multiple' || !hasLockedIdempotencyKey) {
+        } else if (
+          reconciled.status === 'ambiguous_multiple' ||
+          reconciled.status === 'insufficient_data' ||
+          !hasLockedIdempotencyKey
+        ) {
           const nowIso = new Date().toISOString();
           const reason =
             reconciled.status === 'ambiguous_multiple'
-              ? `Обнаружено несколько (${reconciled.count}) подходящих заказов в MyStars после сбоя POST /v1/orders. Автоповтор заблокирован для защиты от дублирования.`
-              : 'Сервер перезапустился во время POST /v1/orders без сохранённого Idempotency-Key. Автоповтор заблокирован для защиты от двойного создания заказа.';
+              ? `Обнаружено несколько (${reconciled.count}) подходящих заказов в MyStars после сбоя POST /v1/orders (проверено стр.: ${reconciled.pagesScanned}). Автоповтор заблокирован для защиты от дублирования.`
+              : reconciled.status === 'insufficient_data'
+                ? reconciled.reason
+                : 'Сервер перезапустился во время POST /v1/orders без сохранённого Idempotency-Key. Автоповтор заблокирован для защиты от двойного создания заказа.';
           const quarantined = await firestoreRepo.runTransaction<Order>(async (tx) => {
             const current = (await tx.get<Order>('orders', staleOrder.orderId)) || staleOrder;
             const updated: Order = {
@@ -1399,46 +1612,148 @@ export class FulfillmentService {
       return summary;
     }
 
-    // Cursor-paginated scan of all 'processing' orders ordered by 'createdAt' (always present),
-    // ensuring legacy documents without `mystarsLastPolledAt` are never excluded by Firestore indexes
-    // and orders #51+ are fairly scheduled in round-robin order.
-    const allProcessingOrders: Order[] = [];
-    let cursorOrderId: string | undefined;
-    const PAGE_SIZE = 100;
-    const MAX_PAGES = 10;
+    // Persistent cursor-paginated fair polling over all 'processing' orders ordered by 'createdAt' ASC:
+    // - Uses real Firestore `startAfter: { value: createdAt, id: orderId }` cursor pagination (never excludes
+    //   legacy docs without `mystarsLastPolledAt` and never stops at a hard 1000-order cap).
+    // - For small active queues (< pollPageSize on a single page from start), sorts globally with
+    //   legacy/unpolled orders prioritized first.
+    // - For large multi-page queues (>= pollPageSize, e.g. 1,500+ orders), advances a persistent Firestore
+    //   checkpoint (`settings/mystars_poll_cursor`) across ticks and restarts, wrapping cleanly at the tail
+    //   so 100% of active orders are fairly serviced with zero starvation.
+    const budget = Math.max(1, this.pollBatchBudget);
+    const pageSize = Math.max(1, this.pollPageSize);
+    const isMyStarsCandidate = (ord: Order): boolean =>
+      Boolean(
+        ord.mystarsOrderId ||
+          (ord.externalExecutionReference &&
+            (ord.externalExecutionReference.startsWith('ord_') ||
+              ord.externalExecutionReference.startsWith('ms_'))),
+      );
+    const hasActiveExternalLease = (ord: Order, refMs: number): boolean => {
+      if (this.inFlightMyStarsPollOrders.has(ord.orderId)) {
+        return true;
+      }
+      const untilMs = this.timestampToMillis(ord.mystarsPollLease?.leaseUntil);
+      return Boolean(ord.mystarsPollLease && untilMs > refMs);
+    };
 
-    for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
-      const page = await firestoreRepo.queryDocs<Order>('orders', {
-        where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
-        orderBy: { field: 'createdAt', direction: 'asc' },
-        limit: PAGE_SIZE,
-        ...(cursorOrderId ? { startAfterDocId: cursorOrderId } : {}),
-      });
-      if (page.length === 0) break;
-      allProcessingOrders.push(...page);
-      if (page.length < PAGE_SIZE) break;
-      cursorOrderId = page[page.length - 1].orderId;
+    const checkpoint = await this.loadMyStarsPollCheckpoint();
+    let scanCursor: { value: string; id: string } | undefined =
+      checkpoint?.cursorCreatedAt && checkpoint?.cursorOrderId
+        ? { value: checkpoint.cursorCreatedAt, id: checkpoint.cursorOrderId }
+        : undefined;
+    let cyclesCompleted = checkpoint?.cyclesCompleted ?? 0;
+
+    let batchToPoll: Order[] = [];
+    let isMultiPageSweep = Boolean(scanCursor);
+    let reachedTailOnLastScan = false;
+    let wrappedAroundThisTick = false;
+
+    const firstPage = await firestoreRepo.queryDocs<Order>('orders', {
+      where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
+      orderBy: { field: 'createdAt', direction: 'asc' },
+      limit: pageSize,
+      ...(scanCursor ? { startAfter: scanCursor } : {}),
+    });
+
+    if (!isMultiPageSweep && firstPage.length < pageSize) {
+      // Entire active queue fits in one page -> globally sort with missing mystarsLastPolledAt first
+      const candidates = firstPage
+        .filter((ord) => isMyStarsCandidate(ord) && !hasActiveExternalLease(ord, nowMs))
+        .sort((a, b) => {
+          const aPolledMs = a.mystarsLastPolledAt ? Date.parse(a.mystarsLastPolledAt) || 0 : 0;
+          const bPolledMs = b.mystarsLastPolledAt ? Date.parse(b.mystarsLastPolledAt) || 0 : 0;
+          if (aPolledMs !== bPolledMs) {
+            return aPolledMs - bPolledMs;
+          }
+          return (a.createdAt || '').localeCompare(b.createdAt || '');
+        });
+      batchToPoll = candidates.slice(0, budget);
+      reachedTailOnLastScan = true;
+    } else {
+      // Large multi-page queue or resumed mid-sweep from persistent checkpoint
+      isMultiPageSweep = true;
+      const visitedOrderIds = new Set<string>();
+      const maxDocsToScan = Math.max(pageSize * 5, budget * 10);
+      let scannedDocs = 0;
+      let currentPage = firstPage;
+      let pageIndex = 0;
+
+      while (batchToPoll.length < budget && scannedDocs < maxDocsToScan) {
+        if (pageIndex > 0) {
+          currentPage = await firestoreRepo.queryDocs<Order>('orders', {
+            where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
+            orderBy: { field: 'createdAt', direction: 'asc' },
+            limit: pageSize,
+            ...(scanCursor ? { startAfter: scanCursor } : {}),
+          });
+        }
+        pageIndex++;
+
+        if (currentPage.length === 0) {
+          if (!wrappedAroundThisTick && checkpoint?.cursorOrderId) {
+            // Reached end of collection; wrap around once to the beginning
+            wrappedAroundThisTick = true;
+            reachedTailOnLastScan = true;
+            cyclesCompleted += 1;
+            scanCursor = undefined;
+            continue;
+          }
+          reachedTailOnLastScan = true;
+          break;
+        }
+
+        let stoppedEarlyAtIndex = -1;
+        for (let i = 0; i < currentPage.length; i++) {
+          const ord = currentPage[i];
+          scannedDocs += 1;
+          if (visitedOrderIds.has(ord.orderId)) {
+            continue;
+          }
+          visitedOrderIds.add(ord.orderId);
+          if (isMyStarsCandidate(ord) && !hasActiveExternalLease(ord, Date.now())) {
+            batchToPoll.push(ord);
+            if (batchToPoll.length >= budget) {
+              stoppedEarlyAtIndex = i;
+              break;
+            }
+          }
+        }
+
+        if (stoppedEarlyAtIndex >= 0) {
+          const lastPicked = currentPage[stoppedEarlyAtIndex];
+          const isExactEndOfShortPage =
+            currentPage.length < pageSize && stoppedEarlyAtIndex === currentPage.length - 1;
+          if (isExactEndOfShortPage) {
+            reachedTailOnLastScan = true;
+            cyclesCompleted += 1;
+            scanCursor = undefined;
+          } else {
+            reachedTailOnLastScan = false;
+            scanCursor = { value: lastPicked.createdAt, id: lastPicked.orderId };
+          }
+          break;
+        }
+
+        const lastInPage = currentPage[currentPage.length - 1];
+        if (currentPage.length < pageSize) {
+          reachedTailOnLastScan = true;
+          cyclesCompleted += 1;
+          scanCursor = undefined;
+          if (!wrappedAroundThisTick && checkpoint?.cursorOrderId) {
+            // Wrap around once so the remaining budget is used on the head of the queue
+            wrappedAroundThisTick = true;
+            continue;
+          }
+          break;
+        }
+
+        scanCursor = { value: lastInPage.createdAt, id: lastInPage.orderId };
+      }
     }
 
-    const myStarsCandidates = allProcessingOrders
-      .filter((ord) =>
-        Boolean(
-          ord.mystarsOrderId ||
-            (ord.externalExecutionReference &&
-              (ord.externalExecutionReference.startsWith('ord_') ||
-                ord.externalExecutionReference.startsWith('ms_'))),
-        ),
-      )
-      .sort((a, b) => {
-        const aPolledMs = a.mystarsLastPolledAt ? Date.parse(a.mystarsLastPolledAt) || 0 : 0;
-        const bPolledMs = b.mystarsLastPolledAt ? Date.parse(b.mystarsLastPolledAt) || 0 : 0;
-        if (aPolledMs !== bPolledMs) {
-          return aPolledMs - bPolledMs;
-        }
-        return (a.createdAt || '').localeCompare(b.createdAt || '');
-      });
-
-    const batchToPoll = myStarsCandidates.slice(0, Math.max(1, this.pollBatchBudget));
+    let lastAttemptedOrderInSweep: Order | null = null;
+    let interruptedByRateLimit = false;
 
     for (const ord of batchToPoll) {
       if (this.inFlightMyStarsPollOrders.has(ord.orderId)) {
@@ -1465,6 +1780,7 @@ export class FulfillmentService {
         }
 
         summary.polled += 1;
+        lastAttemptedOrderInSweep = ord;
         const extStatus = await activeAdapter.checkExternalStatus(
           latest,
           latest.fulfillmentIdempotencyKey || `fulfill_${latest.orderId}`,
@@ -1544,6 +1860,7 @@ export class FulfillmentService {
           this.mystarsPollCooldownUntilMs = Date.now() + cooldownMs;
           summary.rateLimited = true;
           summary.transientErrors += 1;
+          interruptedByRateLimit = true;
           await firestoreRepo
             .updateDoc<Order>('orders', ord.orderId, {
               mystarsLastPolledAt: new Date().toISOString(),
@@ -1602,6 +1919,39 @@ export class FulfillmentService {
           operationId,
         }).catch(() => {});
       }
+    }
+
+    // Persist cursor checkpoint for multi-page sweeps so next tick & restarts resume fairly
+    if (isMultiPageSweep) {
+      const nextCursorToSave =
+        interruptedByRateLimit && lastAttemptedOrderInSweep
+          ? {
+              cursorCreatedAt: lastAttemptedOrderInSweep.createdAt,
+              cursorOrderId: lastAttemptedOrderInSweep.orderId,
+            }
+          : reachedTailOnLastScan && !scanCursor
+            ? { cursorCreatedAt: undefined, cursorOrderId: undefined }
+            : scanCursor
+              ? { cursorCreatedAt: scanCursor.value, cursorOrderId: scanCursor.id }
+              : { cursorCreatedAt: undefined, cursorOrderId: undefined };
+
+      await this.saveMyStarsPollCheckpoint({
+        key: 'mystars_poll_cursor',
+        cursorCreatedAt: nextCursorToSave.cursorCreatedAt,
+        cursorOrderId: nextCursorToSave.cursorOrderId,
+        cyclesCompleted,
+        lastPolledCount: summary.polled,
+        updatedAt: new Date().toISOString(),
+      });
+    } else if (checkpoint?.cursorOrderId) {
+      await this.saveMyStarsPollCheckpoint({
+        key: 'mystars_poll_cursor',
+        cursorCreatedAt: undefined,
+        cursorOrderId: undefined,
+        cyclesCompleted: cyclesCompleted + 1,
+        lastPolledCount: summary.polled,
+        updatedAt: new Date().toISOString(),
+      });
     }
 
     return summary;

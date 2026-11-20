@@ -130,7 +130,8 @@ export interface MyStarsCreateOrderResult {
   quantity?: number | null;
   months?: number | null;
   payment: MyStarsPaymentInstruction;
-  expires_at: string;
+  expires_at?: string | null;
+  purchase_tx?: string | null;
 }
 
 export interface MyStarsOrderRecord {
@@ -149,12 +150,39 @@ export interface MyStarsOrderRecord {
   created_at: string;
   updated_at: string;
   expires_at?: string | null;
+  payment?: MyStarsPaymentInstruction | null;
+  currency?: string | null;
+  payment_amount?: string | null;
+  service_fee_usdt?: string | null;
 }
 
 export interface MyStarsOrderPage {
   orders: MyStarsOrderRecord[];
   next_cursor?: string | null;
 }
+
+export type MyStarsReconcileCreateResult =
+  | {
+      status: 'found';
+      mystarsOrderId: string;
+      mystarsStatus: string;
+      pagesScanned: number;
+    }
+  | {
+      status: 'not_found';
+      pagesScanned: number;
+    }
+  | {
+      status: 'ambiguous_multiple';
+      count: number;
+      pagesScanned: number;
+    }
+  | {
+      status: 'insufficient_data';
+      reason: string;
+      incompleteCount: number;
+      pagesScanned: number;
+    };
 
 export interface MyStarsCancelResult {
   order_id: string;
@@ -738,7 +766,7 @@ export class MyStarsClient {
   private ensurePlainObject(raw: unknown, endpoint: string): Record<string, unknown> {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new MyStarsValidationError({
-        message: `Некорректный JSON-ответ MyStars API (${endpoint}): ожидался объект, получено ${raw === null ? 'null' : typeof raw}.`,
+        message: `Некорректный JSON-ответ MyStars API (${endpoint}): ожидался объект, получено ${raw === null ? 'null' : Array.isArray(raw) ? 'array' : typeof raw}.`,
         endpoint,
       });
     }
@@ -756,20 +784,309 @@ export class MyStarsClient {
     return rec;
   }
 
-  private validatePricingResponse(raw: unknown, endpoint: string): MyStarsPricingQuote {
-    const rec = this.ensurePlainObject(raw, endpoint);
-    const amount = rec.amount !== undefined && rec.amount !== null ? String(rec.amount).trim() : '';
-    const currency = typeof rec.currency === 'string' ? rec.currency.trim() : '';
-    if (!amount || !currency) {
+  private validateNonEmptyString(
+    value: unknown,
+    field: string,
+    endpoint: string,
+  ): string {
+    if (typeof value !== 'string' || !value.trim()) {
       throw new MyStarsValidationError({
-        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют обязательные поля amount или currency.`,
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле ${field} должно быть непустой строкой.`,
         endpoint,
       });
     }
+    return value.trim();
+  }
+
+  private validateNullableString(
+    value: unknown,
+    field: string,
+    endpoint: string,
+  ): string | null | undefined {
+    if (value === undefined || value === null) {
+      return value;
+    }
+    if (typeof value !== 'string') {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле ${field} должно быть строкой или null.`,
+        endpoint,
+      });
+    }
+    return value;
+  }
+
+  private validateNumericString(
+    value: unknown,
+    field: string,
+    endpoint: string,
+  ): string {
+    let normalized = '';
+    if (typeof value === 'string') {
+      normalized = value.trim();
+    } else if (typeof value === 'number' && Number.isFinite(value)) {
+      normalized = String(value);
+    } else {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле ${field} должно быть числовой строкой.`,
+        endpoint,
+      });
+    }
+
+    if (
+      !normalized ||
+      !/^\d+(\.\d+)?$/.test(normalized) ||
+      !Number.isFinite(Number(normalized))
+    ) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле ${field} содержит некорректное числовое значение "${normalized.slice(0, 40)}".`,
+        endpoint,
+      });
+    }
+    return normalized;
+  }
+
+  private validateNullableNumericString(
+    value: unknown,
+    field: string,
+    endpoint: string,
+  ): string | null | undefined {
+    if (value === undefined || value === null) {
+      return value;
+    }
+    return this.validateNumericString(value, field, endpoint);
+  }
+
+  private validateNullablePositiveInt(
+    value: unknown,
+    field: string,
+    endpoint: string,
+  ): number | null | undefined {
+    if (value === undefined || value === null) {
+      return value;
+    }
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле ${field} должно быть положительным целым числом или null.`,
+        endpoint,
+      });
+    }
+    return value;
+  }
+
+  private validateProductType(
+    value: unknown,
+    field: string,
+    endpoint: string,
+  ): MyStarsProductType {
+    if (value !== 'stars' && value !== 'premium') {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле ${field} должно быть "stars" или "premium".`,
+        endpoint,
+      });
+    }
+    return value;
+  }
+
+  private validateFeeBreakdown(
+    raw: unknown,
+    field: string,
+    endpoint: string,
+  ): MyStarsFeeBreakdown {
+    const rec = this.ensurePlainObject(raw, `${endpoint}.${field}`);
+    const subtotal = this.validateNumericString(rec.subtotal, `${field}.subtotal`, endpoint);
+    const processing_fee = this.validateNumericString(
+      rec.processing_fee,
+      `${field}.processing_fee`,
+      endpoint,
+    );
+    const total = this.validateNumericString(rec.total, `${field}.total`, endpoint);
+    const currency = this.validateNonEmptyString(rec.currency, `${field}.currency`, endpoint);
+    const description =
+      rec.description === undefined
+        ? ''
+        : typeof rec.description === 'string'
+          ? rec.description
+          : (() => {
+              throw new MyStarsValidationError({
+                message: `Некорректная схема ответа MyStars API (${endpoint}): поле ${field}.description должно быть строкой.`,
+                endpoint,
+              });
+            })();
+    const kind = this.validateNullableString(rec.kind, `${field}.kind`, endpoint);
     return {
-      ...(rec as unknown as MyStarsPricingQuote),
+      subtotal,
+      processing_fee,
+      total,
+      description,
+      currency,
+      ...(typeof kind === 'string' ? { kind } : {}),
+    };
+  }
+
+  private validatePaymentInstruction(
+    raw: unknown,
+    field: string,
+    endpoint: string,
+  ): MyStarsPaymentInstruction {
+    const rec = this.ensurePlainObject(raw, `${endpoint}.${field}`);
+    const currency = this.validateNonEmptyString(rec.currency, `${field}.currency`, endpoint);
+    const chain = this.validateNonEmptyString(rec.chain, `${field}.chain`, endpoint);
+    const amount = this.validateNumericString(rec.amount, `${field}.amount`, endpoint);
+    const amount_units = this.validateNumericString(
+      rec.amount_units,
+      `${field}.amount_units`,
+      endpoint,
+    );
+    const pay_to_address = this.validateNullableString(
+      rec.pay_to_address,
+      `${field}.pay_to_address`,
+      endpoint,
+    );
+    const memo = this.validateNullableString(rec.memo, `${field}.memo`, endpoint);
+    const fee =
+      rec.fee === undefined || rec.fee === null
+        ? (rec.fee as null | undefined)
+        : this.validateFeeBreakdown(rec.fee, `${field}.fee`, endpoint);
+
+    return {
+      currency,
+      chain,
+      ...(pay_to_address !== undefined ? { pay_to_address } : {}),
+      ...(memo !== undefined ? { memo } : {}),
+      amount,
+      amount_units,
+      ...(fee !== undefined ? { fee } : {}),
+    };
+  }
+
+  private validateCurrenciesResponse(
+    raw: unknown,
+    endpoint: string,
+  ): MyStarsCurrencyInfo[] {
+    let list: unknown[];
+    if (Array.isArray(raw)) {
+      list = raw;
+    } else {
+      const rec = this.ensurePlainObject(raw, endpoint);
+      if (!Array.isArray(rec.currencies)) {
+        throw new MyStarsValidationError({
+          message: `Некорректная схема ответа MyStars API (${endpoint}): ожидался массив валют или поле currencies[].`,
+          endpoint,
+        });
+      }
+      list = rec.currencies;
+    }
+
+    return list.map((item, idx) => {
+      const itemRec = this.ensurePlainObject(item, `${endpoint}[${idx}]`);
+      return {
+        code: this.validateNonEmptyString(itemRec.code, `[${idx}].code`, endpoint),
+        chain: this.validateNonEmptyString(itemRec.chain, `[${idx}].chain`, endpoint),
+        name: this.validateNonEmptyString(itemRec.name, `[${idx}].name`, endpoint),
+      };
+    });
+  }
+
+  private validateProductsResponse(
+    raw: unknown,
+    endpoint: string,
+  ): MyStarsProductInfo[] {
+    let list: unknown[];
+    if (Array.isArray(raw)) {
+      list = raw;
+    } else {
+      const rec = this.ensurePlainObject(raw, endpoint);
+      if (!Array.isArray(rec.products)) {
+        throw new MyStarsValidationError({
+          message: `Некорректная схема ответа MyStars API (${endpoint}): ожидался массив продуктов или поле products[].`,
+          endpoint,
+        });
+      }
+      list = rec.products;
+    }
+
+    return list.map((item, idx) => {
+      const itemRec = this.ensurePlainObject(item, `${endpoint}[${idx}]`);
+      const type = this.validateProductType(itemRec.type, `[${idx}].type`, endpoint);
+      const name = this.validateNonEmptyString(itemRec.name, `[${idx}].name`, endpoint);
+      if (itemRec.parameter !== 'quantity' && itemRec.parameter !== 'months') {
+        throw new MyStarsValidationError({
+          message: `Некорректная схема ответа MyStars API (${endpoint}): поле [${idx}].parameter должно быть "quantity" или "months".`,
+          endpoint,
+        });
+      }
+      const min = itemRec.min;
+      const max = itemRec.max;
+      if (
+        typeof min !== 'number' ||
+        !Number.isFinite(min) ||
+        min <= 0 ||
+        typeof max !== 'number' ||
+        !Number.isFinite(max) ||
+        max < min
+      ) {
+        throw new MyStarsValidationError({
+          message: `Некорректная схема ответа MyStars API (${endpoint}): поля [${idx}].min и [${idx}].max должны быть корректными положительными числами (min <= max).`,
+          endpoint,
+        });
+      }
+
+      let values: number[] | null | undefined;
+      if (itemRec.values === undefined || itemRec.values === null) {
+        values = itemRec.values;
+      } else if (Array.isArray(itemRec.values)) {
+        values = itemRec.values.map((v, vIdx) => {
+          if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+            throw new MyStarsValidationError({
+              message: `Некорректная схема ответа MyStars API (${endpoint}): поле [${idx}].values[${vIdx}] должно быть положительным числом.`,
+              endpoint,
+            });
+          }
+          return v;
+        });
+      } else {
+        throw new MyStarsValidationError({
+          message: `Некорректная схема ответа MyStars API (${endpoint}): поле [${idx}].values должно быть массивом чисел или null.`,
+          endpoint,
+        });
+      }
+
+      return {
+        type,
+        name,
+        parameter: itemRec.parameter,
+        min,
+        max,
+        ...(values !== undefined ? { values } : {}),
+      };
+    });
+  }
+
+  private validatePricingResponse(raw: unknown, endpoint: string): MyStarsPricingQuote {
+    const rec = this.ensurePlainObject(raw, endpoint);
+    const type = this.validateProductType(rec.type, 'type', endpoint);
+    const amount = this.validateNumericString(rec.amount, 'amount', endpoint);
+    const currency = this.validateNonEmptyString(rec.currency, 'currency', endpoint);
+    const quantity = this.validateNullablePositiveInt(rec.quantity, 'quantity', endpoint);
+    const months = this.validateNullablePositiveInt(rec.months, 'months', endpoint);
+    const fee =
+      rec.fee === undefined || rec.fee === null
+        ? (rec.fee as null | undefined)
+        : this.validateFeeBreakdown(rec.fee, 'fee', endpoint);
+    const usdt_per_ton = this.validateNullableNumericString(
+      rec.usdt_per_ton,
+      'usdt_per_ton',
+      endpoint,
+    );
+
+    return {
+      type,
+      ...(quantity !== undefined ? { quantity } : {}),
+      ...(months !== undefined ? { months } : {}),
       amount,
       currency,
+      ...(fee !== undefined ? { fee } : {}),
+      ...(usdt_per_ton !== undefined ? { usdt_per_ton } : {}),
     };
   }
 
@@ -778,26 +1095,54 @@ export class MyStarsClient {
     endpoint: string,
   ): MyStarsRecipientCheckResult {
     const rec = this.ensurePlainObject(raw, endpoint);
+    if (rec.resolved !== undefined && typeof rec.resolved !== 'boolean') {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле resolved должно быть булевым.`,
+        endpoint,
+      });
+    }
+    if (rec.eligible !== undefined && typeof rec.eligible !== 'boolean') {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле eligible должно быть булевым.`,
+        endpoint,
+      });
+    }
+    if (rec.indeterminate !== undefined && typeof rec.indeterminate !== 'boolean') {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле indeterminate должно быть булевым.`,
+        endpoint,
+      });
+    }
+
     const hasBooleanFlags =
       typeof rec.resolved === 'boolean' && typeof rec.eligible === 'boolean';
     const hasIndeterminate = typeof rec.indeterminate === 'boolean';
     if (!hasBooleanFlags && !hasIndeterminate) {
       throw new MyStarsValidationError({
-        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют булевы поля resolved/eligible.`,
+        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют обязательные булевы поля resolved/eligible или indeterminate.`,
         endpoint,
       });
     }
+
+    const recipient_name = this.validateNullableString(
+      rec.recipient_name,
+      'recipient_name',
+      endpoint,
+    );
+    const reason = this.validateNullableString(rec.reason, 'reason', endpoint);
+    const telegram_message = this.validateNullableString(
+      rec.telegram_message,
+      'telegram_message',
+      endpoint,
+    );
+
     return {
       resolved: typeof rec.resolved === 'boolean' ? rec.resolved : false,
       eligible: typeof rec.eligible === 'boolean' ? rec.eligible : false,
       ...(typeof rec.indeterminate === 'boolean' ? { indeterminate: rec.indeterminate } : {}),
-      ...(rec.recipient_name !== undefined
-        ? { recipient_name: rec.recipient_name as string | null }
-        : {}),
-      ...(rec.reason !== undefined ? { reason: rec.reason as string | null } : {}),
-      ...(rec.telegram_message !== undefined
-        ? { telegram_message: rec.telegram_message as string | null }
-        : {}),
+      ...(recipient_name !== undefined ? { recipient_name } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+      ...(telegram_message !== undefined ? { telegram_message } : {}),
     };
   }
 
@@ -806,26 +1151,89 @@ export class MyStarsClient {
     endpoint: string,
   ): MyStarsCreateOrderResult {
     const rec = this.ensurePlainObject(raw, endpoint);
-    const rawOrderId =
-      typeof rec.order_id === 'string' && rec.order_id.trim()
-        ? rec.order_id.trim()
-        : typeof rec.id === 'string' && rec.id.trim()
-          ? rec.id.trim()
-          : '';
-    const rawStatus =
-      typeof rec.status === 'string' && rec.status.trim() ? rec.status.trim() : '';
+    const orderIdRaw = rec.order_id !== undefined ? rec.order_id : rec.id;
+    const order_id = this.validateNonEmptyString(orderIdRaw, 'order_id', endpoint);
+    const status = this.validateNonEmptyString(rec.status, 'status', endpoint);
+    const type = this.validateProductType(rec.type, 'type', endpoint);
+    const quantity = this.validateNullablePositiveInt(rec.quantity, 'quantity', endpoint);
+    const months = this.validateNullablePositiveInt(rec.months, 'months', endpoint);
+    const purchase_tx = this.validateNullableString(rec.purchase_tx, 'purchase_tx', endpoint);
+    const expires_at = this.validateNullableString(rec.expires_at, 'expires_at', endpoint);
 
-    if (!rawOrderId || !rawStatus) {
+    if (typeof expires_at === 'string' && !expires_at.trim()) {
       throw new MyStarsValidationError({
-        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют обязательные строковые поля order_id или status.`,
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле expires_at не может быть пустой строкой.`,
+        endpoint,
+      });
+    }
+    if (status.toLowerCase() === 'awaiting_payment' && !expires_at) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствует обязательное поле expires_at для статуса awaiting_payment.`,
         endpoint,
       });
     }
 
+    let payment: MyStarsPaymentInstruction;
+    if (rec.payment !== undefined && rec.payment !== null) {
+      payment = this.validatePaymentInstruction(rec.payment, 'payment', endpoint);
+    } else {
+      // Documented flat response variant (currency + payment_amount + optional pay_to_address/payment_memo/service_fee_usdt)
+      const flatCurrency = this.validateNonEmptyString(rec.currency, 'currency', endpoint);
+      const flatAmount = this.validateNumericString(
+        rec.payment_amount,
+        'payment_amount',
+        endpoint,
+      );
+      const flatPayTo = this.validateNullableString(
+        rec.pay_to_address,
+        'pay_to_address',
+        endpoint,
+      );
+      const flatMemo = this.validateNullableString(
+        rec.payment_memo,
+        'payment_memo',
+        endpoint,
+      );
+      const flatServiceFee = this.validateNullableNumericString(
+        rec.service_fee_usdt,
+        'service_fee_usdt',
+        endpoint,
+      );
+      const flatSubtotal = this.validateNullableNumericString(
+        rec.fragment_cost_usdt,
+        'fragment_cost_usdt',
+        endpoint,
+      );
+      payment = {
+        currency: flatCurrency,
+        chain: 'ton',
+        amount: flatAmount,
+        amount_units: flatAmount,
+        ...(flatPayTo !== undefined ? { pay_to_address: flatPayTo } : {}),
+        ...(flatMemo !== undefined ? { memo: flatMemo } : {}),
+        ...(flatServiceFee !== undefined && flatServiceFee !== null
+          ? {
+              fee: {
+                subtotal: flatSubtotal ?? flatAmount,
+                processing_fee: flatServiceFee,
+                total: flatAmount,
+                description: 'MyStars service fee',
+                currency: flatCurrency,
+              },
+            }
+          : {}),
+      };
+    }
+
     return {
-      ...(rec as unknown as MyStarsCreateOrderResult),
-      order_id: rawOrderId,
-      status: rawStatus,
+      order_id,
+      status,
+      type,
+      ...(quantity !== undefined ? { quantity } : {}),
+      ...(months !== undefined ? { months } : {}),
+      payment,
+      ...(expires_at !== undefined ? { expires_at } : {}),
+      ...(purchase_tx !== undefined ? { purchase_tx } : {}),
     };
   }
 
@@ -834,26 +1242,78 @@ export class MyStarsClient {
     endpoint: string,
   ): MyStarsOrderRecord {
     const rec = this.ensurePlainObject(raw, endpoint);
-    const rawOrderId =
-      typeof rec.order_id === 'string' && rec.order_id.trim()
-        ? rec.order_id.trim()
-        : typeof rec.id === 'string' && rec.id.trim()
-          ? rec.id.trim()
-          : '';
-    const rawStatus =
-      typeof rec.status === 'string' && rec.status.trim() ? rec.status.trim() : '';
+    const orderIdRaw = rec.order_id !== undefined ? rec.order_id : rec.id;
+    const order_id = this.validateNonEmptyString(orderIdRaw, 'order_id', endpoint);
+    const status = this.validateNonEmptyString(rec.status, 'status', endpoint);
+    const type = this.validateProductType(rec.type, 'type', endpoint);
+    const created_at = this.validateNonEmptyString(rec.created_at, 'created_at', endpoint);
+    const updated_at =
+      rec.updated_at === undefined || rec.updated_at === null
+        ? created_at
+        : this.validateNonEmptyString(rec.updated_at, 'updated_at', endpoint);
 
-    if (!rawOrderId || !rawStatus) {
-      throw new MyStarsValidationError({
-        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют обязательные строковые поля order_id или status.`,
-        endpoint,
-      });
-    }
+    const recipient_username = this.validateNullableString(
+      rec.recipient_username,
+      'recipient_username',
+      endpoint,
+    );
+    const quantity = this.validateNullablePositiveInt(rec.quantity, 'quantity', endpoint);
+    const months = this.validateNullablePositiveInt(rec.months, 'months', endpoint);
+    const amount_ton = this.validateNullableNumericString(
+      rec.amount_ton,
+      'amount_ton',
+      endpoint,
+    );
+    const payment_tx = this.validateNullableString(rec.payment_tx, 'payment_tx', endpoint);
+    const purchase_tx = this.validateNullableString(rec.purchase_tx, 'purchase_tx', endpoint);
+    const failure_reason = this.validateNullableString(
+      rec.failure_reason,
+      'failure_reason',
+      endpoint,
+    );
+    const reversal_tx = this.validateNullableString(rec.reversal_tx, 'reversal_tx', endpoint);
+    const telegram_message = this.validateNullableString(
+      rec.telegram_message,
+      'telegram_message',
+      endpoint,
+    );
+    const expires_at = this.validateNullableString(rec.expires_at, 'expires_at', endpoint);
+    const payment =
+      rec.payment === undefined || rec.payment === null
+        ? (rec.payment as null | undefined)
+        : this.validatePaymentInstruction(rec.payment, 'payment', endpoint);
+    const currency = this.validateNullableString(rec.currency, 'currency', endpoint);
+    const payment_amount = this.validateNullableNumericString(
+      rec.payment_amount,
+      'payment_amount',
+      endpoint,
+    );
+    const service_fee_usdt = this.validateNullableNumericString(
+      rec.service_fee_usdt,
+      'service_fee_usdt',
+      endpoint,
+    );
 
     return {
-      ...(rec as unknown as MyStarsOrderRecord),
-      order_id: rawOrderId,
-      status: rawStatus,
+      order_id,
+      status,
+      type,
+      ...(recipient_username !== undefined ? { recipient_username } : {}),
+      ...(quantity !== undefined ? { quantity } : {}),
+      ...(months !== undefined ? { months } : {}),
+      ...(amount_ton !== undefined ? { amount_ton } : {}),
+      ...(payment_tx !== undefined ? { payment_tx } : {}),
+      ...(purchase_tx !== undefined ? { purchase_tx } : {}),
+      ...(failure_reason !== undefined ? { failure_reason } : {}),
+      ...(reversal_tx !== undefined ? { reversal_tx } : {}),
+      ...(telegram_message !== undefined ? { telegram_message } : {}),
+      created_at,
+      updated_at,
+      ...(expires_at !== undefined ? { expires_at } : {}),
+      ...(payment !== undefined ? { payment } : {}),
+      ...(currency !== undefined ? { currency } : {}),
+      ...(payment_amount !== undefined ? { payment_amount } : {}),
+      ...(service_fee_usdt !== undefined ? { service_fee_usdt } : {}),
     };
   }
 
@@ -873,27 +1333,56 @@ export class MyStarsClient {
         endpoint,
       });
     }
+    if (
+      rec.next_cursor !== undefined &&
+      rec.next_cursor !== null &&
+      typeof rec.next_cursor !== 'string'
+    ) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле next_cursor должно быть строкой или null.`,
+        endpoint,
+      });
+    }
     return {
       orders: rec.orders.map((item, idx) =>
         this.validateOrderRecordResponse(item, `${endpoint}.orders[${idx}]`),
       ),
       next_cursor:
-        typeof rec.next_cursor === 'string' ? rec.next_cursor : null,
+        typeof rec.next_cursor === 'string' && rec.next_cursor.trim()
+          ? rec.next_cursor.trim()
+          : null,
     };
   }
 
+  private validateCancelOrderResponse(
+    raw: unknown,
+    cleanId: string,
+    endpoint: string,
+  ): MyStarsCancelResult {
+    if (raw === null || raw === undefined) {
+      return { order_id: cleanId, status: 'cancelled' };
+    }
+    const rec = this.ensurePlainObject(raw, endpoint);
+    const orderIdRaw = rec.order_id !== undefined ? rec.order_id : rec.id;
+    const order_id = this.validateNonEmptyString(orderIdRaw, 'order_id', endpoint);
+    const status = this.validateNonEmptyString(rec.status, 'status', endpoint);
+    return { order_id, status };
+  }
+
   public async getCurrencies(): Promise<MyStarsCurrencyInfo[]> {
-    return this.requestJson<MyStarsCurrencyInfo[]>({
+    const raw = await this.requestJson<unknown>({
       method: 'GET',
       path: '/currencies',
     });
+    return this.validateCurrenciesResponse(raw, 'GET /v1/currencies');
   }
 
   public async getProducts(): Promise<MyStarsProductInfo[]> {
-    return this.requestJson<MyStarsProductInfo[]>({
+    const raw = await this.requestJson<unknown>({
       method: 'GET',
       path: '/products',
     });
+    return this.validateProductsResponse(raw, 'GET /v1/products');
   }
 
   public async getPricing(params: {
@@ -1002,13 +1491,12 @@ export class MyStarsClient {
         retryable: false,
       });
     }
-    const res = await this.requestJson<MyStarsCancelResult | null>({
+    const path = `/orders/${encodeURIComponent(cleanId)}/cancel`;
+    const raw = await this.requestJson<unknown>({
       method: 'POST',
-      path: `/orders/${encodeURIComponent(cleanId)}/cancel`,
+      path,
     });
-    return res && typeof res === 'object' && 'order_id' in res
-      ? res
-      : { order_id: cleanId, status: 'cancelled' };
+    return this.validateCancelOrderResponse(raw, cleanId, `POST /v1${path}`);
   }
 
   public async listOrders(params?: {
@@ -1209,55 +1697,208 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
   }
 
   /**
-   * Bounded reconciliation via `GET /v1/orders` when a previous `POST /v1/orders` timed out
-   * or dropped before `mystarsOrderId` was persisted in Firestore.
+   * Multi-page reconciliation via `GET /v1/orders` (following `next_cursor`) when a previous
+   * `POST /v1/orders` timed out or dropped before `mystarsOrderId` was persisted in Firestore.
+   *
+   * Strict matching safety guarantees:
+   * - Never matches candidates when `recipient_username`, `quantity`/`months`, or valid `created_at`
+   *   are missing; instead counts them as incomplete candidates and returns `insufficient_data` so
+   *   the order is quarantined rather than risk duplicate creation.
+   * - Never returns `not_found` when pagination is truncated (exceeds maxPages or cursor loop).
+   * - Returns `found` ONLY when there is exactly 1 full-signal match, 0 incomplete candidates,
+   *   and pagination completed cleanly without truncation.
    */
-  public async reconcileAmbiguousCreateOrder(order: Order): Promise<{
-    status: 'found' | 'not_found' | 'ambiguous_multiple';
-    mystarsOrderId?: string;
-    mystarsStatus?: string;
-    count?: number;
-  }> {
+  public async reconcileAmbiguousCreateOrder(
+    order: Order,
+    options?: { maxPages?: number; pageLimit?: number },
+  ): Promise<MyStarsReconcileCreateResult> {
     if (!this.client.isConfigured()) {
-      return { status: 'not_found' };
+      return { status: 'not_found', pagesScanned: 0 };
     }
     if (order.category !== 'stars' && order.category !== 'premium') {
-      return { status: 'not_found' };
+      return { status: 'not_found', pagesScanned: 0 };
     }
 
-    const cleanUsername = validateMyStarsUsername(
-      order.recipientUsername || order.username,
-    );
-    const page = await this.client.listOrders({ limit: 20 });
+    let cleanUsername: string;
+    try {
+      cleanUsername = validateMyStarsUsername(order.recipientUsername || order.username);
+    } catch {
+      return {
+        status: 'insufficient_data',
+        reason: 'Отсутствует или некорректен username получателя для безопасной сверки POST /v1/orders.',
+        incompleteCount: 0,
+        pagesScanned: 0,
+      };
+    }
+
+    const expectedQuantity =
+      order.category === 'stars' ? Number(order.quantity) : undefined;
+    const expectedMonths =
+      order.category === 'premium' ? Number(order.durationMonths ?? 3) : undefined;
+
+    if (
+      order.category === 'stars' &&
+      (!Number.isInteger(expectedQuantity) || (expectedQuantity ?? 0) <= 0)
+    ) {
+      return {
+        status: 'insufficient_data',
+        reason: 'Отсутствует корректное количество Stars для сверки заказа в MyStars.',
+        incompleteCount: 0,
+        pagesScanned: 0,
+      };
+    }
+    if (
+      order.category === 'premium' &&
+      (!Number.isInteger(expectedMonths) || (expectedMonths ?? 0) <= 0)
+    ) {
+      return {
+        status: 'insufficient_data',
+        reason: 'Отсутствует корректный срок Premium (months) для сверки заказа в MyStars.',
+        incompleteCount: 0,
+        pagesScanned: 0,
+      };
+    }
+
     const startedAtMs = order.fulfillmentStartedAt
       ? Date.parse(order.fulfillmentStartedAt)
       : Date.parse(order.createdAt);
+    if (!Number.isFinite(startedAtMs)) {
+      return {
+        status: 'insufficient_data',
+        reason: 'Отсутствует валидная временная метка запуска выдачи для сверки GET /v1/orders.',
+        incompleteCount: 0,
+        pagesScanned: 0,
+      };
+    }
 
-    const matches = page.orders.filter((item) => {
-      if (item.type !== order.category) return false;
-      const itemUser = (item.recipient_username || '').trim().replace(/^@/, '').toLowerCase();
-      if (itemUser && itemUser !== cleanUsername) return false;
-      if (order.category === 'stars') {
-        if (item.quantity !== undefined && item.quantity !== null && Number(item.quantity) !== Number(order.quantity)) {
-          return false;
-        }
-      } else if (order.category === 'premium') {
-        const expectedMonths = Number(order.durationMonths ?? 3);
-        if (item.months !== undefined && item.months !== null && Number(item.months) !== expectedMonths) {
-          return false;
-        }
-      }
-      if (item.created_at && Number.isFinite(startedAtMs)) {
+    const ambiguousAtMs = order.mystarsAmbiguousPostAt
+      ? Date.parse(order.mystarsAmbiguousPostAt)
+      : NaN;
+    const windowStartMs = startedAtMs - 60_000;
+    const windowEndMs =
+      Math.max(Date.now(), Number.isFinite(ambiguousAtMs) ? ambiguousAtMs : 0) + 60_000;
+
+    const maxPages = Math.max(1, options?.maxPages ?? 10);
+    const pageLimit = Math.max(1, Math.min(100, options?.pageLimit ?? 50));
+
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+    const seenOrderIds = new Set<string>();
+    const confirmedMatches: MyStarsOrderRecord[] = [];
+    let incompleteCandidates = 0;
+    let pagesScanned = 0;
+    let truncated = false;
+    let cursorLoopDetected = false;
+
+    while (pagesScanned < maxPages) {
+      const page = await this.client.listOrders({ limit: pageLimit, cursor });
+      pagesScanned += 1;
+
+      for (const item of page.orders) {
+        if (seenOrderIds.has(item.order_id)) continue;
+        seenOrderIds.add(item.order_id);
+
+        if (item.type !== order.category) continue;
+
+        let hasMissingSignal = false;
+
+        // 1. Validate created_at time window strictly (never match without valid created_at)
         const itemCreatedMs = Date.parse(item.created_at);
-        if (Number.isFinite(itemCreatedMs) && itemCreatedMs < startedAtMs - 60_000) {
-          return false;
+        if (Number.isFinite(itemCreatedMs)) {
+          if (itemCreatedMs < windowStartMs || itemCreatedMs > windowEndMs) {
+            continue;
+          }
+        } else {
+          hasMissingSignal = true;
+        }
+
+        // 2. Validate recipient_username strictly (never match if missing)
+        const itemUser =
+          typeof item.recipient_username === 'string'
+            ? item.recipient_username.trim().replace(/^@/, '').toLowerCase()
+            : '';
+        if (itemUser) {
+          if (itemUser !== cleanUsername) {
+            continue;
+          }
+        } else {
+          hasMissingSignal = true;
+        }
+
+        // 3. Validate quantity (stars) or months (premium) strictly (never match if missing)
+        if (order.category === 'stars') {
+          if (item.quantity !== undefined && item.quantity !== null) {
+            if (Number(item.quantity) !== expectedQuantity) {
+              continue;
+            }
+          } else {
+            hasMissingSignal = true;
+          }
+        } else {
+          if (item.months !== undefined && item.months !== null) {
+            if (Number(item.months) !== expectedMonths) {
+              continue;
+            }
+          } else {
+            hasMissingSignal = true;
+          }
+        }
+
+        if (hasMissingSignal) {
+          incompleteCandidates += 1;
+        } else {
+          confirmedMatches.push(item);
         }
       }
-      return true;
-    });
 
-    if (matches.length === 1) {
-      const matched = matches[0];
+      const nextCursor = page.next_cursor?.trim() || null;
+      if (!nextCursor) {
+        break;
+      }
+      if (seenCursors.has(nextCursor)) {
+        cursorLoopDetected = true;
+        truncated = true;
+        break;
+      }
+      seenCursors.add(nextCursor);
+
+      if (pagesScanned >= maxPages) {
+        truncated = true;
+        break;
+      }
+      cursor = nextCursor;
+    }
+
+    if (confirmedMatches.length > 1) {
+      return {
+        status: 'ambiguous_multiple',
+        count: confirmedMatches.length,
+        pagesScanned,
+      };
+    }
+
+    if (incompleteCandidates > 0) {
+      return {
+        status: 'insufficient_data',
+        reason: `В GET /v1/orders найдены кандидаты (${incompleteCandidates}) с неполными данными (отсутствует recipient_username, quantity/months или валидный created_at). Автоповтор POST /v1/orders заблокирован для защиты от дублирования.`,
+        incompleteCount: incompleteCandidates,
+        pagesScanned,
+      };
+    }
+
+    if (truncated) {
+      return {
+        status: 'insufficient_data',
+        reason: cursorLoopDetected
+          ? `Обнаружен повтор курсора next_cursor при пагинации GET /v1/orders (${pagesScanned} стр.). Автоповтор POST /v1/orders заблокирован.`
+          : `Пагинация GET /v1/orders достигла лимита (${maxPages} стр.) и не проверила все заказы. Автоповтор POST /v1/orders заблокирован для защиты от дублирования.`,
+        incompleteCount: 0,
+        pagesScanned,
+      };
+    }
+
+    if (confirmedMatches.length === 1) {
+      const matched = confirmedMatches[0];
       const resolvedId = matched.order_id;
       const resolvedStatus = (matched.status || '').toLowerCase();
       await this.persistMyStarsOrderMetadata(order, {
@@ -1271,17 +1912,11 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
         status: 'found',
         mystarsOrderId: resolvedId,
         mystarsStatus: resolvedStatus,
+        pagesScanned,
       };
     }
 
-    if (matches.length > 1) {
-      return {
-        status: 'ambiguous_multiple',
-        count: matches.length,
-      };
-    }
-
-    return { status: 'not_found' };
+    return { status: 'not_found', pagesScanned };
   }
 
   public async checkExternalStatus(
@@ -1311,23 +1946,24 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
     }
 
     const remoteOrder = await this.client.getOrder(mystarsOrderId);
-    const remoteRec = remoteOrder as unknown as Record<string, unknown>;
-    const resolvedOrderId =
-      remoteOrder.order_id ||
-      (typeof remoteRec.id === 'string' ? remoteRec.id : mystarsOrderId);
+    const resolvedOrderId = remoteOrder.order_id || mystarsOrderId;
     const status = (remoteOrder.status || '').toLowerCase();
     const isUnknownStatus = !MYSTARS_KNOWN_STATUSES.has(status);
 
-    const remotePayment = remoteRec.payment as MyStarsPaymentInstruction | undefined;
+    const remotePayment = remoteOrder.payment ?? undefined;
     const wholesaleTotalUsdt =
       remotePayment?.fee?.total ||
       remotePayment?.amount ||
-      (typeof remoteRec.payment_amount === 'string' ? remoteRec.payment_amount : undefined);
+      remoteOrder.payment_amount ||
+      undefined;
     const processingFeeUsdt =
       remotePayment?.fee?.processing_fee ||
-      (typeof remoteRec.service_fee_usdt === 'string' ? remoteRec.service_fee_usdt : undefined);
+      remoteOrder.service_fee_usdt ||
+      undefined;
     const remoteCurrency: 'usdt_ton' | 'ton' =
-      remoteRec.currency === 'ton' || remotePayment?.currency === 'ton' ? 'ton' : 'usdt_ton';
+      remoteOrder.currency === 'ton' || remotePayment?.currency === 'ton'
+        ? 'ton'
+        : 'usdt_ton';
 
     const pnlUpdates = wholesaleTotalUsdt
       ? this.computeOrderPnLUpdates({
@@ -1507,36 +2143,21 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       idempotencyKey,
     });
 
-    const createdRec = created as unknown as Record<string, unknown>;
-    const resolvedOrderId =
-      created.order_id ||
-      (typeof createdRec.id === 'string' ? createdRec.id : `ms_${order.orderId}`);
+    const resolvedOrderId = created.order_id;
     const status = (created.status || '').toLowerCase();
     const isUnknownStatus = !MYSTARS_KNOWN_STATUSES.has(status);
     const payment = created.payment;
-    const flatPaymentAmount =
-      typeof createdRec.payment_amount === 'string' ? createdRec.payment_amount : undefined;
-    const flatServiceFee =
-      typeof createdRec.service_fee_usdt === 'string' ? createdRec.service_fee_usdt : undefined;
-    const flatPayToAddress =
-      typeof createdRec.pay_to_address === 'string' ? createdRec.pay_to_address : undefined;
-    const flatPaymentMemo =
-      typeof createdRec.payment_memo === 'string' ? createdRec.payment_memo : undefined;
-    const flatPurchaseTx =
-      typeof createdRec.purchase_tx === 'string' ? createdRec.purchase_tx : undefined;
-    const flatCurrency =
-      createdRec.currency === 'ton' || payment?.currency === 'ton' ? 'ton' : 'usdt_ton';
+    const resolvedCurrency: 'usdt_ton' | 'ton' =
+      payment.currency === 'ton' ? 'ton' : 'usdt_ton';
 
-    const wholesaleTotalUsdt =
-      payment?.fee?.total || payment?.amount || flatPaymentAmount || '0';
-    const processingFeeUsdt =
-      payment?.fee?.processing_fee || flatServiceFee || '0';
+    const wholesaleTotalUsdt = payment.fee?.total || payment.amount || '0';
+    const processingFeeUsdt = payment.fee?.processing_fee || '0';
 
     const pnlUpdates = this.computeOrderPnLUpdates({
       order,
       wholesaleTotalUsdt,
       processingFeeUsdt,
-      currency: flatCurrency,
+      currency: resolvedCurrency,
     });
 
     const nowIso = new Date().toISOString();
@@ -1549,12 +2170,12 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       mystarsLastPollError: undefined,
       mystarsCreateInFlight: false,
       mystarsAmbiguousPostAt: undefined,
-      mystarsPayToAddress: payment?.pay_to_address || flatPayToAddress || undefined,
-      mystarsPaymentMemo: payment?.memo || flatPaymentMemo || resolvedOrderId,
-      mystarsPaymentAmountUsdt: payment?.amount || flatPaymentAmount || wholesaleTotalUsdt,
-      ...(flatPurchaseTx ? { mystarsPurchaseTx: flatPurchaseTx } : {}),
+      mystarsPayToAddress: payment.pay_to_address || undefined,
+      mystarsPaymentMemo: payment.memo || resolvedOrderId,
+      mystarsPaymentAmountUsdt: payment.amount || wholesaleTotalUsdt,
+      ...(created.purchase_tx ? { mystarsPurchaseTx: created.purchase_tx } : {}),
       ...(isUnknownStatus ? { mystarsUnknownStatusSeen: status } : {}),
-      mystarsExpiresAt: created.expires_at,
+      mystarsExpiresAt: created.expires_at ?? undefined,
       externalExecutionReference: resolvedOrderId,
     });
 
@@ -1593,11 +2214,11 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       });
     }
 
-    const resolvedPayTo = payment?.pay_to_address || flatPayToAddress;
-    const resolvedMemo = payment?.memo || flatPaymentMemo || resolvedOrderId;
-    const resolvedAmount = payment?.amount || flatPaymentAmount || wholesaleTotalUsdt;
+    const resolvedPayTo = payment.pay_to_address;
+    const resolvedMemo = payment.memo || resolvedOrderId;
+    const resolvedAmount = payment.amount || wholesaleTotalUsdt;
     const payInstructionSummary = resolvedPayTo
-      ? `Оплата поставщику MyStars: ${resolvedAmount} ${flatCurrency.toUpperCase()} на адрес ${resolvedPayTo} (MEMO: ${resolvedMemo})`
+      ? `Оплата поставщику MyStars: ${resolvedAmount} ${resolvedCurrency.toUpperCase()} на адрес ${resolvedPayTo} (MEMO: ${resolvedMemo})`
       : `Статус MyStars: ${status}`;
 
     return {

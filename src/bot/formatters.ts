@@ -911,6 +911,12 @@ export function formatAdminOrderCard(order: Order): string {
     order.externalInvoiceId
       ? `${oe('lock')} External Invoice: <code>${escapeHtml(order.externalInvoiceId)}</code>`
       : '',
+    order.buyerNotificationState?.status === 'delivery_uncertain'
+      ? `${oe('warning')} Уведомление покупателю: <b>delivery_uncertain</b> (event: <code>${escapeHtml(order.buyerNotificationState.eventId)}</code>, попыток: ${order.buyerNotificationState.attemptCount}) — результат доставки не подтверждён после сбоя`
+      : '',
+    order.adminNotificationState?.status === 'delivery_uncertain'
+      ? `${oe('warning')} Уведомление админам: <b>delivery_uncertain</b> (event: <code>${escapeHtml(order.adminNotificationState.eventId)}</code>, попыток: ${order.adminNotificationState.attemptCount}) — результат доставки не подтверждён после сбоя`
+      : '',
     order.fulfillmentNote
       ? `${oe('edit')} Примечание: ${escapeHtml(order.fulfillmentNote)}`
       : '',
@@ -920,6 +926,52 @@ export function formatAdminOrderCard(order: Order): string {
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+export function formatAdminNotificationReviewMessage(order: Order): string {
+  const formatState = (
+    title: string,
+    state: Order['buyerNotificationState'],
+    confirmedAt?: string,
+  ): string[] => {
+    if (!state) {
+      return [
+        `<b>${title}:</b> ${confirmedAt ? `✅ отправлено (${formatDateRu(confirmedAt)})` : '⏳ не отправлялось'}`,
+      ];
+    }
+    const statusLabel: Record<string, string> = {
+      pending: '⏳ pending (ожидает отправки)',
+      sending: '🔄 sending (активный lease отправки)',
+      sent: '✅ sent (подтверждено)',
+      delivery_uncertain:
+        '⚠️ delivery_uncertain (процесс завершился во время отправки; доставка в Telegram не подтверждена)',
+    };
+    const lines = [
+      `<b>${title}:</b> ${statusLabel[state.status] || escapeHtml(state.status)}`,
+      `• eventId: <code>${escapeHtml(state.eventId)}</code>`,
+      state.operationId ? `• operationId: <code>${escapeHtml(state.operationId)}</code>` : '',
+      state.leaseOwner ? `• leaseOwner: <code>${escapeHtml(state.leaseOwner)}</code>` : '',
+      `• Попыток: <b>${state.attemptCount}</b>`,
+      state.uncertainSince ? `• Неопределённость с: <code>${formatDateRu(state.uncertainSince)}</code>` : '',
+      state.sentAt ? `• Зафиксировано отправленным: <code>${formatDateRu(state.sentAt)}</code>` : '',
+      state.acknowledgedAt
+        ? `• Подтверждено админом (${state.acknowledgedByAdminId ?? '—'}): <code>${formatDateRu(state.acknowledgedAt)}</code>`
+        : '',
+      state.lastError ? `• Последняя ошибка: <code>${escapeHtml(state.lastError)}</code>` : '',
+    ];
+    return lines.filter(Boolean);
+  };
+
+  return [
+    `${oe('warning')} <b>Проверка доставки Telegram-уведомлений</b>`,
+    `Заказ: <code>#${escapeHtml(order.orderId)}</code> | Покупатель: <code>${order.userTelegramId}</code>`,
+    '',
+    ...formatState('Уведомление покупателю', order.buyerNotificationState, order.buyerNotifiedAt),
+    '',
+    ...formatState('Уведомление администраторам', order.adminNotificationState, order.adminNotifiedAt),
+    '',
+    'ℹ️ Между Telegram API и Firestore нет атомарной транзакции (exactly-once не гарантируется при аварийном завершении после приёма запроса Telegram). Выберите контролируемое действие:',
+  ].join('\n');
 }
 
 export function formatOwnerKeysOverviewMessage(

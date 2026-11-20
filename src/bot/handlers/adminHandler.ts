@@ -36,6 +36,7 @@ import {
 import {
   buildAdminCategoryPickKeyboard,
   buildAdminMainKeyboard,
+  buildAdminNotificationReviewKeyboard,
   buildAdminOrderActionKeyboard,
   buildAdminOrderBalanceRefundConfirmKeyboard,
   buildAdminOrdersKeyboard,
@@ -53,6 +54,7 @@ import {
 import {
   escapeHtml,
   formatAdminCatalogDiagnosticsSummary,
+  formatAdminNotificationReviewMessage,
   formatAdminOrderCard,
   formatAdminStatsMessage,
   formatAdminTopUpCard,
@@ -653,6 +655,113 @@ export function registerAdminHandlers(
         ctx,
         formatAdminOrderCard(res.order),
         buildAdminOrderActionKeyboard(res.order),
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
+  });
+
+  // Административная проверка неопределённой доставки уведомлений (delivery_uncertain)
+  bot.action(/^adm:ord_notify_review:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_notify_review:${orderId}`, 1000)) {
+      return;
+    }
+
+    const order = await OrderService.getOrderById(orderId);
+    if (!order) {
+      await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
+      return;
+    }
+
+    await safeRespondOrEdit(
+      ctx,
+      formatAdminNotificationReviewMessage(order),
+      buildAdminNotificationReviewKeyboard(order),
+    );
+  });
+
+  bot.action(/^adm:ord_notify_resend_(buyer|admin):([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const target = ctx.match[1] as 'buyer' | 'admin';
+    const orderId = ctx.match[2];
+    if (
+      isDuplicateCallbackClick(
+        ctx.from!.id,
+        `adm:ord_notify_resend_${target}:${orderId}`,
+        1500,
+      )
+    ) {
+      return;
+    }
+
+    try {
+      const res = await FulfillmentService.forceResendOrderNotification({
+        orderId,
+        target,
+        bot,
+        adminTelegramId: ctx.from!.id,
+      });
+      await logAdminAudit(
+        ctx.from!.id,
+        orderId,
+        res.order.totalPrice,
+        `Контролируемая повторная отправка уведомления (${target})${res.skippedInFlight ? ' [пропущено: уже выполняется]' : ''}`,
+      );
+      await safeAnswerCbQuery(
+        ctx,
+        res.skippedInFlight
+          ? 'Отправка уже выполняется другим процессом (активный lease). Повторите позже.'
+          : target === 'buyer'
+            ? res.sentBuyer
+              ? 'Уведомление повторно отправлено покупателю.'
+              : 'Не удалось доставить уведомление покупателю.'
+            : res.sentAdmin
+              ? 'Уведомление повторно отправлено администраторам.'
+              : 'Не удалось доставить уведомление администраторам.',
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminNotificationReviewMessage(res.order),
+        buildAdminNotificationReviewKeyboard(res.order),
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
+  });
+
+  bot.action(/^adm:ord_notify_ack:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_notify_ack:${orderId}`, 1500)) {
+      return;
+    }
+
+    try {
+      const updated = await FulfillmentService.acknowledgeUncertainNotification({
+        orderId,
+        target: 'both',
+        adminTelegramId: ctx.from!.id,
+      });
+      await logAdminAudit(
+        ctx.from!.id,
+        orderId,
+        updated.totalPrice,
+        'Подтвердил статус доставки delivery_uncertain уведомлений после проверки (без повторной отправки)',
+      );
+      await safeAnswerCbQuery(
+        ctx,
+        'Статус уведомления отмечен как проверенный администратором.',
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(updated),
+        buildAdminOrderActionKeyboard(updated),
       );
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);

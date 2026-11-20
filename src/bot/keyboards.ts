@@ -874,6 +874,18 @@ export function buildAdminOrderActionKeyboard(order: Order) {
   }
 
   if (
+    order.buyerNotificationState?.status === 'delivery_uncertain' ||
+    order.adminNotificationState?.status === 'delivery_uncertain'
+  ) {
+    rows.push([
+      Markup.button.callback(
+        '⚠️ Проверить доставку уведомления',
+        `adm:ord_notify_review:${order.orderId}`,
+      ),
+    ]);
+  }
+
+  if (
     order.paymentStatus === 'paid' ||
     order.paymentStatus === 'processing' ||
     order.paymentStatus === 'completed'
@@ -919,6 +931,37 @@ export function buildAdminOrderActionKeyboard(order: Order) {
   ]);
   rows.push([Markup.button.callback('⬅️ К заказам', 'adm:orders:all')]);
 
+  return Markup.inlineKeyboard(rows);
+}
+
+export function buildAdminNotificationReviewKeyboard(order: Order) {
+  const rows = [];
+  if (order.fulfillmentStatus === 'completed') {
+    rows.push([
+      Markup.button.callback(
+        '🔁 Повторно отправить покупателю',
+        `adm:ord_notify_resend_buyer:${order.orderId}`,
+      ),
+    ]);
+  }
+  rows.push([
+    Markup.button.callback(
+      '🔁 Повторно отправить админам',
+      `adm:ord_notify_resend_admin:${order.orderId}`,
+    ),
+  ]);
+  if (
+    order.buyerNotificationState?.status === 'delivery_uncertain' ||
+    order.adminNotificationState?.status === 'delivery_uncertain'
+  ) {
+    rows.push([
+      Markup.button.callback(
+        '✅ Отметить проверенным (без отправки)',
+        `adm:ord_notify_ack:${order.orderId}`,
+      ),
+    ]);
+  }
+  rows.push([Markup.button.callback('⬅️ К заказу', `adm:ord:${order.orderId}`)]);
   return Markup.inlineKeyboard(rows);
 }
 

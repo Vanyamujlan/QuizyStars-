@@ -306,7 +306,11 @@ export interface DistributedLeaseRecord {
   acquiredAt: FirestoreTimestampLike;
 }
 
-export type NotificationDeliveryStatus = 'pending' | 'sending' | 'sent';
+export type NotificationDeliveryStatus =
+  | 'pending'
+  | 'sending'
+  | 'sent'
+  | 'delivery_uncertain';
 
 export interface NotificationDeliveryState {
   status: NotificationDeliveryStatus;
@@ -316,8 +320,20 @@ export interface NotificationDeliveryState {
   leaseUntil?: FirestoreTimestampLike;
   attemptCount: number;
   sentAt?: string;
+  uncertainSince?: string;
   deliveryUncertainAfterCrash?: boolean;
+  acknowledgedByAdminId?: number;
+  acknowledgedAt?: string;
   lastError?: string;
+}
+
+export interface MyStarsPollCheckpoint {
+  key: 'mystars_poll_cursor';
+  cursorCreatedAt?: string;
+  cursorOrderId?: string;
+  cyclesCompleted: number;
+  lastPolledCount: number;
+  updatedAt: string;
 }
 
 export interface PaymentRecord {

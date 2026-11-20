@@ -1509,16 +1509,28 @@ export class PaymentProviderGateway {
       const safeClientInvoiceId = params.paymentId
         ? encodeURIComponent(params.paymentId.trim().slice(0, 100))
         : '';
-      const singleInvoicePath = safeClientInvoiceId
-        ? `/invoice?invoiceId=${safeExternalId}&clientInvoiceId=${safeClientInvoiceId}`
-        : `/invoice?invoiceId=${safeExternalId}`;
-      const primaryUrl = buildXRocketApiV1Url(
-        creds.xrocketApiUrl,
-        singleInvoicePath,
-      );
-      const fallbackUrl = buildXRocketApiV1Url(
-        creds.xrocketApiUrl,
-        `/invoices?ids=${encodeURIComponent(params.externalInvoiceId)}`,
+
+      // Official xRocket Pay API v1 accepts either invoiceId OR clientInvoiceId on GET /api/v1/invoice.
+      // Never send both parameters simultaneously in one request; use a deterministic separate-request fallback chain:
+      // 1) GET /api/v1/invoice?invoiceId=...
+      // 2) GET /api/v1/invoice?clientInvoiceId=... (only when paymentId is provided)
+      // 3) GET /api/v1/invoices?ids=... (legacy / batch fallback)
+      const candidateUrls: string[] = [
+        buildXRocketApiV1Url(creds.xrocketApiUrl, `/invoice?invoiceId=${safeExternalId}`),
+      ];
+      if (safeClientInvoiceId) {
+        candidateUrls.push(
+          buildXRocketApiV1Url(
+            creds.xrocketApiUrl,
+            `/invoice?clientInvoiceId=${safeClientInvoiceId}`,
+          ),
+        );
+      }
+      candidateUrls.push(
+        buildXRocketApiV1Url(
+          creds.xrocketApiUrl,
+          `/invoices?ids=${encodeURIComponent(params.externalInvoiceId)}`,
+        ),
       );
 
       const reqHeaders = {
@@ -1526,31 +1538,35 @@ export class PaymentProviderGateway {
         Authorization: `Bearer ${creds.xrocketApiKey}`,
       };
 
-      let res: { status: number; ok: boolean; json: unknown; text?: string };
-      try {
-        res = await this.transport({
-          url: primaryUrl,
-          method: 'GET',
-          headers: reqHeaders,
-        });
-        if (!res.ok && (res.status === 400 || res.status === 404)) {
-          const fallbackRes = await this.transport({
-            url: fallbackUrl,
+      let res: { status: number; ok: boolean; json: unknown; text?: string } | null = null;
+      let lastTransportError: unknown = null;
+
+      for (let i = 0; i < candidateUrls.length; i++) {
+        const url = candidateUrls[i];
+        try {
+          const attemptRes = await this.transport({
+            url,
             method: 'GET',
             headers: reqHeaders,
-          }).catch(() => null);
-          if (fallbackRes && fallbackRes.ok) {
-            res = fallbackRes;
+          });
+          res = attemptRes;
+          if (attemptRes.ok) {
+            break;
           }
+          // Only fall back to the next endpoint on 400 (parameter validation) or 404 (not found)
+          if (attemptRes.status !== 400 && attemptRes.status !== 404) {
+            break;
+          }
+        } catch (err) {
+          lastTransportError = err;
+          // Continue to next fallback endpoint if available
         }
-      } catch (primaryErr) {
-        res = await this.transport({
-          url: fallbackUrl,
-          method: 'GET',
-          headers: reqHeaders,
-        }).catch(() => {
-          throw primaryErr;
-        });
+      }
+
+      if (!res) {
+        throw lastTransportError instanceof Error
+          ? lastTransportError
+          : new Error(String(lastTransportError || 'Ошибка сети при проверке счёта xRocket Pay'));
       }
 
       if (!res.ok) {
@@ -1564,14 +1580,23 @@ export class PaymentProviderGateway {
       const raw = res.json;
       let items: Array<Record<string, unknown>> = [];
       if (Array.isArray(raw)) {
-        items = raw as Array<Record<string, unknown>>;
+        items = raw.filter(
+          (entry): entry is Record<string, unknown> =>
+            Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry),
+        );
       } else if (raw && typeof raw === 'object') {
         const obj = raw as Record<string, unknown>;
         if (Array.isArray(obj.data)) {
-          items = obj.data as Array<Record<string, unknown>>;
+          items = obj.data.filter(
+            (entry): entry is Record<string, unknown> =>
+              Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry),
+          );
         } else if (Array.isArray(obj.items)) {
-          items = obj.items as Array<Record<string, unknown>>;
-        } else if (obj.data && typeof obj.data === 'object') {
+          items = obj.items.filter(
+            (entry): entry is Record<string, unknown> =>
+              Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry),
+          );
+        } else if (obj.data && typeof obj.data === 'object' && !Array.isArray(obj.data)) {
           items = [obj.data as Record<string, unknown>];
         } else if (obj.id !== undefined) {
           items = [obj];
@@ -1579,46 +1604,108 @@ export class PaymentProviderGateway {
       }
 
       const found = items.find(
-        (item) => String(item.id) === String(params.externalInvoiceId),
+        (item) =>
+          item.id !== undefined &&
+          item.id !== null &&
+          String(item.id).trim() === String(params.externalInvoiceId).trim(),
       );
       if (!found) {
         throw new XRocketApiError(
-          `Счёт xRocket Pay #${params.externalInvoiceId} не найден в ответе API v1`,
+          `Счёт xRocket Pay #${params.externalInvoiceId} не найден или ID не совпадает в ответе API v1`,
           404,
           {
             status: 404,
             title: 'Not Found',
-            detail: `Invoice ${params.externalInvoiceId} not returned by GET /api/v1/invoices`,
+            detail: `Invoice ${params.externalInvoiceId} not found or mismatched in xRocket API v1 response`,
             kind: 'invoice_not_found',
           },
         );
       }
 
+      const rawStatus =
+        typeof found.status === 'string' && found.status.trim()
+          ? found.status.trim()
+          : '';
+      if (!rawStatus) {
+        throw new XRocketApiError(
+          `Некорректный ответ xRocket Pay API v1 для счёта #${params.externalInvoiceId}: отсутствует поле status.`,
+          502,
+          {
+            status: 502,
+            title: 'Invalid Invoice Payload',
+            detail: 'Missing required invoice status in xRocket API v1 response',
+            kind: 'invalid_invoice_payload',
+          },
+        );
+      }
+      const normalizedStatus = normalizeProviderStatus(rawStatus);
+
       const paymentObj =
-        found.payment && typeof found.payment === 'object'
+        found.payment && typeof found.payment === 'object' && !Array.isArray(found.payment)
           ? (found.payment as Record<string, unknown>)
           : undefined;
 
       const resolvedPaymentId =
-        found.clientInvoiceId !== undefined
-          ? String(found.clientInvoiceId)
-          : found.payload !== undefined
-            ? String(found.payload)
-            : undefined;
+        typeof found.clientInvoiceId === 'string' && found.clientInvoiceId.trim()
+          ? found.clientInvoiceId.trim()
+          : typeof found.payload === 'string' && found.payload.trim()
+            ? found.payload.trim()
+            : found.clientInvoiceId !== undefined && found.clientInvoiceId !== null
+              ? String(found.clientInvoiceId).trim()
+              : found.payload !== undefined && found.payload !== null
+                ? String(found.payload).trim()
+                : undefined;
 
-      const rawAmount =
-        paymentObj?.amount ?? found.paidAmount ?? found.priceAmount ?? found.amount ?? '0';
-      const amountPaidStr = String(rawAmount);
+      const rawAmountCandidate =
+        paymentObj?.amount ?? found.paidAmount ?? found.priceAmount ?? found.amount;
+      const rawAmountStr =
+        typeof rawAmountCandidate === 'number' && Number.isFinite(rawAmountCandidate)
+          ? String(rawAmountCandidate)
+          : typeof rawAmountCandidate === 'string'
+            ? rawAmountCandidate.trim()
+            : '';
+      const parsedAmountNum = rawAmountStr ? Number(rawAmountStr) : NaN;
 
-      const resolvedCurrency = normalizeCurrencyCode(
-        String(
-          paymentObj?.currency ??
-            found.paidCurrency ??
-            found.priceCurrency ??
-            found.currency ??
-            'USDT',
-        ),
-      );
+      const rawCurrencyCandidate =
+        paymentObj?.currency ??
+        found.paidCurrency ??
+        found.priceCurrency ??
+        found.currency;
+      const rawCurrencyStr =
+        typeof rawCurrencyCandidate === 'string' ? rawCurrencyCandidate.trim() : '';
+
+      // Strictly reject HTTP 200 PAID payloads with missing/invalid amount or missing currency —
+      // never silently default currency to 'USDT' or confirm payment on incomplete HTTP 200 data.
+      if (normalizedStatus === 'paid') {
+        if (!rawAmountStr || !Number.isFinite(parsedAmountNum) || parsedAmountNum <= 0) {
+          throw new XRocketApiError(
+            `Некорректный ответ xRocket Pay API v1 для оплаченного счёта #${params.externalInvoiceId}: отсутствует или некорректна сумма оплаты.`,
+            502,
+            {
+              status: 502,
+              title: 'Invalid Invoice Payload',
+              detail: 'Paid xRocket invoice is missing a valid positive amount',
+              kind: 'invalid_invoice_payload',
+            },
+          );
+        }
+        if (!rawCurrencyStr) {
+          throw new XRocketApiError(
+            `Некорректный ответ xRocket Pay API v1 для оплаченного счёта #${params.externalInvoiceId}: отсутствует валюта оплаты.`,
+            502,
+            {
+              status: 502,
+              title: 'Invalid Invoice Payload',
+              detail: 'Paid xRocket invoice is missing currency',
+              kind: 'invalid_invoice_payload',
+            },
+          );
+        }
+      }
+
+      const amountPaidStr =
+        rawAmountStr && Number.isFinite(parsedAmountNum) ? rawAmountStr : '0';
+      const resolvedCurrency = rawCurrencyStr ? normalizeCurrencyCode(rawCurrencyStr) : '';
 
       const resolvedNetwork = normalizeNetworkCode(
         typeof paymentObj?.network === 'string'
@@ -1631,14 +1718,16 @@ export class PaymentProviderGateway {
       const rawFeeUsd = paymentObj?.feeInUsd ?? found.feeInUsd ?? found.feeUsd;
 
       return {
-        externalInvoiceId: String(found.id),
+        externalInvoiceId: String(found.id).trim(),
         paymentId: resolvedPaymentId,
-        status: normalizeProviderStatus(String(found.status ?? 'PENDING')),
+        status: normalizedStatus,
         amountPaidStr,
         amountPaid: Number(amountPaidStr),
         currency: resolvedCurrency,
         ...(resolvedNetwork ? { network: resolvedNetwork } : {}),
-        ...(rawFeeUsd !== undefined ? { feeInUsdStr: String(rawFeeUsd) } : {}),
+        ...(rawFeeUsd !== undefined && rawFeeUsd !== null
+          ? { feeInUsdStr: String(rawFeeUsd) }
+          : {}),
         paidAt:
           typeof paymentObj?.finalizedAt === 'string'
             ? paymentObj.finalizedAt
