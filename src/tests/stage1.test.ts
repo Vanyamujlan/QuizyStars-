@@ -10469,6 +10469,435 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  // =========================================================================
+  // STAGE 4.4.4 — INDEPENDENT VERIFICATION & REGRESSION AUDIT TESTS
+  // =========================================================================
+
+  await runTest(
+    'S444-01',
+    'Database',
+    'Stage 4.4.4: Регрессии MyStars checkpoint (HTTP 429 в середине и на 1-м заказе батча не пропускает заказ, защита от отката checkpoint при multi-worker, восстановление повреждённого документа)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 444001, username: 's444_ckpt_buyer', first_name: 'Buyer444' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      const TOTAL_ORDERS = 50;
+      let rateLimitTargetExtId: string | null = null;
+      let polledThisTick: string[] = [];
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s444_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      const prevRetries = myStarsClient.maxTransientGetRetries;
+      myStarsClient.maxTransientGetRetries = 0;
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          polledThisTick.push(extId);
+          if (rateLimitTargetExtId === extId) {
+            return {
+              status: 429,
+              ok: false,
+              headers: { 'retry-after': '1' },
+              json: { error: 'Too many requests' },
+            };
+          }
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: 's444_ckpt_buyer',
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected URL in S444-01: ${req.method} ${req.url}`);
+      });
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+      const prevBackoff = FulfillmentService.checkpointBackoffBaseMs;
+      const origSetDoc = firestoreRepo.setDoc.bind(firestoreRepo);
+      let failCheckpointWrite = false;
+
+      firestoreRepo.setDoc = (async <T extends object>(collection: string, docId: string, data: T): Promise<void> => {
+        if (collection === 'settings' && docId === 'mystars_poll_cursor' && failCheckpointWrite) {
+          throw new Error('Simulated Worker-A checkpoint write failure');
+        }
+        return origSetDoc<T>(collection as never, docId, data);
+      }) as typeof firestoreRepo.setDoc;
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.checkpointBackoffBaseMs = 0;
+        FulfillmentService.pollBatchBudget = 10;
+        FulfillmentService.pollPageSize = 15;
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 3_600_000;
+        for (let i = 1; i <= TOTAL_ORDERS; i++) {
+          const ordId = `ord_s444_${String(i).padStart(3, '0')}`;
+          const msId = `ms_s444_${String(i).padStart(3, '0')}`;
+          const orderDoc: Order = {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: 'Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: msId,
+            mystarsOrderStatus: 'awaiting_payment',
+            createdAt: new Date(baseMs + i * 1000).toISOString(),
+            updatedAt: new Date(baseMs + i * 1000).toISOString(),
+          };
+          await origSetDoc<Order>('orders', ordId, orderDoc);
+        }
+
+        // 1. HTTP 429 в середине батча (на #005): checkpoint должен сохраниться на #004 (последний ЗАВЕРШЁННЫЙ), а НЕ #005!
+        rateLimitTargetExtId = 'ms_s444_005';
+        polledThisTick = [];
+        const tickMid429 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickMid429.rateLimited, true);
+        assert.deepEqual(polledThisTick, [
+          'ms_s444_001',
+          'ms_s444_002',
+          'ms_s444_003',
+          'ms_s444_004',
+          'ms_s444_005',
+        ]);
+        const ckptMid = await FulfillmentService.loadMyStarsPollCheckpoint();
+        assert.equal(
+          ckptMid?.cursorOrderId,
+          'ord_s444_004',
+          'При 429 на #005 курсор обязан остановиться на #004, чтобы не пропустить #005',
+        );
+
+        // Сбрасываем cooldown (имитируем окончание Retry-After), но #005 снова получает 429 (первый заказ батча!)
+        FulfillmentService.resetMyStarsPollingState();
+        polledThisTick = [];
+        const tickFirst429 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickFirst429.rateLimited, true);
+        assert.deepEqual(polledThisTick, ['ms_s444_005']);
+        const ckptFirst = await FulfillmentService.loadMyStarsPollCheckpoint();
+        assert.equal(
+          ckptFirst?.cursorOrderId,
+          'ord_s444_004',
+          'При 429 на самом первом заказе батча (#005) курсор обязан остаться на #004, не перескакивая вперёд',
+        );
+
+        // Снимаем 429 и cooldown: следующий тик начинает СТРОГО с #005 (0 пропусков!)
+        rateLimitTargetExtId = null;
+        FulfillmentService.resetMyStarsPollingState();
+        polledThisTick = [];
+        const tickAfter429 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickAfter429.rateLimited, false);
+        assert.equal(polledThisTick[0], 'ms_s444_005', 'После снятия 429 опрос обязан начаться с #005 без пропуска');
+        assert.equal(polledThisTick[9], 'ms_s444_014');
+        assert.equal((await FulfillmentService.loadMyStarsPollCheckpoint())?.cursorOrderId, 'ord_s444_014');
+
+        // 2. Multi-worker защита от отката checkpoint назад:
+        // Worker A опрашивает #015..#024, запись падает (pendingUnsavedCheckpoint=#024).
+        // Тем временем Worker B продвинул Firestore checkpoint до #035.
+        // При восстановлении записи Worker A сбрасывает pendingUnsavedCheckpoint — Firestore НЕ откатывается к #024!
+        failCheckpointWrite = true;
+        polledThisTick = [];
+        const tickWorkerAFail = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickWorkerAFail.checkpointSaved, false);
+        assert.equal(FulfillmentService.getMyStarsPollingStatus().hasPendingUnsavedCheckpoint, true);
+
+        const ord35 = (await OrderService.getOrderById('ord_s444_035'))!;
+        await origSetDoc('settings', 'mystars_poll_cursor', {
+          key: 'mystars_poll_cursor',
+          cursorCreatedAt: ord35.createdAt,
+          cursorOrderId: ord35.orderId,
+          cyclesCompleted: 0,
+          lastPolledCount: 10,
+          updatedAt: new Date().toISOString(),
+        });
+
+        failCheckpointWrite = false;
+        polledThisTick = [];
+        const tickWorkerARecover = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickWorkerARecover.checkpointSaved, true);
+        assert.equal(
+          polledThisTick[0],
+          'ms_s444_036',
+          'Worker A обязан принять более свежий checkpoint Worker B (#035) и продолжить с #036, без отката к #024',
+        );
+        assert.equal((await FulfillmentService.loadMyStarsPollCheckpoint())?.cursorOrderId, 'ord_s444_045');
+
+        // 3. Повреждённый документ checkpoint в Firestore (невалидные поля/полузаполненный курсор/плохая дата)
+        const corruptedDocs: Array<Record<string, unknown>> = [
+          { key: 'mystars_poll_cursor', cyclesCompleted: 'NaN', cursorOrderId: 'ord_s444_010' },
+          { key: 'mystars_poll_cursor', cyclesCompleted: 0, cursorOrderId: 'ord_s444_010' }, // нет cursorCreatedAt
+          { key: 'mystars_poll_cursor', cyclesCompleted: 0, cursorOrderId: 'ord_s444_010', cursorCreatedAt: 'not-a-date' },
+          { key: 'wrong_key', cyclesCompleted: -5 },
+        ];
+
+        for (const badDoc of corruptedDocs) {
+          await origSetDoc('settings', 'mystars_poll_cursor', badDoc);
+          const loaded = await FulfillmentService.loadMyStarsPollCheckpoint();
+          assert.equal(loaded, null, 'Повреждённый checkpoint должен безопасно сбрасываться и возвращать null');
+          const repaired = await firestoreRepo.getDoc<Record<string, unknown>>(
+            'settings',
+            'mystars_poll_cursor',
+          );
+          assert.equal(repaired?.key, 'mystars_poll_cursor');
+          assert.equal(repaired?.cyclesCompleted, 0);
+          assert.equal(repaired?.cursorOrderId, undefined);
+        }
+
+        // После самовосстановления повреждённого документа polling работает чисто с начала очереди
+        polledThisTick = [];
+        const tickAfterCorrupt = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickAfterCorrupt.polled, 10);
+        assert.equal(polledThisTick[0], 'ms_s444_001');
+      } finally {
+        firestoreRepo.setDoc = origSetDoc;
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        FulfillmentService.checkpointBackoffBaseMs = prevBackoff;
+        myStarsClient.maxTransientGetRetries = prevRetries;
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Регрессии checkpoint устранены и подтверждены: HTTP 429 (середина и 1-й заказ батча), монотонность при multi-worker и самовосстановление повреждённого документа.';
+    },
+  );
+
+  await runTest(
+    'S444-02',
+    'Security',
+    'Stage 4.4.4: Конкурентные admin notifications, смена ADMIN_IDS при partial_sent, краш при sending, forceResend с пустым ADMIN_IDS и защита admin callbacks',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+
+      const buyer = { id: 444002, username: 's444_notif_buyer', first_name: 'Buyer444N' };
+      await UserService.upsertFromTelegram(buyer);
+
+      const ADMIN_A = 9444001;
+      const ADMIN_B = 9444002;
+      const ADMIN_C = 9444003;
+      const ADMIN_D = 9444004;
+
+      const makePaidOrder = async (suffix: string): Promise<Order> => {
+        const o = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: `s444_${suffix}`,
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', o.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+        });
+        return (await OrderService.getOrderById(o.orderId))!;
+      };
+
+      const sentLog: Array<{ chatId: number; text: string }> = [];
+      let failingChatIds = new Set<number>();
+      let artificialDelayMs = 0;
+
+      const selectiveBot = {
+        telegram: {
+          sendMessage: async (chatId: number | string, text: string) => {
+            if (artificialDelayMs > 0) {
+              await new Promise((r) => setTimeout(r, artificialDelayMs));
+            }
+            const numericChatId = Number(chatId);
+            if (failingChatIds.has(numericChatId)) {
+              throw new Error(`Simulated Telegram failure for ${numericChatId}`);
+            }
+            sentLog.push({ chatId: numericChatId, text });
+            return { message_id: sentLog.length };
+          },
+        },
+      } as unknown as Telegraf;
+
+      try {
+        process.env.OWNER_TELEGRAM_ID = String(ADMIN_A);
+        process.env.ADMIN_IDS = `${ADMIN_B},${ADMIN_C}`;
+
+        // 1. Параллельный retry partial_sent (два воркера одновременно) -> ADMIN_B получает строго 1 раз, A и C — 0 дублей
+        const ordConcurrent = await makePaidOrder('concurrent_partial');
+        failingChatIds = new Set([ADMIN_B]);
+        const partial1 = await FulfillmentService.ensureAdminNotified(ordConcurrent, selectiveBot);
+        assert.equal(partial1.adminNotificationState?.status, 'partial_sent');
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_A).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_C).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_B).length, 0);
+
+        failingChatIds = new Set();
+        artificialDelayMs = 25;
+        await Promise.all([
+          FulfillmentService.ensureAdminNotified(partial1, selectiveBot),
+          FulfillmentService.ensureAdminNotified(partial1, selectiveBot),
+        ]);
+        artificialDelayMs = 0;
+        const afterConcurrent = (await OrderService.getOrderById(ordConcurrent.orderId))!;
+        assert.equal(afterConcurrent.adminNotificationState?.status, 'sent');
+        assert.ok(afterConcurrent.adminNotifiedAt);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_A).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_C).length, 1);
+        assert.equal(
+          sentLog.filter((m) => m.chatId === ADMIN_B).length,
+          1,
+          'При параллельном запуске двух воркеров ADMIN_B обязан получить ровно 1 сообщение',
+        );
+
+        // 2. Изменение ADMIN_IDS при partial_sent:
+        // 2a. Удаление упавшего ADMIN_B -> автоматическая консолидация в 'sent' без спама A и C
+        sentLog.length = 0;
+        const ordRemovedAdmin = await makePaidOrder('removed_admin');
+        failingChatIds = new Set([ADMIN_B]);
+        const partialRem = await FulfillmentService.ensureAdminNotified(ordRemovedAdmin, selectiveBot);
+        assert.equal(partialRem.adminNotificationState?.status, 'partial_sent');
+        assert.equal(sentLog.length, 2);
+
+        process.env.ADMIN_IDS = `${ADMIN_C}`; // ADMIN_B удалён из конфигурации
+        const reconciledRem = await FulfillmentService.ensureAdminNotified(partialRem, selectiveBot);
+        assert.equal(reconciledRem.adminNotificationState?.status, 'sent');
+        assert.ok(reconciledRem.adminNotifiedAt);
+        assert.equal(sentLog.length, 2, 'Консолидация после удаления упавшего админа не должна спамить уже получивших');
+
+        // 2b. Добавление нового ADMIN_D при partial_sent -> отправляется ТОЛЬКО B и D (0 дублей A и C)
+        sentLog.length = 0;
+        process.env.ADMIN_IDS = `${ADMIN_B},${ADMIN_C}`;
+        const ordAddedAdmin = await makePaidOrder('added_admin');
+        failingChatIds = new Set([ADMIN_B]);
+        const partialAdd = await FulfillmentService.ensureAdminNotified(ordAddedAdmin, selectiveBot);
+        assert.equal(partialAdd.adminNotificationState?.status, 'partial_sent');
+        assert.equal(sentLog.length, 2);
+
+        process.env.ADMIN_IDS = `${ADMIN_B},${ADMIN_C},${ADMIN_D}`;
+        failingChatIds = new Set();
+        const completedAdd = await FulfillmentService.ensureAdminNotified(partialAdd, selectiveBot);
+        assert.equal(completedAdd.adminNotificationState?.status, 'sent');
+        assert.ok(completedAdd.adminNotifiedAt);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_A).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_C).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_B).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_D).length, 1);
+
+        // 3. Краш процесса во время sending на partial_sent -> A и C остаются 'sent', только B становится 'delivery_uncertain',
+        // а последующий forceResend отправляет ТОЛЬКО B без спама A и C
+        sentLog.length = 0;
+        process.env.ADMIN_IDS = `${ADMIN_B},${ADMIN_C}`;
+        const ordCrashPartial = await makePaidOrder('crash_partial');
+        failingChatIds = new Set([ADMIN_B]);
+        const partialCrash = await FulfillmentService.ensureAdminNotified(ordCrashPartial, selectiveBot);
+        assert.equal(partialCrash.adminNotificationState?.status, 'partial_sent');
+
+        // Имитируем зависший истекший sending-lease во время повторной отправки
+        await firestoreRepo.updateDoc<Order>('orders', ordCrashPartial.orderId, {
+          adminNotificationState: {
+            ...partialCrash.adminNotificationState!,
+            status: 'sending',
+            leaseUntil: Timestamp.fromMillis(Date.now() - 10_000),
+          },
+        });
+        const stalePartial = (await OrderService.getOrderById(ordCrashPartial.orderId))!;
+        const uncertainPartial = await FulfillmentService.ensureAdminNotified(stalePartial, selectiveBot);
+        assert.equal(uncertainPartial.adminNotificationState?.status, 'delivery_uncertain');
+        assert.equal(uncertainPartial.adminNotificationState?.recipientDeliveries?.[String(ADMIN_A)]?.status, 'sent');
+        assert.equal(uncertainPartial.adminNotificationState?.recipientDeliveries?.[String(ADMIN_C)]?.status, 'sent');
+        assert.equal(
+          uncertainPartial.adminNotificationState?.recipientDeliveries?.[String(ADMIN_B)]?.status,
+          'delivery_uncertain',
+        );
+
+        failingChatIds = new Set();
+        const resendRes = await FulfillmentService.forceResendOrderNotification({
+          orderId: ordCrashPartial.orderId,
+          target: 'admin',
+          bot: selectiveBot,
+        });
+        assert.equal(resendRes.sentAdmin, true);
+        assert.equal(resendRes.order.adminNotificationState?.status, 'sent');
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_A).length, 1, 'A не должен получить дубль при forceResend');
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_C).length, 1, 'C не должен получить дубль при forceResend');
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_B).length, 1, 'B должен получить сообщение ровно 1 раз');
+
+        // 4. forceResendOrderNotification при пустом ADMIN_IDS на УЖЕ 'sent' заказе не портит статус и возвращает sentAdmin=false
+        process.env.OWNER_TELEGRAM_ID = '';
+        process.env.ADMIN_IDS = '';
+        const emptyResendOnSent = await FulfillmentService.forceResendOrderNotification({
+          orderId: ordCrashPartial.orderId,
+          target: 'admin',
+          bot: selectiveBot,
+        });
+        assert.equal(emptyResendOnSent.sentAdmin, false);
+        assert.equal(
+          emptyResendOnSent.order.adminNotificationState?.status,
+          'sent',
+          'Пустой ADMIN_IDS при forceResend не должен разрушать уже подтверждённый статус sent',
+        );
+
+        // 5. Безопасность админ-колбэков: не-админ блокируется ensureAdmin, дублирующийся клик блокируется debounce
+        process.env.OWNER_TELEGRAM_ID = String(ADMIN_A);
+        process.env.ADMIN_IDS = `${ADMIN_B}`;
+        const harness = createWiredBotHarness(true);
+        const nonAdminUser = { id: 777666555, username: 'intruder_user', first_name: 'Intruder' };
+        await harness.sendCallback(nonAdminUser, `adm:ord_notify_review:${ordCrashPartial.orderId}`);
+        assert.ok(
+          harness.lastAnswer()?.text?.includes('Доступ разрешён только администраторам'),
+          'Не-админ должен получать отказ доступа на adm:ord_notify_review',
+        );
+        await harness.sendCallback(nonAdminUser, `adm:ord_notify_resend_admin:${ordCrashPartial.orderId}`);
+        assert.ok(
+          harness.lastAnswer()?.text?.includes('Доступ разрешён только администраторам'),
+          'Не-админ должен получать отказ доступа на adm:ord_notify_resend_admin',
+        );
+
+        // Дублирующийся клик админа по adm:ord_notify_review блокируется isDuplicateCallbackClick
+        const adminUser = { id: ADMIN_A, username: 'owner_admin', first_name: 'Owner' };
+        const beforeAdminClicks = harness.calls.length;
+        await harness.sendCallback(adminUser, `adm:ord_notify_review:${ordCrashPartial.orderId}`);
+        const afterFirstClick = harness.calls.length;
+        assert.ok(afterFirstClick > beforeAdminClicks, 'Первый клик админа должен открыть review-карточку');
+        await harness.sendCallback(adminUser, `adm:ord_notify_review:${ordCrashPartial.orderId}`);
+        assert.equal(
+          harness.calls.length,
+          afterFirstClick,
+          'Повторный мгновенный клик админа должен блокироваться debounce без повторной отрисовки',
+        );
+      } finally {
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Конкурентная доставка partial_sent, смена ADMIN_IDS, краш с сохранением recipientDeliveries, защита sent от пустого ADMIN_IDS и RBAC админ-колбэков подтверждены.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {

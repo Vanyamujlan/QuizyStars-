@@ -331,14 +331,125 @@ export class FulfillmentService {
     this.checkpointRetryAfterMs = 0;
   }
 
+  private static parseValidPollCheckpoint(raw: unknown): MyStarsPollCheckpoint | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return null;
+    }
+    const obj = raw as Record<string, unknown>;
+    if (obj.key !== 'mystars_poll_cursor') {
+      return null;
+    }
+    if (
+      typeof obj.cyclesCompleted !== 'number' ||
+      !Number.isInteger(obj.cyclesCompleted) ||
+      obj.cyclesCompleted < 0
+    ) {
+      return null;
+    }
+    const hasCreatedAt = obj.cursorCreatedAt !== undefined && obj.cursorCreatedAt !== null;
+    const hasOrderId = obj.cursorOrderId !== undefined && obj.cursorOrderId !== null;
+    if (hasCreatedAt !== hasOrderId) {
+      return null;
+    }
+    let cursorCreatedAt: string | undefined;
+    let cursorOrderId: string | undefined;
+    if (hasCreatedAt && hasOrderId) {
+      if (
+        typeof obj.cursorCreatedAt !== 'string' ||
+        obj.cursorCreatedAt.trim().length === 0 ||
+        Number.isNaN(Date.parse(obj.cursorCreatedAt)) ||
+        typeof obj.cursorOrderId !== 'string' ||
+        obj.cursorOrderId.trim().length === 0
+      ) {
+        return null;
+      }
+      cursorCreatedAt = obj.cursorCreatedAt;
+      cursorOrderId = obj.cursorOrderId;
+    }
+    const lastPolledCount =
+      typeof obj.lastPolledCount === 'number' &&
+      Number.isFinite(obj.lastPolledCount) &&
+      obj.lastPolledCount >= 0
+        ? obj.lastPolledCount
+        : 0;
+    const updatedAt =
+      typeof obj.updatedAt === 'string' && obj.updatedAt.trim().length > 0
+        ? obj.updatedAt
+        : new Date().toISOString();
+
+    return {
+      key: 'mystars_poll_cursor',
+      cursorCreatedAt,
+      cursorOrderId,
+      cyclesCompleted: obj.cyclesCompleted,
+      lastPolledCount,
+      updatedAt,
+    };
+  }
+
+  private static comparePollCheckpoints(
+    a: MyStarsPollCheckpoint,
+    b: MyStarsPollCheckpoint,
+  ): number {
+    if (a.cyclesCompleted !== b.cyclesCompleted) {
+      return a.cyclesCompleted - b.cyclesCompleted;
+    }
+    const aHasCursor = Boolean(a.cursorCreatedAt && a.cursorOrderId);
+    const bHasCursor = Boolean(b.cursorCreatedAt && b.cursorOrderId);
+    if (aHasCursor !== bHasCursor) {
+      return aHasCursor ? 1 : -1;
+    }
+    if (!aHasCursor && !bHasCursor) {
+      return 0;
+    }
+    const aCreated = a.cursorCreatedAt || '';
+    const bCreated = b.cursorCreatedAt || '';
+    if (aCreated !== bCreated) {
+      return aCreated < bCreated ? -1 : 1;
+    }
+    const aId = a.cursorOrderId || '';
+    const bId = b.cursorOrderId || '';
+    if (aId !== bId) {
+      return aId < bId ? -1 : 1;
+    }
+    return 0;
+  }
+
   public static async loadMyStarsPollCheckpoint(): Promise<MyStarsPollCheckpoint | null> {
     try {
       const doc = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
         'settings',
         'mystars_poll_cursor',
       );
-      const valid = doc && doc.key === 'mystars_poll_cursor' ? doc : null;
-      this.lastConfirmedPollCheckpoint = valid ? { ...valid } : null;
+      if (doc === null || doc === undefined) {
+        this.lastConfirmedPollCheckpoint = null;
+        this.clearCheckpointDegradedState();
+        return null;
+      }
+      const valid = this.parseValidPollCheckpoint(doc);
+      if (!valid) {
+        console.warn(
+          '[FulfillmentService:MyStarsPolling] Обнаружен повреждённый документ checkpoint settings/mystars_poll_cursor — выполняется безопасный сброс курсора.',
+        );
+        const sanitized: MyStarsPollCheckpoint = {
+          key: 'mystars_poll_cursor',
+          cursorCreatedAt: undefined,
+          cursorOrderId: undefined,
+          cyclesCompleted: 0,
+          lastPolledCount: 0,
+          updatedAt: new Date().toISOString(),
+        };
+        await firestoreRepo.setDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+          sanitized,
+        );
+        this.lastConfirmedPollCheckpoint = { ...sanitized };
+        this.pendingUnsavedCheckpoint = null;
+        this.clearCheckpointDegradedState();
+        return null;
+      }
+      this.lastConfirmedPollCheckpoint = { ...valid };
       this.clearCheckpointDegradedState();
       return valid;
     } catch (error) {
@@ -348,8 +459,25 @@ export class FulfillmentService {
 
   public static async saveMyStarsPollCheckpoint(
     checkpoint: MyStarsPollCheckpoint,
+    options?: { allowReset?: boolean },
   ): Promise<void> {
     try {
+      if (!options?.allowReset) {
+        const remoteRaw = await firestoreRepo.getDoc<MyStarsPollCheckpoint>(
+          'settings',
+          'mystars_poll_cursor',
+        );
+        const remoteValid = this.parseValidPollCheckpoint(remoteRaw);
+        if (remoteValid && this.comparePollCheckpoints(remoteValid, checkpoint) > 0) {
+          this.lastConfirmedPollCheckpoint = { ...remoteValid };
+          this.pendingUnsavedCheckpoint = null;
+          this.clearCheckpointDegradedState();
+          console.info(
+            `[FulfillmentService:MyStarsPolling] Пропущена запись устаревшего checkpoint (cycle=${checkpoint.cyclesCompleted}, cursor=${checkpoint.cursorOrderId ?? 'none'}): в Firestore уже сохранён более новый (cycle=${remoteValid.cyclesCompleted}, cursor=${remoteValid.cursorOrderId ?? 'none'}).`,
+          );
+          return;
+        }
+      }
       await firestoreRepo.setDoc<MyStarsPollCheckpoint>(
         'settings',
         'mystars_poll_cursor',
@@ -366,14 +494,17 @@ export class FulfillmentService {
   public static async resetMyStarsPollCheckpoint(): Promise<void> {
     this.pendingUnsavedCheckpoint = null;
     this.checkpointRetryAfterMs = 0;
-    await this.saveMyStarsPollCheckpoint({
-      key: 'mystars_poll_cursor',
-      cursorCreatedAt: undefined,
-      cursorOrderId: undefined,
-      cyclesCompleted: 0,
-      lastPolledCount: 0,
-      updatedAt: new Date().toISOString(),
-    });
+    await this.saveMyStarsPollCheckpoint(
+      {
+        key: 'mystars_poll_cursor',
+        cursorCreatedAt: undefined,
+        cursorOrderId: undefined,
+        cyclesCompleted: 0,
+        lastPolledCount: 0,
+        updatedAt: new Date().toISOString(),
+      },
+      { allowReset: true },
+    );
   }
 
   public static getMyStarsPollingStatus(): {
@@ -499,12 +630,26 @@ export class FulfillmentService {
           return current;
         }
         if (
-          !forceResend &&
-          (current.adminNotifiedAt ||
-            state?.status === 'sent' ||
-            state?.status === 'delivery_uncertain')
+          current.adminNotifiedAt ||
+          state?.status === 'sent' ||
+          state?.status === 'delivery_uncertain'
         ) {
           return current;
+        }
+        if (state?.status === 'sending') {
+          const uncertainState: NotificationDeliveryState = {
+            ...state,
+            status: 'delivery_uncertain',
+            uncertainSince: state.uncertainSince || nowIso,
+            deliveryUncertainAfterCrash: true,
+          };
+          const uncertainOrder: Order = {
+            ...current,
+            adminNotificationState: uncertainState,
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', uncertainOrder.orderId, uncertainOrder);
+          return uncertainOrder;
         }
 
         const noRecipientsState: NotificationDeliveryState = {
@@ -522,7 +667,7 @@ export class FulfillmentService {
         };
         const updated: Order = {
           ...current,
-          adminNotifiedAt: current.adminNotifiedAt,
+          adminNotifiedAt: undefined,
           adminNotificationState: noRecipientsState,
           updatedAt: nowIso,
         };
@@ -1015,11 +1160,13 @@ export class FulfillmentService {
     let skippedInFlight = false;
 
     if (params.target === 'admin' || params.target === 'both') {
+      const configuredAdminCount = new Set(getEnvConfig().adminIds).size;
       const next = await this.ensureAdminNotified(order, params.bot, true);
       if (next.adminNotificationState?.status === 'sending') {
         skippedInFlight = true;
       } else {
-        sentAdmin = next.adminNotificationState?.status === 'sent';
+        sentAdmin =
+          configuredAdminCount > 0 && next.adminNotificationState?.status === 'sent';
       }
       order = next;
     }
@@ -1999,6 +2146,7 @@ export class FulfillmentService {
     let cyclesCompleted = checkpoint?.cyclesCompleted ?? 0;
 
     let batchToPoll: Order[] = [];
+    const orderCycleMap = new Map<string, number>();
     let isMultiPageSweep = Boolean(scanCursor);
     let reachedTailOnLastScan = false;
     let wrappedAroundThisTick = false;
@@ -2023,6 +2171,9 @@ export class FulfillmentService {
           return (a.createdAt || '').localeCompare(b.createdAt || '');
         });
       batchToPoll = candidates.slice(0, budget);
+      for (const ord of batchToPoll) {
+        orderCycleMap.set(ord.orderId, cyclesCompleted);
+      }
       reachedTailOnLastScan = true;
     } else {
       // Large multi-page queue or resumed mid-sweep from persistent checkpoint
@@ -2067,6 +2218,7 @@ export class FulfillmentService {
           visitedOrderIds.add(ord.orderId);
           if (isMyStarsCandidate(ord) && !hasActiveExternalLease(ord, Date.now())) {
             batchToPoll.push(ord);
+            orderCycleMap.set(ord.orderId, cyclesCompleted);
             if (batchToPoll.length >= budget) {
               stoppedEarlyAtIndex = i;
               break;
@@ -2106,7 +2258,7 @@ export class FulfillmentService {
       }
     }
 
-    let lastAttemptedOrderInSweep: Order | null = null;
+    let lastCompletedOrderInSweep: { order: Order; cycle: number } | null = null;
     let interruptedByRateLimit = false;
 
     for (const ord of batchToPoll) {
@@ -2130,15 +2282,22 @@ export class FulfillmentService {
       try {
         const latest = leaseClaim.order;
         if (latest.fulfillmentStatus !== 'processing') {
+          lastCompletedOrderInSweep = {
+            order: ord,
+            cycle: orderCycleMap.get(ord.orderId) ?? cyclesCompleted,
+          };
           continue;
         }
 
         summary.polled += 1;
-        lastAttemptedOrderInSweep = ord;
         const extStatus = await activeAdapter.checkExternalStatus(
           latest,
           latest.fulfillmentIdempotencyKey || `fulfill_${latest.orderId}`,
         );
+        lastCompletedOrderInSweep = {
+          order: ord,
+          cycle: orderCycleMap.get(ord.orderId) ?? cyclesCompleted,
+        };
 
         if (extStatus.alreadyExecuted && extStatus.status === 'completed') {
           const completed = await this.completeOrder({
@@ -2207,7 +2366,8 @@ export class FulfillmentService {
           error instanceof Error ? error.message : String(error),
         );
 
-        // 1. Rate-limit (HTTP 429 general): set global polling cooldown honoring Retry-After
+        // 1. Rate-limit (HTTP 429 general): set global polling cooldown honoring Retry-After.
+        // Do NOT advance lastCompletedOrderInSweep so this unprocessed order is NOT skipped on the next tick.
         if (error instanceof MyStarsRateLimitError && error.kind === 'general') {
           const retryAfterSec = error.retryAfterSeconds ?? 15;
           const cooldownMs = Math.min(Math.max(retryAfterSec * 1000, 10), 120_000);
@@ -2227,6 +2387,12 @@ export class FulfillmentService {
           );
           break;
         }
+
+        // Non-rate-limit terminal/transient errors still count as processed for sweep advancement
+        lastCompletedOrderInSweep = {
+          order: ord,
+          cycle: orderCycleMap.get(ord.orderId) ?? cyclesCompleted,
+        };
 
         // 2. Permanent terminal failure (MyStars status failed/reversed/expired/cancelled or non-retryable 4xx)
         const isPermanent =
@@ -2280,27 +2446,37 @@ export class FulfillmentService {
     // so subsequent ticks flush it before scanning any new orders (preventing head-of-queue loops).
     let checkpointToPersist: MyStarsPollCheckpoint | null = null;
     if (isMultiPageSweep) {
-      const nextCursorToSave =
-        interruptedByRateLimit && lastAttemptedOrderInSweep
-          ? {
-              cursorCreatedAt: lastAttemptedOrderInSweep.createdAt,
-              cursorOrderId: lastAttemptedOrderInSweep.orderId,
-            }
-          : reachedTailOnLastScan && !scanCursor
+      if (interruptedByRateLimit) {
+        if (lastCompletedOrderInSweep) {
+          checkpointToPersist = {
+            key: 'mystars_poll_cursor',
+            cursorCreatedAt: lastCompletedOrderInSweep.order.createdAt,
+            cursorOrderId: lastCompletedOrderInSweep.order.orderId,
+            cyclesCompleted: lastCompletedOrderInSweep.cycle,
+            lastPolledCount: summary.polled,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        // If the very first order in batchToPoll hit HTTP 429, keep the previous checkpoint
+        // unchanged so the rate-limited order is polled first after cooldown.
+      } else {
+        const nextCursorToSave =
+          reachedTailOnLastScan && !scanCursor
             ? { cursorCreatedAt: undefined, cursorOrderId: undefined }
             : scanCursor
               ? { cursorCreatedAt: scanCursor.value, cursorOrderId: scanCursor.id }
               : { cursorCreatedAt: undefined, cursorOrderId: undefined };
 
-      checkpointToPersist = {
-        key: 'mystars_poll_cursor',
-        cursorCreatedAt: nextCursorToSave.cursorCreatedAt,
-        cursorOrderId: nextCursorToSave.cursorOrderId,
-        cyclesCompleted,
-        lastPolledCount: summary.polled,
-        updatedAt: new Date().toISOString(),
-      };
-    } else if (checkpoint?.cursorOrderId) {
+        checkpointToPersist = {
+          key: 'mystars_poll_cursor',
+          cursorCreatedAt: nextCursorToSave.cursorCreatedAt,
+          cursorOrderId: nextCursorToSave.cursorOrderId,
+          cyclesCompleted,
+          lastPolledCount: summary.polled,
+          updatedAt: new Date().toISOString(),
+        };
+      }
+    } else if (checkpoint?.cursorOrderId && !interruptedByRateLimit) {
       checkpointToPersist = {
         key: 'mystars_poll_cursor',
         cursorCreatedAt: undefined,
@@ -2390,32 +2566,41 @@ export class FulfillmentService {
         console.warn(
           `[FulfillmentService] ADMIN_IDS / OWNER_TELEGRAM_ID не заданы — алерт сбоя MyStars для заказа #${updated.orderId} не отправлен.`,
         );
-        if (!updated.adminNotifiedAt) {
-          await firestoreRepo
-            .updateDoc<Order>('orders', updated.orderId, {
+        await firestoreRepo
+          .runTransaction<void>(async (tx) => {
+            const latest = await tx.get<Order>('orders', updated.orderId);
+            if (!latest) return;
+            const latestState = latest.adminNotificationState;
+            const leaseUntilMs = this.timestampToMillis(latestState?.leaseUntil);
+            if (
+              latest.adminNotifiedAt ||
+              latestState?.status === 'sent' ||
+              latestState?.status === 'delivery_uncertain' ||
+              (latestState?.status === 'sending' && leaseUntilMs > Date.now())
+            ) {
+              return;
+            }
+            tx.set<Order>('orders', latest.orderId, {
+              ...latest,
               adminNotificationState: {
-                ...(updated.adminNotificationState || {}),
+                ...(latestState || {}),
                 status: 'no_recipients',
                 eventId:
-                  updated.adminNotificationState?.eventId ||
-                  `evt_admin_${updated.orderId}_failed`,
-                attemptCount: updated.adminNotificationState?.attemptCount ?? 0,
+                  latestState?.eventId || `evt_admin_${latest.orderId}_failed`,
+                attemptCount: latestState?.attemptCount ?? 0,
                 sentAt: undefined,
                 lastError:
                   'Не настроены получатели ADMIN_IDS / OWNER_TELEGRAM_ID — уведомление не отправлялось.',
               },
               updatedAt: finIso,
-            })
-            .catch(() => {});
-        }
+            });
+          })
+          .catch(() => {});
       } else {
-        const deliveries: Record<string, AdminRecipientDeliveryRecord> = {
-          ...(updated.adminNotificationState?.recipientDeliveries || {}),
-        };
-        let deliveredCount = 0;
+        const deliveries: Record<string, AdminRecipientDeliveryRecord> = {};
         for (const adminId of uniqueAdminIds) {
           const key = String(adminId);
-          const prev = deliveries[key];
+          const prev = updated.adminNotificationState?.recipientDeliveries?.[key];
           const res = await this.sendTelegramMessageWithResult(
             bot,
             adminId,
@@ -2426,7 +2611,6 @@ export class FulfillmentService {
             },
           );
           if (res.ok) {
-            deliveredCount++;
             deliveries[key] = {
               adminTelegramId: adminId,
               status: 'sent',
@@ -2446,29 +2630,62 @@ export class FulfillmentService {
           }
         }
 
-        const allDelivered = deliveredCount === uniqueAdminIds.length;
         await firestoreRepo
-          .updateDoc<Order>('orders', updated.orderId, {
-            ...(allDelivered ? { adminNotifiedAt: finIso } : {}),
-            adminNotificationState: {
-              status: allDelivered
-                ? 'sent'
-                : deliveredCount > 0
-                  ? 'partial_sent'
-                  : 'pending',
-              eventId:
-                updated.adminNotificationState?.eventId ||
-                `evt_admin_${updated.orderId}_failed`,
-              attemptCount: (updated.adminNotificationState?.attemptCount ?? 0) + 1,
-              sentAt: allDelivered ? finIso : undefined,
-              lastError: allDelivered
-                ? undefined
-                : deliveredCount > 0
-                  ? `Частичная доставка алерта сбоя (${deliveredCount}/${uniqueAdminIds.length})`
-                  : 'Не удалось доставить алерт сбоя ни одному администратору',
-              recipientDeliveries: deliveries,
-            },
-            updatedAt: finIso,
+          .runTransaction<void>(async (tx) => {
+            const latest = await tx.get<Order>('orders', updated.orderId);
+            if (!latest) return;
+            const latestState = latest.adminNotificationState;
+            const leaseUntilMs = this.timestampToMillis(latestState?.leaseUntil);
+            if (latestState?.status === 'sending' && leaseUntilMs > Date.now()) {
+              return;
+            }
+            const mergedDeliveries: Record<string, AdminRecipientDeliveryRecord> = {
+              ...(latestState?.recipientDeliveries || {}),
+            };
+            for (const [k, rec] of Object.entries(deliveries)) {
+              const existing = mergedDeliveries[k];
+              if (existing?.status === 'sent' && rec.status !== 'sent') {
+                mergedDeliveries[k] = {
+                  ...existing,
+                  attemptCount: Math.max(existing.attemptCount, rec.attemptCount),
+                  lastAttemptAt: rec.lastAttemptAt,
+                };
+              } else {
+                mergedDeliveries[k] = rec;
+              }
+            }
+
+            const deliveredIds = uniqueAdminIds.filter(
+              (id) => mergedDeliveries[String(id)]?.status === 'sent',
+            );
+            const undeliveredIds = uniqueAdminIds.filter(
+              (id) => mergedDeliveries[String(id)]?.status !== 'sent',
+            );
+            const allDelivered = undeliveredIds.length === 0;
+
+            tx.set<Order>('orders', latest.orderId, {
+              ...latest,
+              ...(allDelivered ? { adminNotifiedAt: latest.adminNotifiedAt || finIso } : {}),
+              adminNotificationState: {
+                ...(latestState || {}),
+                status: allDelivered
+                  ? 'sent'
+                  : deliveredIds.length > 0
+                    ? 'partial_sent'
+                    : 'pending',
+                eventId:
+                  latestState?.eventId || `evt_admin_${latest.orderId}_failed`,
+                attemptCount: (latestState?.attemptCount ?? 0) + 1,
+                sentAt: allDelivered ? latestState?.sentAt || finIso : undefined,
+                lastError: allDelivered
+                  ? undefined
+                  : deliveredIds.length > 0
+                    ? `Частичная доставка алерта сбоя (${deliveredIds.length}/${uniqueAdminIds.length})`
+                    : 'Не удалось доставить алерт сбоя ни одному администратору',
+                recipientDeliveries: mergedDeliveries,
+              },
+              updatedAt: finIso,
+            });
           })
           .catch(() => {});
       }
