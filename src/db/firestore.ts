@@ -26,6 +26,7 @@ import {
   BalanceTopUpRecord,
   DigitalKeyRecord,
   PaymentLockRecord,
+  FragmentWebhookLockRecord,
 } from '../types.ts';
 import { handleFirestoreError, testConnection } from './firestoreErrorHandler.ts';
 
@@ -42,7 +43,8 @@ export type StoreCollectionName =
   | CollectionName
   | 'balance_topups'
   | 'digital_keys'
-  | 'payment_locks';
+  | 'payment_locks'
+  | 'fragment_webhook_locks';
 
 export interface QueryWhereFilter {
   field: string;
@@ -88,6 +90,7 @@ interface LocalDatabaseState {
   balance_topups: Record<string, BalanceTopUpRecord>;
   digital_keys: Record<string, DigitalKeyRecord>;
   payment_locks: Record<string, PaymentLockRecord>;
+  fragment_webhook_locks: Record<string, FragmentWebhookLockRecord>;
   transactions: Record<string, StoreTransaction>;
   admins: Record<string, AdminRecord>;
   settings: Record<string, StoreSettings | Record<string, unknown>>;
@@ -339,6 +342,7 @@ export class FirestoreRepository {
       balance_topups: {},
       digital_keys: {},
       payment_locks: {},
+      fragment_webhook_locks: {},
       transactions: {},
       admins: {},
       settings: {},
@@ -552,6 +556,7 @@ export class FirestoreRepository {
           balance_topups: parsed.balance_topups || {},
           digital_keys: parsed.digital_keys || {},
           payment_locks: parsed.payment_locks || {},
+          fragment_webhook_locks: parsed.fragment_webhook_locks || {},
           transactions: parsed.transactions || {},
           admins: parsed.admins || {},
           settings: parsed.settings || {},

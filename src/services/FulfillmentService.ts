@@ -23,6 +23,10 @@ import {
   MyStarsTransportError,
   myStarsClient,
 } from './MyStarsService.ts';
+import {
+  FragmentApiError,
+  fragmentAuthService,
+} from './FragmentAuthService.ts';
 import { redactSecretsFromText } from './PaymentProviders.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
 import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
@@ -85,6 +89,29 @@ export class ManualAdminFulfillmentAdapter implements FulfillmentProviderAdapter
   }
 }
 
+/**
+ * Stage 4.6.1 Preparation Adapter for Fragment API v3 (Auth Only — Option 1).
+ * Real Stars/Premium purchases and TON transfers are strictly disabled in Stage 4.6.1.
+ */
+export class FragmentPreparationAdapter implements FulfillmentProviderAdapter {
+  public readonly providerName = 'FragmentAPIv3 (Stage 4.6.1: Подготовка и Auth без KYC)';
+  public readonly supportsIdempotency = true;
+
+  public isConfigured(): boolean {
+    return fragmentAuthService.isWalletConfigured();
+  }
+
+  public async requestFulfillment(
+    order: Order,
+  ): Promise<FulfillmentAdapterResult> {
+    throw new FragmentApiError({
+      message: `Покупка через Fragment API v3 для заказа #${order.orderId} отключена на этапе Stage 4.6.1 (подготовлена только авторизация кошелька без транзакций). Переключите FULFILLMENT_PROVIDER=mystars для автовыдачи или выполните заказ вручную.`,
+      code: 'FRAGMENT_PURCHASE_NOT_ENABLED_STAGE_4_6_1',
+      retryable: false,
+    });
+  }
+}
+
 export class MyStarsCheckpointError extends Error {
   public readonly operation: 'load' | 'save';
 
@@ -114,6 +141,7 @@ export class FulfillmentService {
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
   private static myStarsAdapter = new MyStarsFulfillmentAdapter(myStarsClient);
+  private static fragmentPrepAdapter = new FragmentPreparationAdapter();
   private static customAdapterOverride: FulfillmentProviderAdapter | null = null;
   private static recoveryIntervalHandle: ReturnType<typeof setInterval> | null = null;
   private static isRecoveryPassRunning = false;
@@ -333,6 +361,28 @@ export class FulfillmentService {
     this.checkpointRetryAfterMs = 0;
   }
 
+  private static normalizeResetEpoch(
+    checkpoint: Pick<MyStarsPollCheckpoint, 'resetEpoch'>,
+  ): number {
+    return typeof checkpoint.resetEpoch === 'number' &&
+      Number.isInteger(checkpoint.resetEpoch) &&
+      checkpoint.resetEpoch >= 0
+      ? checkpoint.resetEpoch
+      : 0;
+  }
+
+  private static extractRawResetEpoch(raw: unknown): number {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return 0;
+    }
+    const candidate = (raw as Record<string, unknown>).resetEpoch;
+    return typeof candidate === 'number' &&
+      Number.isInteger(candidate) &&
+      candidate >= 0
+      ? candidate
+      : 0;
+  }
+
   private static sanitizeCheckpointForStorage(
     checkpoint: MyStarsPollCheckpoint,
   ): MyStarsPollCheckpoint {
@@ -341,17 +391,11 @@ export class FulfillmentService {
       cyclesCompleted: checkpoint.cyclesCompleted,
       lastPolledCount: checkpoint.lastPolledCount,
       updatedAt: checkpoint.updatedAt,
+      resetEpoch: this.normalizeResetEpoch(checkpoint),
     };
     if (checkpoint.cursorCreatedAt && checkpoint.cursorOrderId) {
       clean.cursorCreatedAt = checkpoint.cursorCreatedAt;
       clean.cursorOrderId = checkpoint.cursorOrderId;
-    }
-    if (
-      typeof checkpoint.resetEpoch === 'number' &&
-      Number.isInteger(checkpoint.resetEpoch) &&
-      checkpoint.resetEpoch >= 0
-    ) {
-      clean.resetEpoch = checkpoint.resetEpoch;
     }
     return clean;
   }
@@ -371,7 +415,7 @@ export class FulfillmentService {
     ) {
       return null;
     }
-    let resetEpoch: number | undefined;
+    let resetEpoch = 0;
     if (obj.resetEpoch !== undefined && obj.resetEpoch !== null) {
       if (
         typeof obj.resetEpoch !== 'number' ||
@@ -420,7 +464,7 @@ export class FulfillmentService {
       cyclesCompleted: obj.cyclesCompleted,
       lastPolledCount,
       updatedAt,
-      ...(resetEpoch !== undefined ? { resetEpoch } : {}),
+      resetEpoch,
     });
   }
 
@@ -428,10 +472,10 @@ export class FulfillmentService {
     a: MyStarsPollCheckpoint,
     b: MyStarsPollCheckpoint,
   ): number {
-    if (a.resetEpoch !== undefined && b.resetEpoch !== undefined) {
-      if (a.resetEpoch !== b.resetEpoch) {
-        return a.resetEpoch - b.resetEpoch;
-      }
+    const aEpoch = this.normalizeResetEpoch(a);
+    const bEpoch = this.normalizeResetEpoch(b);
+    if (aEpoch !== bEpoch) {
+      return aEpoch - bEpoch;
     }
     if (a.cyclesCompleted !== b.cyclesCompleted) {
       return a.cyclesCompleted - b.cyclesCompleted;
@@ -552,6 +596,7 @@ export class FulfillmentService {
         const repairResult = await this.runCheckpointTransactionWithRetry<{
           repaired: boolean;
           checkpoint: MyStarsPollCheckpoint | null;
+          repairedDoc?: MyStarsPollCheckpoint;
         }>('load', async (tx) => {
           const currentRaw = await tx.get<MyStarsPollCheckpoint>(
             'settings',
@@ -565,30 +610,24 @@ export class FulfillmentService {
             // Another worker already repaired or advanced the checkpoint — never overwrite it!
             return { repaired: false, checkpoint: currentValid };
           }
+          const preservedEpoch = this.extractRawResetEpoch(currentRaw);
           const sanitized = this.sanitizeCheckpointForStorage({
             key: 'mystars_poll_cursor',
             cyclesCompleted: 0,
             lastPolledCount: 0,
             updatedAt: new Date().toISOString(),
-            resetEpoch: 0,
+            resetEpoch: preservedEpoch,
           });
           tx.set<MyStarsPollCheckpoint>(
             'settings',
             'mystars_poll_cursor',
             sanitized,
           );
-          return { repaired: true, checkpoint: null };
+          return { repaired: true, checkpoint: null, repairedDoc: sanitized };
         });
 
-        if (repairResult.repaired) {
-          const cleanConfirmed = this.sanitizeCheckpointForStorage({
-            key: 'mystars_poll_cursor',
-            cyclesCompleted: 0,
-            lastPolledCount: 0,
-            updatedAt: new Date().toISOString(),
-            resetEpoch: 0,
-          });
-          this.updateLocalConfirmedCheckpoint(cleanConfirmed, { force: true });
+        if (repairResult.repaired && repairResult.repairedDoc) {
+          this.updateLocalConfirmedCheckpoint(repairResult.repairedDoc, { force: true });
           this.clearCheckpointDegradedState();
           return null;
         }
@@ -637,13 +676,7 @@ export class FulfillmentService {
           return { written: false, effective: remoteValid };
         }
 
-        const toWrite = this.sanitizeCheckpointForStorage({
-          ...normalizedIncoming,
-          ...(normalizedIncoming.resetEpoch === undefined &&
-          remoteValid?.resetEpoch !== undefined
-            ? { resetEpoch: remoteValid.resetEpoch }
-            : {}),
-        });
+        const toWrite = this.sanitizeCheckpointForStorage(normalizedIncoming);
         tx.set<MyStarsPollCheckpoint>(
           'settings',
           'mystars_poll_cursor',
@@ -654,7 +687,7 @@ export class FulfillmentService {
 
       if (!txOutcome.written) {
         console.info(
-          `[FulfillmentService:MyStarsPolling] Атомарно пропущена запись устаревшего checkpoint (epoch=${normalizedIncoming.resetEpoch ?? 'legacy'}, cycle=${normalizedIncoming.cyclesCompleted}, cursor=${normalizedIncoming.cursorOrderId ?? 'none'}): в Firestore уже сохранён более новый (epoch=${txOutcome.effective.resetEpoch ?? 'legacy'}, cycle=${txOutcome.effective.cyclesCompleted}, cursor=${txOutcome.effective.cursorOrderId ?? 'none'}).`,
+          `[FulfillmentService:MyStarsPolling] Атомарно пропущена запись устаревшего checkpoint (epoch=${this.normalizeResetEpoch(normalizedIncoming)}, cycle=${normalizedIncoming.cyclesCompleted}, cursor=${normalizedIncoming.cursorOrderId ?? 'none'}): в Firestore уже сохранён более новый (epoch=${this.normalizeResetEpoch(txOutcome.effective)}, cycle=${txOutcome.effective.cyclesCompleted}, cursor=${txOutcome.effective.cursorOrderId ?? 'none'}).`,
         );
       }
 
@@ -678,7 +711,13 @@ export class FulfillmentService {
             'mystars_poll_cursor',
           );
           const remoteValid = this.parseValidPollCheckpoint(remoteRaw);
-          const nextResetEpoch = (remoteValid?.resetEpoch ?? 0) + 1;
+          const remoteEpoch = remoteValid
+            ? this.normalizeResetEpoch(remoteValid)
+            : this.extractRawResetEpoch(remoteRaw);
+          const localEpoch = this.lastConfirmedPollCheckpoint
+            ? this.normalizeResetEpoch(this.lastConfirmedPollCheckpoint)
+            : 0;
+          const nextResetEpoch = Math.max(remoteEpoch, localEpoch) + 1;
           const nextCheckpoint = this.sanitizeCheckpointForStorage({
             key: 'mystars_poll_cursor',
             cyclesCompleted: 0,
@@ -749,10 +788,39 @@ export class FulfillmentService {
     if (this.customAdapterOverride) {
       return this.customAdapterOverride;
     }
+    const config = getEnvConfig();
+    if (config.fulfillmentProvider === 'fragment') {
+      return this.fragmentPrepAdapter;
+    }
+    if (config.fulfillmentProvider === 'mystars') {
+      return myStarsClient.isConfigured() ? this.myStarsAdapter : this.manualAdapter;
+    }
     if (myStarsClient.isConfigured()) {
       return this.myStarsAdapter;
     }
     return this.manualAdapter;
+  }
+
+  /**
+   * Resolves the adapter pinned to a specific order so unfinished orders keep using
+   * the supplier recorded on the order even if FULFILLMENT_PROVIDER is switched later.
+   */
+  public static getAdapterForOrder(
+    order?: Pick<Order, 'fulfillmentProvider'>,
+  ): FulfillmentProviderAdapter {
+    if (this.customAdapterOverride) {
+      return this.customAdapterOverride;
+    }
+    if (order?.fulfillmentProvider === 'mystars') {
+      return myStarsClient.isConfigured() ? this.myStarsAdapter : this.manualAdapter;
+    }
+    if (order?.fulfillmentProvider === 'manual') {
+      return this.manualAdapter;
+    }
+    if (order?.fulfillmentProvider === 'fragment') {
+      return this.fragmentPrepAdapter;
+    }
+    return this.getActiveAdapter();
   }
 
   public static getAdapterInfo(): { name: string; configured: boolean } {
@@ -1510,7 +1578,7 @@ export class FulfillmentService {
   ): Promise<Order> {
     const idempotencyKey =
       orderInput.fulfillmentIdempotencyKey || `fulfill_${orderInput.orderId}`;
-    const activeAdapter = this.getActiveAdapter();
+    const activeAdapter = this.getAdapterForOrder(orderInput);
 
     // Stage 3.3: Check if digital keys are available for this product (for ManualAdminFulfillmentAdapter or gifts category)
     if (
@@ -1873,7 +1941,7 @@ export class FulfillmentService {
     );
     const idempotencyKey =
       staleOrder.fulfillmentIdempotencyKey || `fulfill_${staleOrder.orderId}`;
-    const activeAdapter = this.getActiveAdapter();
+    const activeAdapter = this.getAdapterForOrder(staleOrder);
 
     // If MyStars POST /v1/orders crashed or timed out before mystarsOrderId was persisted,
     // attempt bounded reconciliation via GET /v1/orders first.
@@ -2252,8 +2320,14 @@ export class FulfillmentService {
       return summary;
     }
 
-    const activeAdapter = this.getActiveAdapter();
-    if (!activeAdapter.checkExternalStatus || !activeAdapter.isConfigured()) {
+    const pollingAdapter =
+      this.customAdapterOverride ??
+      (myStarsClient.isConfigured() ? this.myStarsAdapter : null);
+    if (
+      !pollingAdapter ||
+      !pollingAdapter.checkExternalStatus ||
+      !pollingAdapter.isConfigured()
+    ) {
       return summary;
     }
 
@@ -2304,6 +2378,8 @@ export class FulfillmentService {
     const budget = Math.max(1, this.pollBatchBudget);
     const pageSize = Math.max(1, this.pollPageSize);
     const isMyStarsCandidate = (ord: Order): boolean =>
+      ord.fulfillmentProvider !== 'fragment' &&
+      ord.fulfillmentProvider !== 'manual' &&
       Boolean(
         ord.mystarsOrderId ||
           (ord.externalExecutionReference &&
@@ -2485,7 +2561,7 @@ export class FulfillmentService {
         }
 
         summary.polled += 1;
-        const extStatus = await activeAdapter.checkExternalStatus(
+        const extStatus = await pollingAdapter.checkExternalStatus(
           latest,
           latest.fulfillmentIdempotencyKey || `fulfill_${latest.orderId}`,
         );
@@ -2639,7 +2715,11 @@ export class FulfillmentService {
     // Persist cursor checkpoint for multi-page sweeps so next tick & restarts resume fairly.
     // Never advance the confirmed cursor if Firestore save fails; queue pendingUnsavedCheckpoint
     // so subsequent ticks flush it before scanning any new orders (preventing head-of-queue loops).
-    const sweepResetEpoch = checkpoint?.resetEpoch ?? 0;
+    const sweepResetEpoch = checkpoint
+      ? this.normalizeResetEpoch(checkpoint)
+      : this.lastConfirmedPollCheckpoint
+        ? this.normalizeResetEpoch(this.lastConfirmedPollCheckpoint)
+        : 0;
     let checkpointToPersist: MyStarsPollCheckpoint | null = null;
     if (isMultiPageSweep) {
       if (interruptedByRateLimit) {

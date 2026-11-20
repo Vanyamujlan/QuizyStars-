@@ -1,8 +1,11 @@
+import { getEnvConfig } from '../config/env.ts';
 import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
+  FulfillmentProviderType,
   Order,
   OrderStatus,
   PaymentRecord,
+  ProductCategory,
   StoreTransaction,
   StoreUser,
   TransactionType,
@@ -73,6 +76,26 @@ export function canUseTelegramUsernameAsRecipient(raw?: string): string | null {
 
 export class OrderService {
   /**
+   * Resolves which fulfillment provider should be stamped on newly created orders.
+   * Preserves existing MyStars / Manual default when FULFILLMENT_PROVIDER is unset.
+   */
+  public static resolveOrderFulfillmentProvider(
+    category: ProductCategory,
+  ): FulfillmentProviderType {
+    if (category === 'gifts') {
+      return 'manual';
+    }
+    const cfg = getEnvConfig();
+    if (cfg.fulfillmentProvider === 'fragment') {
+      return 'fragment';
+    }
+    if (myStarsClient.isConfigured()) {
+      return 'mystars';
+    }
+    return 'manual';
+  }
+
+  /**
    * Creates a new pending order strictly using the product USD cents price stored in DB.
    * Never trusts price sent from client callbacks.
    */
@@ -120,9 +143,14 @@ export class OrderService {
       throw new Error('Укажите @username получателя перед созданием заказа.');
     }
 
+    const assignedFulfillmentProvider = this.resolveOrderFulfillmentProvider(
+      product.category,
+    );
+
     if (
       normalizedRecipient &&
-      (product.category === 'stars' || product.category === 'premium')
+      (product.category === 'stars' || product.category === 'premium') &&
+      assignedFulfillmentProvider !== 'fragment'
     ) {
       await myStarsClient.validateRecipientBeforeCheckout({
         category: product.category,
@@ -155,8 +183,11 @@ export class OrderService {
       currency: 'USD',
       paymentStatus: 'pending',
       fulfillmentStatus: 'pending',
+      fulfillmentProvider: assignedFulfillmentProvider,
       grossRevenueUsdCents: totalPriceUsdCents,
-      mystarsCurrency: 'usdt_ton',
+      ...(assignedFulfillmentProvider !== 'fragment'
+        ? { mystarsCurrency: 'usdt_ton' as const }
+        : {}),
       fulfillmentAttempts: 0,
       fulfillmentIdempotencyKey: `fulfill_${orderId}`,
       createdAt: now,
@@ -190,6 +221,7 @@ export class OrderService {
     const preCheckOrder = await firestoreRepo.getDoc<Order>('orders', orderId);
     if (
       preCheckOrder &&
+      preCheckOrder.fulfillmentProvider !== 'fragment' &&
       (preCheckOrder.category === 'stars' || preCheckOrder.category === 'premium')
     ) {
       await myStarsClient.validateRecipientBeforeCheckout({

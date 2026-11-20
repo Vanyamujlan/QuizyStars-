@@ -247,7 +247,7 @@ export interface ParsedWebhookNotification {
 
 export interface HttpTransportRequest {
   url: string;
-  method: 'GET' | 'POST';
+  method: 'GET' | 'POST' | 'DELETE';
   headers: Record<string, string>;
   body?: string;
 }
@@ -291,6 +291,25 @@ export function buildXRocketApiV1Url(baseUrl: string, endpointPath: string): str
   return `${cleanBase}/api/v1${cleanPath}`;
 }
 
+const runtimeSensitiveSecrets = new Set<string>();
+
+export function registerRuntimeSecret(value: string | undefined | null): void {
+  if (!value) return;
+  const trimmed = value.trim();
+  if (trimmed.length >= 6) {
+    runtimeSensitiveSecrets.add(trimmed);
+  }
+}
+
+export function unregisterRuntimeSecret(value: string | undefined | null): void {
+  if (!value) return;
+  runtimeSensitiveSecrets.delete(value.trim());
+}
+
+export function clearRuntimeSecretsForTests(): void {
+  runtimeSensitiveSecrets.clear();
+}
+
 export function maskSecret(value: string | undefined | null): string {
   if (!value) return '[NOT_SET]';
   const trimmed = value.trim();
@@ -301,6 +320,8 @@ export function maskSecret(value: string | undefined | null): string {
 export function redactSecretsFromText(text: string): string {
   if (!text) return text;
   const cfg = getEnvConfig();
+  const runtimeSeed = (process.env.TON_SEED || process.env.FRAGMENT_WALLET_SEED || '').trim();
+  const normalizedSeed = runtimeSeed ? runtimeSeed.split(/\s+/).join(' ') : '';
   const secrets = [
     cfg.cryptobotApiToken,
     cfg.xrocketApiKey,
@@ -308,10 +329,13 @@ export function redactSecretsFromText(text: string): string {
     cfg.webhookSecret,
     cfg.mystarsApiKey,
     cfg.mystarsWebhookSecret,
+    runtimeSeed,
+    normalizedSeed,
+    ...runtimeSensitiveSecrets,
   ].filter((s): s is string => Boolean(s && s.trim().length >= 4));
 
   let redacted = text;
-  for (const secret of secrets) {
+  for (const secret of Array.from(new Set(secrets))) {
     redacted = redacted.split(secret).join(maskSecret(secret));
   }
   return redacted;
