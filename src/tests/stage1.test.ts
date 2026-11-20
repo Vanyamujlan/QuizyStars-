@@ -16,6 +16,7 @@ import { PaymentService } from '../services/PaymentService.ts';
 import {
   FulfillmentService,
   ManualAdminFulfillmentAdapter,
+  MyStarsCheckpointError,
   type FulfillmentProviderAdapter,
 } from '../services/FulfillmentService.ts';
 import { ProductService } from '../services/ProductService.ts';
@@ -9995,6 +9996,476 @@ async function runFullAuditTestSuite(): Promise<void> {
       );
 
       return 'xRocket verifyInvoiceStatus (раздельные primary/fallback запросы, строгая проверка status/amount/currency без дефолта USDT и защита от двойного зачисления) подтверждён.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 4.4.3 — FINAL RELIABILITY CORRECTIONS TESTS
+  // =========================================================================
+
+  await runTest(
+    'S443-01',
+    'Fulfillment',
+    'Stage 4.4.3: Пустой adminIds не отмечает admin notification как sent и не выставляет adminNotifiedAt (no_recipients + восстановление при настройке админов)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+
+      const buyer = { id: 443001, username: 's443_empty_admin_buyer', first_name: 'Buyer443' };
+      await UserService.upsertFromTelegram(buyer);
+      const order = await OrderService.createOrder({
+        telegramUser: buyer,
+        recipientUsername: 's443_empty_admin_buyer',
+        productId: 'stars_custom',
+        quantity: 100,
+      });
+      await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
+        paymentStatus: 'paid',
+        fulfillmentStatus: 'processing',
+      });
+      const paidOrder = (await OrderService.getOrderById(order.orderId))!;
+
+      const deliveredMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(deliveredMessages);
+
+      try {
+        // 1. Убираем всех получателей (ADMIN_IDS и OWNER_TELEGRAM_ID пустые)
+        process.env.ADMIN_IDS = '';
+        process.env.OWNER_TELEGRAM_ID = '';
+
+        const afterEmpty = await FulfillmentService.ensureAdminNotified(paidOrder, mockBot);
+        assert.equal(deliveredMessages.length, 0, 'При пустом adminIds ни одно сообщение не должно отправляться');
+        assert.equal(
+          afterEmpty.adminNotifiedAt,
+          undefined,
+          'При пустом adminIds поле adminNotifiedAt НЕ должно выставляться',
+        );
+        assert.equal(
+          afterEmpty.adminNotificationState?.status,
+          'no_recipients',
+          'Статус должен быть no_recipients (не sent!)',
+        );
+        assert.equal(
+          afterEmpty.adminNotificationState?.sentAt,
+          undefined,
+          'Поле sentAt не должно выставляться при отсутствии получателей',
+        );
+        assert.equal(afterEmpty.adminNotificationState?.attemptCount, 0);
+
+        // Форматтер и клавиатура честно показывают no_recipients и дают review-кнопку
+        const cardText = formatAdminOrderCard(afterEmpty);
+        assert.ok(cardText.includes('no_recipients'));
+        const cardKb = JSON.stringify(buildAdminOrderActionKeyboard(afterEmpty));
+        assert.ok(cardKb.includes(`adm:ord_notify_review:${order.orderId}`));
+
+        // forceResend при пустом adminIds также НЕ выдаёт успех
+        const forceEmpty = await FulfillmentService.forceResendOrderNotification({
+          orderId: order.orderId,
+          target: 'admin',
+          bot: mockBot,
+        });
+        assert.equal(forceEmpty.sentAdmin, false);
+        assert.equal(forceEmpty.order.adminNotifiedAt, undefined);
+        assert.equal(forceEmpty.order.adminNotificationState?.status, 'no_recipients');
+
+        // 2. После настройки ADMIN_IDS повторный ensureAdminNotified автоматически доставляет уведомление и переводит в sent
+        process.env.ADMIN_IDS = '9001001,9001002';
+        const afterConfigured = await FulfillmentService.ensureAdminNotified(
+          forceEmpty.order,
+          mockBot,
+        );
+        assert.equal(afterConfigured.adminNotificationState?.status, 'sent');
+        assert.ok(afterConfigured.adminNotifiedAt);
+        assert.equal(deliveredMessages.filter((m) => m.chatId === 9001001).length, 1);
+        assert.equal(deliveredMessages.filter((m) => m.chatId === 9001002).length, 1);
+      } finally {
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'При пустом adminIds фиксируется status=no_recipients без adminNotifiedAt/sentAt; после настройки админов доставка выполняется корректно.';
+    },
+  );
+
+  await runTest(
+    'S443-02',
+    'Fulfillment',
+    'Stage 4.4.3: Частичная доставка уведомлений администраторам (все получили, никто не получил, 1 из 3 упал -> partial_sent, повтор без дубля уже получившим)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+
+      const buyer = { id: 443002, username: 's443_partial_buyer', first_name: 'PartialBuyer' };
+      await UserService.upsertFromTelegram(buyer);
+
+      const ADMIN_A = 9100001;
+      const ADMIN_B = 9100002;
+      const ADMIN_C = 9100003;
+
+      const makeOrder = async (suffix: string): Promise<Order> => {
+        const o = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: `s443_${suffix}`,
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', o.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+        });
+        return (await OrderService.getOrderById(o.orderId))!;
+      };
+
+      const sentLog: Array<{ chatId: number; text: string }> = [];
+      let failingChatIds = new Set<number>();
+      const selectiveBot = {
+        telegram: {
+          sendMessage: async (chatId: number | string, text: string) => {
+            const numericChatId = Number(chatId);
+            if (failingChatIds.has(numericChatId)) {
+              throw new Error(`Simulated Telegram 403 blocked for ${numericChatId}`);
+            }
+            sentLog.push({ chatId: numericChatId, text });
+            return { message_id: sentLog.length };
+          },
+        },
+      } as unknown as Telegraf;
+
+      try {
+        process.env.OWNER_TELEGRAM_ID = String(ADMIN_A);
+        process.env.ADMIN_IDS = `${ADMIN_B},${ADMIN_C}`;
+
+        // Сценарий 1: Все администраторы получили -> status='sent', adminNotifiedAt установлен
+        const ordAll = await makeOrder('all_ok');
+        failingChatIds = new Set();
+        const resAll = await FulfillmentService.ensureAdminNotified(ordAll, selectiveBot);
+        assert.equal(resAll.adminNotificationState?.status, 'sent');
+        assert.ok(resAll.adminNotifiedAt);
+        assert.equal(resAll.adminNotificationState?.recipientDeliveries?.[String(ADMIN_A)]?.status, 'sent');
+        assert.equal(resAll.adminNotificationState?.recipientDeliveries?.[String(ADMIN_B)]?.status, 'sent');
+        assert.equal(resAll.adminNotificationState?.recipientDeliveries?.[String(ADMIN_C)]?.status, 'sent');
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_A).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_B).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_C).length, 1);
+
+        // Повторный автоматический вызов НЕ дублирует никому
+        await FulfillmentService.ensureAdminNotified(resAll, selectiveBot);
+        assert.equal(sentLog.length, 3);
+
+        // Сценарий 2: Никто из администраторов не получил -> status='pending', adminNotifiedAt НЕ установлен
+        sentLog.length = 0;
+        const ordNone = await makeOrder('none_ok');
+        failingChatIds = new Set([ADMIN_A, ADMIN_B, ADMIN_C]);
+        const resNone = await FulfillmentService.ensureAdminNotified(ordNone, selectiveBot);
+        assert.equal(resNone.adminNotificationState?.status, 'pending');
+        assert.equal(resNone.adminNotifiedAt, undefined);
+        assert.equal(resNone.adminNotificationState?.sentAt, undefined);
+        assert.equal(resNone.adminNotificationState?.recipientDeliveries?.[String(ADMIN_A)]?.status, 'failed');
+        assert.equal(resNone.adminNotificationState?.recipientDeliveries?.[String(ADMIN_B)]?.status, 'failed');
+        assert.equal(resNone.adminNotificationState?.recipientDeliveries?.[String(ADMIN_C)]?.status, 'failed');
+        assert.equal(sentLog.length, 0);
+
+        // Сценарий 3: Один из нескольких (ADMIN_B) не получил -> status='partial_sent', adminNotifiedAt НЕ установлен
+        sentLog.length = 0;
+        const ordPartial = await makeOrder('partial_ok');
+        failingChatIds = new Set([ADMIN_B]);
+        const resPartial = await FulfillmentService.ensureAdminNotified(ordPartial, selectiveBot);
+        assert.equal(
+          resPartial.adminNotificationState?.status,
+          'partial_sent',
+          'При сбое у 1 из 3 админов статус обязан быть partial_sent, а не sent',
+        );
+        assert.equal(
+          resPartial.adminNotifiedAt,
+          undefined,
+          'При частичной доставке adminNotifiedAt НЕ должен устанавливаться',
+        );
+        assert.equal(resPartial.adminNotificationState?.sentAt, undefined);
+        assert.equal(resPartial.adminNotificationState?.recipientDeliveries?.[String(ADMIN_A)]?.status, 'sent');
+        assert.equal(resPartial.adminNotificationState?.recipientDeliveries?.[String(ADMIN_B)]?.status, 'failed');
+        assert.equal(resPartial.adminNotificationState?.recipientDeliveries?.[String(ADMIN_C)]?.status, 'sent');
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_A).length, 1);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_B).length, 0);
+        assert.equal(sentLog.filter((m) => m.chatId === ADMIN_C).length, 1);
+
+        // Проверка форматирования review-сообщения при partial_sent
+        const reviewMsg = formatAdminNotificationReviewMessage(resPartial);
+        assert.ok(reviewMsg.includes('partial_sent'));
+        assert.ok(reviewMsg.includes(String(ADMIN_B)));
+
+        // Сценарий 4: Повторная попытка (после восстановления связи с ADMIN_B):
+        // ADMIN_A и ADMIN_C НЕ получают дубль; доставляется ТОЛЬКО ADMIN_B -> статус становится 'sent' + adminNotifiedAt!
+        failingChatIds = new Set();
+        const resRetry = await FulfillmentService.ensureAdminNotified(resPartial, selectiveBot);
+        assert.equal(resRetry.adminNotificationState?.status, 'sent');
+        assert.ok(resRetry.adminNotifiedAt);
+        assert.equal(resRetry.adminNotificationState?.recipientDeliveries?.[String(ADMIN_B)]?.status, 'sent');
+        assert.equal(resRetry.adminNotificationState?.recipientDeliveries?.[String(ADMIN_B)]?.attemptCount, 2);
+        assert.equal(
+          sentLog.filter((m) => m.chatId === ADMIN_A).length,
+          1,
+          'ADMIN_A уже получил уведомление ранее и не должен получить дубль при повторе',
+        );
+        assert.equal(
+          sentLog.filter((m) => m.chatId === ADMIN_C).length,
+          1,
+          'ADMIN_C уже получил уведомление ранее и не должен получить дубль при повторе',
+        );
+        assert.equal(
+          sentLog.filter((m) => m.chatId === ADMIN_B).length,
+          1,
+          'ADMIN_B должен получить уведомление при повторной попытке ровно 1 раз',
+        );
+
+        // Сценарий 5: Совместимость со старым заказом (есть legacy adminNotifiedAt без recipientDeliveries)
+        sentLog.length = 0;
+        const ordLegacy = await makeOrder('legacy_compat');
+        await firestoreRepo.updateDoc<Order>('orders', ordLegacy.orderId, {
+          adminNotifiedAt: new Date().toISOString(),
+        });
+        const loadedLegacy = (await OrderService.getOrderById(ordLegacy.orderId))!;
+        await FulfillmentService.ensureAdminNotified(loadedLegacy, selectiveBot);
+        assert.equal(sentLog.length, 0, 'Legacy-заказ с adminNotifiedAt не должен переотправляться автоматически');
+      } finally {
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Сценарии all-sent, none-sent, partial_sent (1 из 3 упал), доотправка только недоставленному без дублей и совместимость с legacy-заказами подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S443-03',
+    'Database',
+    'Stage 4.4.3: Надёжность MyStars polling checkpoint (ошибки чтения/записи Firestore, защита от перезапуска с начала очереди, рестарт и восстановление)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 443003, username: 's443_ckpt_buyer', first_name: 'CkptBuyer' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      const TOTAL_ORDERS = 150;
+      const polledOrderIdsPerTick: string[][] = [];
+      let currentTickPolls: string[] = [];
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s443_ckpt_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      const prevRetries = myStarsClient.maxTransientGetRetries;
+      myStarsClient.maxTransientGetRetries = 0;
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          currentTickPolls.push(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: 's443_ckpt_buyer',
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected URL in S443-03: ${req.method} ${req.url}`);
+      });
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+      const prevBackoff = FulfillmentService.checkpointBackoffBaseMs;
+      const prevWorkerId = FulfillmentService.workerInstanceId;
+      const origGetDoc = firestoreRepo.getDoc.bind(firestoreRepo);
+      const origSetDoc = firestoreRepo.setDoc.bind(firestoreRepo);
+
+      let failCheckpointRead = false;
+      let failCheckpointWrite = false;
+
+      firestoreRepo.getDoc = (async <T>(collection: string, docId: string): Promise<T | null> => {
+        if (collection === 'settings' && docId === 'mystars_poll_cursor' && failCheckpointRead) {
+          throw new Error('Simulated Firestore UNAVAILABLE on checkpoint read');
+        }
+        return origGetDoc<T>(collection as never, docId);
+      }) as typeof firestoreRepo.getDoc;
+
+      firestoreRepo.setDoc = (async <T extends object>(collection: string, docId: string, data: T): Promise<void> => {
+        if (collection === 'settings' && docId === 'mystars_poll_cursor' && failCheckpointWrite) {
+          throw new Error('Simulated Firestore DEADLINE_EXCEEDED on checkpoint write');
+        }
+        return origSetDoc<T>(collection as never, docId, data);
+      }) as typeof firestoreRepo.setDoc;
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.checkpointBackoffBaseMs = 0; // детерминированное тестирование без sleep
+        FulfillmentService.pollBatchBudget = 30;
+        FulfillmentService.pollPageSize = 50;
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 3_600_000;
+        for (let i = 1; i <= TOTAL_ORDERS; i++) {
+          const ordId = `ord_ckpt_${String(i).padStart(3, '0')}`;
+          const msId = `ms_ckpt_${String(i).padStart(3, '0')}`;
+          const orderDoc: Order = {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: 'Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: msId,
+            mystarsOrderStatus: 'awaiting_payment',
+            createdAt: new Date(baseMs + i * 1000).toISOString(),
+            updatedAt: new Date(baseMs + i * 1000).toISOString(),
+          };
+          await origSetDoc<Order>('orders', ordId, orderDoc);
+        }
+
+        // Тик 1 (здоровый): опрашивает #001..#030 и сохраняет checkpoint на ord_ckpt_030
+        currentTickPolls = [];
+        const tick1 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        polledOrderIdsPerTick.push([...currentTickPolls]);
+        assert.equal(tick1.polled, 30);
+        assert.equal(tick1.checkpointSaved, true);
+        assert.equal(tick1.checkpointDegraded, false);
+        const ckptAfter1 = await FulfillmentService.loadMyStarsPollCheckpoint();
+        assert.equal(ckptAfter1?.cursorOrderId, 'ord_ckpt_030');
+
+        // 1. Ошибка ЧТЕНИЯ checkpoint (loadMyStarsPollCheckpoint):
+        // Прямой вызов выбрасывает MyStarsCheckpointError('load'), а pollMyStarsOrders явно фиксирует ошибку
+        // и НЕ сбрасывает опрос на начало очереди (#001..#030)!
+        failCheckpointRead = true;
+        await assert.rejects(
+          () => FulfillmentService.loadMyStarsPollCheckpoint(),
+          (err: unknown) => err instanceof MyStarsCheckpointError && err.operation === 'load',
+        );
+
+        currentTickPolls = [];
+        const tickReadFail = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickReadFail.polled, 0, 'При отказе чтения checkpoint не должно происходить повторное обслуживание начала очереди');
+        assert.equal(tickReadFail.checkpointDegraded, true);
+        assert.equal(tickReadFail.checkpointSaved, false);
+        assert.ok(tickReadFail.checkpointError?.includes('UNAVAILABLE'));
+        assert.equal(FulfillmentService.getMyStarsPollingStatus().checkpointDegraded, true);
+
+        // Восстановление чтения Firestore: следующий тик продолжает ровно с #031..#060!
+        failCheckpointRead = false;
+        currentTickPolls = [];
+        const tickAfterReadRecover = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickAfterReadRecover.polled, 30);
+        assert.equal(tickAfterReadRecover.checkpointDegraded, false);
+        assert.equal(tickAfterReadRecover.checkpointSaved, true);
+        assert.equal(currentTickPolls[0], 'ms_ckpt_031', 'После восстановления чтения опрос должен продолжиться с #031, а не с #001');
+        assert.equal(currentTickPolls[29], 'ms_ckpt_060');
+        assert.equal((await FulfillmentService.loadMyStarsPollCheckpoint())?.cursorOrderId, 'ord_ckpt_060');
+
+        // 2. Ошибка ЗАПИСИ checkpoint (saveMyStarsPollCheckpoint):
+        // Тик опрашивает #061..#090, но запись cursor=#090 падает:
+        // - checkpointSaved = false, checkpointDegraded = true, checkpointError заполнен;
+        // - в Firestore остаётся подтверждённый cursor=#060 (не продвинут!);
+        // - следующий тик, пока запись всё ещё падает, НЕ пересканирует повторно #061..#090 или #001..#030!
+        failCheckpointWrite = true;
+        currentTickPolls = [];
+        const tickWriteFail = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickWriteFail.polled, 30);
+        assert.equal(currentTickPolls[0], 'ms_ckpt_061');
+        assert.equal(tickWriteFail.checkpointSaved, false);
+        assert.equal(tickWriteFail.checkpointDegraded, true);
+        assert.ok(tickWriteFail.checkpointError?.includes('DEADLINE_EXCEEDED'));
+        assert.equal(FulfillmentService.getMyStarsPollingStatus().hasPendingUnsavedCheckpoint, true);
+        assert.equal(
+          (await FulfillmentService.loadMyStarsPollCheckpoint())?.cursorOrderId,
+          'ord_ckpt_060',
+          'Cursor в Firestore не должен быть продвинут при ошибке сохранения',
+        );
+
+        // Пока запись всё ещё недоступна, повторный тик пытается дозаписать pending checkpoint и НЕ опрашивает очередь по кругу
+        currentTickPolls = [];
+        const tickStillFailing = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickStillFailing.polled, 0, 'Пока checkpoint не сохраняется, не должно быть повторного обслуживания тех же заказов');
+        assert.equal(tickStillFailing.checkpointDegraded, true);
+        assert.equal(tickStillFailing.checkpointSaved, false);
+
+        // 3. Восстановление записи Firestore без рестарта -> дозаписывает pending cursor=#090 и переходит к #091..#120!
+        failCheckpointWrite = false;
+        currentTickPolls = [];
+        const tickAfterWriteRecover = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickAfterWriteRecover.polled, 30);
+        assert.equal(tickAfterWriteRecover.checkpointSaved, true);
+        assert.equal(tickAfterWriteRecover.checkpointDegraded, false);
+        assert.equal(currentTickPolls[0], 'ms_ckpt_091', 'После дозаписи pending checkpoint опрос должен продолжиться с #091');
+        assert.equal(currentTickPolls[29], 'ms_ckpt_120');
+        assert.equal((await FulfillmentService.loadMyStarsPollCheckpoint())?.cursorOrderId, 'ord_ckpt_120');
+
+        // 4. Ошибка записи checkpoint + РЕСТАРТ процесса:
+        // Опрашивает #121..#150, запись падает (cursor в Firestore остаётся #120).
+        // После рестарта (resetMyStarsPollingState) процесс восстанавливает Firestore и честно продолжает с последнего подтверждённого cursor=#120!
+        failCheckpointWrite = true;
+        currentTickPolls = [];
+        const tickBeforeRestart = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickBeforeRestart.polled, 30);
+        assert.equal(tickBeforeRestart.checkpointSaved, false);
+        assert.equal(currentTickPolls[0], 'ms_ckpt_121');
+
+        // Имитируем рестарт процесса + восстановление Firestore
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.workerInstanceId = 'restarted-ckpt-worker';
+        failCheckpointWrite = false;
+
+        const ckptOnRestart = await FulfillmentService.loadMyStarsPollCheckpoint();
+        assert.equal(
+          ckptOnRestart?.cursorOrderId,
+          'ord_ckpt_120',
+          'После рестарта процесс должен видеть последний реально сохранённый cursor (#120)',
+        );
+        currentTickPolls = [];
+        const tickAfterRestart = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickAfterRestart.polled, 30);
+        assert.equal(tickAfterRestart.checkpointSaved, true);
+        assert.equal(currentTickPolls[0], 'ms_ckpt_121', 'После рестарта опрос безопасно возобновляется с #121 без потери хвоста очереди');
+        assert.equal(currentTickPolls[29], 'ms_ckpt_150');
+
+        // Проверяем, что механизм распределённых leases по-прежнему полностью работает (все leases освобождены после тиков)
+        const sampleOrd = await OrderService.getOrderById('ord_ckpt_150');
+        assert.equal(sampleOrd?.mystarsPollLease, undefined, 'Распределённый lease должен корректно освобождаться после опроса');
+      } finally {
+        firestoreRepo.getDoc = origGetDoc;
+        firestoreRepo.setDoc = origSetDoc;
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        FulfillmentService.checkpointBackoffBaseMs = prevBackoff;
+        FulfillmentService.workerInstanceId = prevWorkerId;
+        myStarsClient.maxTransientGetRetries = prevRetries;
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Ошибки чтения/записи MyStars polling checkpoint явно фиксируются, не сбрасывают опрос на начало очереди и безопасно восстанавливаются (включая рестарт).';
     },
   );
 

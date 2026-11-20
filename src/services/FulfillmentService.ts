@@ -4,6 +4,7 @@ import { Telegraf } from 'telegraf';
 import { getEnvConfig } from '../config/env.ts';
 import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
+  AdminRecipientDeliveryRecord,
   DistributedLeaseRecord,
   FirestoreTimestampLike,
   MyStarsPollCheckpoint,
@@ -84,6 +85,19 @@ export class ManualAdminFulfillmentAdapter implements FulfillmentProviderAdapter
   }
 }
 
+export class MyStarsCheckpointError extends Error {
+  public readonly operation: 'load' | 'save';
+
+  constructor(operation: 'load' | 'save', message: string, cause?: unknown) {
+    super(message);
+    this.name = 'MyStarsCheckpointError';
+    this.operation = operation;
+    if (cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = cause;
+    }
+  }
+}
+
 export class FulfillmentService {
   public static readonly MAX_FULFILLMENT_ATTEMPTS = 3;
   public static baseRetryDelayMs = 2000;
@@ -93,6 +107,7 @@ export class FulfillmentService {
   public static staleOrderAlertThresholdMs = 15 * 60 * 1000;
   public static pollBatchBudget = 50;
   public static pollPageSize = 100;
+  public static checkpointBackoffBaseMs = 2000;
   public static workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
@@ -102,6 +117,12 @@ export class FulfillmentService {
   private static isRecoveryPassRunning = false;
   private static mystarsPollCooldownUntilMs = 0;
   private static inFlightMyStarsPollOrders = new Set<string>();
+  private static lastConfirmedPollCheckpoint: MyStarsPollCheckpoint | null = null;
+  private static pendingUnsavedCheckpoint: MyStarsPollCheckpoint | null = null;
+  private static checkpointDegraded = false;
+  private static checkpointLastError: string | null = null;
+  private static checkpointConsecutiveFailures = 0;
+  private static checkpointRetryAfterMs = 0;
 
   /**
    * Normalizes a Firestore Timestamp (or serialized plain-object / ISO / epoch representation)
@@ -262,6 +283,52 @@ export class FulfillmentService {
   public static resetMyStarsPollingState(): void {
     this.mystarsPollCooldownUntilMs = 0;
     this.inFlightMyStarsPollOrders.clear();
+    this.lastConfirmedPollCheckpoint = null;
+    this.pendingUnsavedCheckpoint = null;
+    this.checkpointDegraded = false;
+    this.checkpointLastError = null;
+    this.checkpointConsecutiveFailures = 0;
+    this.checkpointRetryAfterMs = 0;
+  }
+
+  private static recordCheckpointFailure(
+    operation: 'load' | 'save',
+    error: unknown,
+  ): MyStarsCheckpointError {
+    const rawMsg = redactSecretsFromText(
+      error instanceof Error ? error.message : String(error),
+    );
+    const wrapped =
+      error instanceof MyStarsCheckpointError
+        ? error
+        : new MyStarsCheckpointError(
+            operation,
+            `Ошибка Firestore при ${operation === 'load' ? 'чтении' : 'сохранении'} checkpoint MyStars polling: ${rawMsg}`,
+            error,
+          );
+    this.checkpointDegraded = true;
+    this.checkpointLastError = wrapped.message;
+    this.checkpointConsecutiveFailures += 1;
+    const baseMs = Math.max(0, this.checkpointBackoffBaseMs);
+    const backoffMs =
+      baseMs > 0
+        ? Math.min(30_000, baseMs * 2 ** Math.min(this.checkpointConsecutiveFailures - 1, 5))
+        : 0;
+    this.checkpointRetryAfterMs = backoffMs > 0 ? Date.now() + backoffMs : 0;
+    console.error(`[FulfillmentService:MyStarsPolling] ${wrapped.message}`);
+    return wrapped;
+  }
+
+  private static clearCheckpointDegradedState(): void {
+    if (this.checkpointDegraded) {
+      console.info(
+        `[FulfillmentService:MyStarsPolling] Работа с checkpoint Firestore восстановлена после ${this.checkpointConsecutiveFailures} сбоев.`,
+      );
+    }
+    this.checkpointDegraded = false;
+    this.checkpointLastError = null;
+    this.checkpointConsecutiveFailures = 0;
+    this.checkpointRetryAfterMs = 0;
   }
 
   public static async loadMyStarsPollCheckpoint(): Promise<MyStarsPollCheckpoint | null> {
@@ -270,12 +337,12 @@ export class FulfillmentService {
         'settings',
         'mystars_poll_cursor',
       );
-      if (doc && doc.key === 'mystars_poll_cursor') {
-        return doc;
-      }
-      return null;
-    } catch {
-      return null;
+      const valid = doc && doc.key === 'mystars_poll_cursor' ? doc : null;
+      this.lastConfirmedPollCheckpoint = valid ? { ...valid } : null;
+      this.clearCheckpointDegradedState();
+      return valid;
+    } catch (error) {
+      throw this.recordCheckpointFailure('load', error);
     }
   }
 
@@ -288,12 +355,17 @@ export class FulfillmentService {
         'mystars_poll_cursor',
         checkpoint,
       );
-    } catch {
-      // Best-effort checkpoint persistence
+      this.lastConfirmedPollCheckpoint = { ...checkpoint };
+      this.pendingUnsavedCheckpoint = null;
+      this.clearCheckpointDegradedState();
+    } catch (error) {
+      throw this.recordCheckpointFailure('save', error);
     }
   }
 
   public static async resetMyStarsPollCheckpoint(): Promise<void> {
+    this.pendingUnsavedCheckpoint = null;
+    this.checkpointRetryAfterMs = 0;
     await this.saveMyStarsPollCheckpoint({
       key: 'mystars_poll_cursor',
       cursorCreatedAt: undefined,
@@ -310,6 +382,11 @@ export class FulfillmentService {
     cooldownActive: boolean;
     cooldownUntilIso: string | null;
     inFlightOrdersCount: number;
+    checkpointDegraded: boolean;
+    checkpointLastError: string | null;
+    checkpointConsecutiveFailures: number;
+    hasPendingUnsavedCheckpoint: boolean;
+    lastConfirmedCursorOrderId: string | null;
   } {
     const now = Date.now();
     const cooldownActive = this.mystarsPollCooldownUntilMs > now;
@@ -321,6 +398,11 @@ export class FulfillmentService {
         ? new Date(this.mystarsPollCooldownUntilMs).toISOString()
         : null,
       inFlightOrdersCount: this.inFlightMyStarsPollOrders.size,
+      checkpointDegraded: this.checkpointDegraded,
+      checkpointLastError: this.checkpointLastError,
+      checkpointConsecutiveFailures: this.checkpointConsecutiveFailures,
+      hasPendingUnsavedCheckpoint: this.pendingUnsavedCheckpoint !== null,
+      lastConfirmedCursorOrderId: this.lastConfirmedPollCheckpoint?.cursorOrderId ?? null,
     };
   }
 
@@ -357,16 +439,21 @@ export class FulfillmentService {
 
   /**
    * Sends admin notification using a resilient state machine
-   * (`pending` -> `sending` -> `sent` | `delivery_uncertain`)
-   * with atomic claim, event ID, and lease protection.
+   * (`pending` -> `sending` -> `sent` | `partial_sent` | `no_recipients` | `delivery_uncertain`)
+   * with atomic claim, event ID, lease protection, and per-recipient delivery tracking.
    *
-   * Honesty contract: between Telegram Bot API and Firestore there is no distributed transaction,
-   * so absolute exactly-once delivery across process crashes is NOT guaranteed.
-   * If a process crashes while in `sending` (after Telegram may have accepted the message) and
-   * `leaseUntil` expires, we transition to explicit `delivery_uncertain` (NOT `sent` and WITHOUT
-   * setting `adminNotifiedAt`) so automatic retries never spam duplicates and admins can inspect
-   * and decide whether to perform a controlled resend or acknowledge delivery.
-   * Even `forceResend=true` respects an active `sending` lease to prevent parallel resend races.
+   * Honesty contract:
+   * - If `ADMIN_IDS` / `OWNER_TELEGRAM_ID` has zero recipients, records explicit `no_recipients`
+   *   and NEVER sets `status = 'sent'` or `adminNotifiedAt`.
+   * - `status = 'sent'` and `adminNotifiedAt` are set ONLY when EVERY configured admin has confirmed
+   *   delivery. Partial delivery sets `status = 'partial_sent'` (leaving `adminNotifiedAt` unset)
+   *   and persists per-admin `recipientDeliveries` so retries deliver ONLY to undelivered admins
+   *   without spamming already-notified recipients.
+   * - Between Telegram Bot API and Firestore there is no distributed transaction, so absolute
+   *   exactly-once delivery across process crashes is NOT guaranteed. If a process crashes while in
+   *   `sending` and `leaseUntil` expires, transitions to explicit `delivery_uncertain` (NOT `sent`
+   *   and WITHOUT setting `adminNotifiedAt`), preserving already-confirmed `recipientDeliveries`.
+   * - Even `forceResend=true` respects an active `sending` lease to prevent parallel resend races.
    */
   public static async ensureAdminNotified(
     order: Order,
@@ -393,23 +480,60 @@ export class FulfillmentService {
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
-    const { adminIds } = getEnvConfig();
-    if (adminIds.length === 0) {
-      const sentState: NotificationDeliveryState = {
-        status: 'sent',
-        eventId,
-        operationId,
-        leaseOwner,
-        attemptCount: (order.adminNotificationState?.attemptCount ?? 0) + 1,
-        sentAt: nowIso,
-      };
-      return (
-        (await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
-          adminNotifiedAt: nowIso,
-          adminNotificationState: sentState,
+    const uniqueAdminIds = Array.from(new Set(getEnvConfig().adminIds));
+    if (uniqueAdminIds.length === 0) {
+      if (
+        !forceResend &&
+        order.adminNotificationState?.status === 'no_recipients' &&
+        !order.adminNotifiedAt
+      ) {
+        return order;
+      }
+
+      const noRecipientsOrder = await firestoreRepo.runTransaction<Order>(async (tx) => {
+        const current = (await tx.get<Order>('orders', order.orderId)) || order;
+        const state = current.adminNotificationState;
+        const leaseUntilMs = this.timestampToMillis(state?.leaseUntil);
+
+        if (state?.status === 'sending' && leaseUntilMs > nowMs) {
+          return current;
+        }
+        if (
+          !forceResend &&
+          (current.adminNotifiedAt ||
+            state?.status === 'sent' ||
+            state?.status === 'delivery_uncertain')
+        ) {
+          return current;
+        }
+
+        const noRecipientsState: NotificationDeliveryState = {
+          ...state,
+          status: 'no_recipients',
+          eventId: state?.eventId || eventId,
+          operationId,
+          leaseOwner,
+          leaseUntil: undefined,
+          attemptCount: state?.attemptCount ?? 0,
+          sentAt: undefined,
+          deliveryUncertainAfterCrash: false,
+          lastError:
+            'Не настроены получатели ADMIN_IDS / OWNER_TELEGRAM_ID — уведомление не отправлялось.',
+        };
+        const updated: Order = {
+          ...current,
+          adminNotifiedAt: current.adminNotifiedAt,
+          adminNotificationState: noRecipientsState,
           updatedAt: nowIso,
-        })) || order
+        };
+        tx.set<Order>('orders', updated.orderId, updated);
+        return updated;
+      });
+
+      console.warn(
+        `[FulfillmentService] ADMIN_IDS / OWNER_TELEGRAM_ID не заданы — уведомление для заказа #${order.orderId} не отправлено (status=no_recipients).`,
       );
+      return noRecipientsOrder;
     }
 
     type AdminNotifyClaim =
@@ -417,7 +541,12 @@ export class FulfillmentService {
       | { action: 'delivery_uncertain'; order: Order }
       | { action: 'in_flight'; order: Order }
       | { action: 'recovered_uncertain'; order: Order }
-      | { action: 'claimed'; order: Order };
+      | {
+          action: 'claimed';
+          order: Order;
+          targetAdminIds: number[];
+          existingDeliveries: Record<string, AdminRecipientDeliveryRecord>;
+        };
 
     const claim = await firestoreRepo.runTransaction<AdminNotifyClaim>(async (tx) => {
       const current = (await tx.get<Order>('orders', order.orderId)) || order;
@@ -429,6 +558,13 @@ export class FulfillmentService {
         return { action: 'in_flight', order: current };
       }
 
+      const existingDeliveries: Record<string, AdminRecipientDeliveryRecord> =
+        state?.recipientDeliveries
+          ? Object.fromEntries(
+              Object.entries(state.recipientDeliveries).map(([k, v]) => [k, { ...v }]),
+            )
+          : {};
+
       if (!forceResend) {
         if (current.adminNotifiedAt || state?.status === 'sent') {
           return { action: 'already_sent', order: current };
@@ -438,12 +574,36 @@ export class FulfillmentService {
         }
         if (state?.status === 'sending') {
           // Previous worker crashed during `sending` and its lease expired:
-          // Mark explicit `delivery_uncertain` (NOT `sent`) preserving eventId/operationId/leaseOwner/leaseUntil/attemptCount.
+          // Mark explicit `delivery_uncertain` (NOT `sent`) preserving eventId/operationId/leaseOwner/leaseUntil/attemptCount
+          // and preserving any already-confirmed per-recipient deliveries.
+          const uncertainDeliveries: Record<string, AdminRecipientDeliveryRecord> = {
+            ...existingDeliveries,
+          };
+          for (const adminId of uniqueAdminIds) {
+            const key = String(adminId);
+            const existing = uncertainDeliveries[key];
+            if (!existing) {
+              uncertainDeliveries[key] = {
+                adminTelegramId: adminId,
+                status: 'delivery_uncertain',
+                attemptCount: state.attemptCount ?? 1,
+                lastAttemptAt: nowIso,
+                operationId: state.operationId,
+              };
+            } else if (existing.status !== 'sent') {
+              uncertainDeliveries[key] = {
+                ...existing,
+                status: 'delivery_uncertain',
+              };
+            }
+          }
+
           const uncertainState: NotificationDeliveryState = {
             ...state,
             status: 'delivery_uncertain',
             uncertainSince: state.uncertainSince || nowIso,
             deliveryUncertainAfterCrash: true,
+            recipientDeliveries: uncertainDeliveries,
           };
           const uncertainOrder: Order = {
             ...current,
@@ -455,7 +615,51 @@ export class FulfillmentService {
         }
       }
 
+      // Compute which admins still need delivery:
+      // - For partial_sent / pending / no_recipients / delivery_uncertain, NEVER re-spam admins already marked 'sent'.
+      // - Only when forceResend is explicitly invoked on an already-fully-sent order do we resend to all admins.
+      const isExplicitResendOfCompletedOrder =
+        forceResend &&
+        (state?.status === 'sent' ||
+          (Boolean(current.adminNotifiedAt) && Object.keys(existingDeliveries).length === 0));
+
+      const undeliveredAdminIds = uniqueAdminIds.filter(
+        (id) => existingDeliveries[String(id)]?.status !== 'sent',
+      );
+
+      if (!isExplicitResendOfCompletedOrder && undeliveredAdminIds.length === 0) {
+        if (!forceResend) {
+          // Every currently configured admin already has confirmed delivery -> reconcile to sent without re-sending
+          const sentState: NotificationDeliveryState = {
+            ...state,
+            status: 'sent',
+            eventId: state?.eventId || eventId,
+            operationId: state?.operationId || operationId,
+            leaseOwner: state?.leaseOwner || leaseOwner,
+            attemptCount: state?.attemptCount ?? 1,
+            sentAt: state?.sentAt || nowIso,
+            deliveryUncertainAfterCrash: false,
+            lastError: undefined,
+            recipientDeliveries: existingDeliveries,
+          };
+          const reconciledOrder: Order = {
+            ...current,
+            adminNotifiedAt: current.adminNotifiedAt || nowIso,
+            adminNotificationState: sentState,
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', reconciledOrder.orderId, reconciledOrder);
+          return { action: 'already_sent', order: reconciledOrder };
+        }
+      }
+
+      const targetAdminIds =
+        isExplicitResendOfCompletedOrder || undeliveredAdminIds.length === 0
+          ? uniqueAdminIds
+          : undeliveredAdminIds;
+
       const claimingState: NotificationDeliveryState = {
+        ...state,
         status: 'sending',
         eventId: state?.eventId || eventId,
         operationId,
@@ -463,6 +667,7 @@ export class FulfillmentService {
         leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
         attemptCount: (state?.attemptCount ?? 0) + 1,
         deliveryUncertainAfterCrash: false,
+        recipientDeliveries: existingDeliveries,
       };
       const claimedOrder: Order = {
         ...current,
@@ -470,7 +675,12 @@ export class FulfillmentService {
         updatedAt: nowIso,
       };
       tx.set<Order>('orders', claimedOrder.orderId, claimedOrder);
-      return { action: 'claimed', order: claimedOrder };
+      return {
+        action: 'claimed',
+        order: claimedOrder,
+        targetAdminIds,
+        existingDeliveries,
+      };
     });
 
     if (claim.action !== 'claimed') {
@@ -482,9 +692,15 @@ export class FulfillmentService {
       return claim.order;
     }
 
-    let deliveredCount = 0;
-    for (const adminId of adminIds) {
-      const ok = await this.sendTelegramMessageWithRetry(
+    const updatedDeliveries: Record<string, AdminRecipientDeliveryRecord> = {
+      ...claim.existingDeliveries,
+    };
+
+    for (const adminId of claim.targetAdminIds) {
+      const key = String(adminId);
+      const prev = updatedDeliveries[key];
+      const attemptIso = new Date().toISOString();
+      const sendResult = await this.sendTelegramMessageWithResult(
         bot,
         adminId,
         `🔔 <b>Новый оплаченный заказ поступил на выдачу!</b>\n\n${formatAdminOrderCard(
@@ -495,8 +711,26 @@ export class FulfillmentService {
           ...buildAdminOrderActionKeyboard(claim.order),
         },
       );
-      if (ok) {
-        deliveredCount++;
+      if (sendResult.ok) {
+        updatedDeliveries[key] = {
+          adminTelegramId: adminId,
+          status: 'sent',
+          attemptCount: (prev?.attemptCount ?? 0) + 1,
+          sentAt: attemptIso,
+          lastAttemptAt: attemptIso,
+          lastError: undefined,
+          operationId,
+        };
+      } else {
+        updatedDeliveries[key] = {
+          adminTelegramId: adminId,
+          status: 'failed',
+          attemptCount: (prev?.attemptCount ?? 0) + 1,
+          sentAt: prev?.sentAt,
+          lastAttemptAt: attemptIso,
+          lastError: sendResult.error || 'Ошибка отправки в Telegram',
+          operationId,
+        };
       }
     }
 
@@ -512,7 +746,18 @@ export class FulfillmentService {
         return latest;
       }
 
-      if (deliveredCount > 0) {
+      const mergedDeliveries: Record<string, AdminRecipientDeliveryRecord> = {
+        ...(latestState?.recipientDeliveries || {}),
+        ...updatedDeliveries,
+      };
+      const deliveredIds = uniqueAdminIds.filter(
+        (id) => mergedDeliveries[String(id)]?.status === 'sent',
+      );
+      const undeliveredIds = uniqueAdminIds.filter(
+        (id) => mergedDeliveries[String(id)]?.status !== 'sent',
+      );
+
+      if (undeliveredIds.length === 0) {
         const sentState: NotificationDeliveryState = {
           status: 'sent',
           eventId: latestState?.eventId || eventId,
@@ -522,6 +767,8 @@ export class FulfillmentService {
           attemptCount: latestState?.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
+          lastError: undefined,
+          recipientDeliveries: mergedDeliveries,
         };
         const updated: Order = {
           ...latest,
@@ -533,13 +780,39 @@ export class FulfillmentService {
         return updated;
       }
 
+      if (deliveredIds.length > 0) {
+        const partialState: NotificationDeliveryState = {
+          status: 'partial_sent',
+          eventId: latestState?.eventId || eventId,
+          operationId,
+          leaseOwner,
+          leaseUntil: undefined,
+          attemptCount: latestState?.attemptCount ?? 1,
+          sentAt: undefined,
+          deliveryUncertainAfterCrash: false,
+          lastError: `Частичная доставка администраторам (${deliveredIds.length}/${uniqueAdminIds.length}); не доставлено: ${undeliveredIds.join(', ')}`,
+          recipientDeliveries: mergedDeliveries,
+        };
+        const updated: Order = {
+          ...latest,
+          adminNotificationState: partialState,
+          updatedAt: finIso,
+        };
+        tx.set<Order>('orders', updated.orderId, updated);
+        return updated;
+      }
+
       const pendingState: NotificationDeliveryState = {
         status: 'pending',
         eventId: latestState?.eventId || eventId,
         operationId,
         leaseOwner,
+        leaseUntil: undefined,
         attemptCount: latestState?.attemptCount ?? 1,
-        lastError: 'Не удалось доставить уведомление ни одному администратору',
+        sentAt: undefined,
+        deliveryUncertainAfterCrash: false,
+        lastError: `Не удалось доставить уведомление ни одному администратору (${undeliveredIds.join(', ')})`,
+        recipientDeliveries: mergedDeliveries,
       };
       const updated: Order = {
         ...latest,
@@ -833,18 +1106,18 @@ export class FulfillmentService {
     };
   }
 
-  private static async sendTelegramMessageWithRetry(
+  private static async sendTelegramMessageWithResult(
     bot: Telegraf,
     chatId: number | string,
     htmlText: string,
     extra: Record<string, unknown>,
     maxAttempts = 2,
-  ): Promise<boolean> {
+  ): Promise<{ ok: boolean; error?: string }> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         await bot.telegram.sendMessage(chatId, htmlText, extra);
-        return true;
+        return { ok: true };
       } catch (error) {
         lastError = error;
         if (attempt < maxAttempts) {
@@ -853,11 +1126,31 @@ export class FulfillmentService {
       }
     }
 
-    console.warn(
-      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}:`,
+    const errMsg = redactSecretsFromText(
       lastError instanceof Error ? lastError.message : String(lastError),
     );
-    return false;
+    console.warn(
+      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}:`,
+      errMsg,
+    );
+    return { ok: false, error: errMsg.slice(0, 300) };
+  }
+
+  private static async sendTelegramMessageWithRetry(
+    bot: Telegraf,
+    chatId: number | string,
+    htmlText: string,
+    extra: Record<string, unknown>,
+    maxAttempts = 2,
+  ): Promise<boolean> {
+    const res = await this.sendTelegramMessageWithResult(
+      bot,
+      chatId,
+      htmlText,
+      extra,
+      maxAttempts,
+    );
+    return res.ok;
   }
 
   /**
@@ -1583,9 +1876,24 @@ export class FulfillmentService {
     rateLimited: boolean;
     deferredByCooldown: boolean;
     transientErrors: number;
+    checkpointDegraded: boolean;
+    checkpointSaved: boolean;
+    checkpointError?: string;
     orders: Order[];
   }> {
-    const summary = {
+    const summary: {
+      polled: number;
+      completed: number;
+      failed: number;
+      stillProcessing: number;
+      rateLimited: boolean;
+      deferredByCooldown: boolean;
+      transientErrors: number;
+      checkpointDegraded: boolean;
+      checkpointSaved: boolean;
+      checkpointError?: string;
+      orders: Order[];
+    } = {
       polled: 0,
       completed: 0,
       failed: 0,
@@ -1593,7 +1901,9 @@ export class FulfillmentService {
       rateLimited: false,
       deferredByCooldown: false,
       transientErrors: 0,
-      orders: [] as Order[],
+      checkpointDegraded: this.checkpointDegraded,
+      checkpointSaved: true,
+      orders: [],
     };
 
     if (!firestoreRepo.isProductionStorageHealthy()) {
@@ -1610,6 +1920,35 @@ export class FulfillmentService {
       summary.rateLimited = true;
       summary.deferredByCooldown = true;
       return summary;
+    }
+
+    // If checkpoint persistence is currently in failure backoff, pause polling instead of repeatedly
+    // re-serving the head of the queue.
+    if (this.checkpointRetryAfterMs > nowMs) {
+      summary.checkpointDegraded = true;
+      summary.checkpointSaved = false;
+      summary.deferredByCooldown = true;
+      summary.checkpointError =
+        this.checkpointLastError || 'Ожидание восстановления checkpoint Firestore';
+      return summary;
+    }
+
+    // If a previous tick polled orders but failed to persist its checkpoint, flush that pending
+    // checkpoint first before scanning any new batch. If Firestore writes still fail, abort the
+    // tick rather than re-polling the beginning of the queue.
+    if (this.pendingUnsavedCheckpoint) {
+      try {
+        await this.saveMyStarsPollCheckpoint(this.pendingUnsavedCheckpoint);
+      } catch (error) {
+        const msg = redactSecretsFromText(
+          error instanceof Error ? error.message : String(error),
+        );
+        summary.checkpointDegraded = true;
+        summary.checkpointSaved = false;
+        summary.checkpointError = msg;
+        summary.transientErrors += 1;
+        return summary;
+      }
     }
 
     // Persistent cursor-paginated fair polling over all 'processing' orders ordered by 'createdAt' ASC:
@@ -1637,7 +1976,22 @@ export class FulfillmentService {
       return Boolean(ord.mystarsPollLease && untilMs > refMs);
     };
 
-    const checkpoint = await this.loadMyStarsPollCheckpoint();
+    let checkpoint: MyStarsPollCheckpoint | null;
+    try {
+      checkpoint = await this.loadMyStarsPollCheckpoint();
+      summary.checkpointDegraded = false;
+    } catch (error) {
+      // Never silently treat a Firestore read failure as null (head of queue)!
+      const msg = redactSecretsFromText(
+        error instanceof Error ? error.message : String(error),
+      );
+      summary.checkpointDegraded = true;
+      summary.checkpointSaved = false;
+      summary.checkpointError = msg;
+      summary.transientErrors += 1;
+      return summary;
+    }
+
     let scanCursor: { value: string; id: string } | undefined =
       checkpoint?.cursorCreatedAt && checkpoint?.cursorOrderId
         ? { value: checkpoint.cursorCreatedAt, id: checkpoint.cursorOrderId }
@@ -1921,7 +2275,10 @@ export class FulfillmentService {
       }
     }
 
-    // Persist cursor checkpoint for multi-page sweeps so next tick & restarts resume fairly
+    // Persist cursor checkpoint for multi-page sweeps so next tick & restarts resume fairly.
+    // Never advance the confirmed cursor if Firestore save fails; queue pendingUnsavedCheckpoint
+    // so subsequent ticks flush it before scanning any new orders (preventing head-of-queue loops).
+    let checkpointToPersist: MyStarsPollCheckpoint | null = null;
     if (isMultiPageSweep) {
       const nextCursorToSave =
         interruptedByRateLimit && lastAttemptedOrderInSweep
@@ -1935,23 +2292,40 @@ export class FulfillmentService {
               ? { cursorCreatedAt: scanCursor.value, cursorOrderId: scanCursor.id }
               : { cursorCreatedAt: undefined, cursorOrderId: undefined };
 
-      await this.saveMyStarsPollCheckpoint({
+      checkpointToPersist = {
         key: 'mystars_poll_cursor',
         cursorCreatedAt: nextCursorToSave.cursorCreatedAt,
         cursorOrderId: nextCursorToSave.cursorOrderId,
         cyclesCompleted,
         lastPolledCount: summary.polled,
         updatedAt: new Date().toISOString(),
-      });
+      };
     } else if (checkpoint?.cursorOrderId) {
-      await this.saveMyStarsPollCheckpoint({
+      checkpointToPersist = {
         key: 'mystars_poll_cursor',
         cursorCreatedAt: undefined,
         cursorOrderId: undefined,
         cyclesCompleted: cyclesCompleted + 1,
         lastPolledCount: summary.polled,
         updatedAt: new Date().toISOString(),
-      });
+      };
+    }
+
+    if (checkpointToPersist) {
+      try {
+        await this.saveMyStarsPollCheckpoint(checkpointToPersist);
+        summary.checkpointSaved = true;
+        summary.checkpointDegraded = false;
+      } catch (error) {
+        const msg = redactSecretsFromText(
+          error instanceof Error ? error.message : String(error),
+        );
+        this.pendingUnsavedCheckpoint = checkpointToPersist;
+        summary.checkpointSaved = false;
+        summary.checkpointDegraded = true;
+        summary.checkpointError = msg;
+        summary.transientErrors += 1;
+      }
     }
 
     return summary;
@@ -2010,24 +2384,94 @@ export class FulfillmentService {
 
     const updated = txOutcome.order;
     if (txOutcome.newlyFailed && updated && updated.fulfillmentStatus === 'failed' && bot) {
-      const { adminIds } = getEnvConfig();
-      for (const adminId of adminIds) {
-        await this.sendTelegramMessageWithRetry(
-          bot,
-          adminId,
-          `🚨 <b>СБОЙ АВТОВЫДАЧИ MYSTARS (Polling)</b>\n\n${formatAdminOrderCard(updated)}`,
-          {
-            parse_mode: 'HTML',
-            ...buildAdminOrderActionKeyboard(updated),
-          },
+      const uniqueAdminIds = Array.from(new Set(getEnvConfig().adminIds));
+      const finIso = new Date().toISOString();
+      if (uniqueAdminIds.length === 0) {
+        console.warn(
+          `[FulfillmentService] ADMIN_IDS / OWNER_TELEGRAM_ID не заданы — алерт сбоя MyStars для заказа #${updated.orderId} не отправлен.`,
         );
+        if (!updated.adminNotifiedAt) {
+          await firestoreRepo
+            .updateDoc<Order>('orders', updated.orderId, {
+              adminNotificationState: {
+                ...(updated.adminNotificationState || {}),
+                status: 'no_recipients',
+                eventId:
+                  updated.adminNotificationState?.eventId ||
+                  `evt_admin_${updated.orderId}_failed`,
+                attemptCount: updated.adminNotificationState?.attemptCount ?? 0,
+                sentAt: undefined,
+                lastError:
+                  'Не настроены получатели ADMIN_IDS / OWNER_TELEGRAM_ID — уведомление не отправлялось.',
+              },
+              updatedAt: finIso,
+            })
+            .catch(() => {});
+        }
+      } else {
+        const deliveries: Record<string, AdminRecipientDeliveryRecord> = {
+          ...(updated.adminNotificationState?.recipientDeliveries || {}),
+        };
+        let deliveredCount = 0;
+        for (const adminId of uniqueAdminIds) {
+          const key = String(adminId);
+          const prev = deliveries[key];
+          const res = await this.sendTelegramMessageWithResult(
+            bot,
+            adminId,
+            `🚨 <b>СБОЙ АВТОВЫДАЧИ MYSTARS (Polling)</b>\n\n${formatAdminOrderCard(updated)}`,
+            {
+              parse_mode: 'HTML',
+              ...buildAdminOrderActionKeyboard(updated),
+            },
+          );
+          if (res.ok) {
+            deliveredCount++;
+            deliveries[key] = {
+              adminTelegramId: adminId,
+              status: 'sent',
+              attemptCount: (prev?.attemptCount ?? 0) + 1,
+              sentAt: finIso,
+              lastAttemptAt: finIso,
+            };
+          } else {
+            deliveries[key] = {
+              adminTelegramId: adminId,
+              status: 'failed',
+              attemptCount: (prev?.attemptCount ?? 0) + 1,
+              sentAt: prev?.sentAt,
+              lastAttemptAt: finIso,
+              lastError: res.error,
+            };
+          }
+        }
+
+        const allDelivered = deliveredCount === uniqueAdminIds.length;
+        await firestoreRepo
+          .updateDoc<Order>('orders', updated.orderId, {
+            ...(allDelivered ? { adminNotifiedAt: finIso } : {}),
+            adminNotificationState: {
+              status: allDelivered
+                ? 'sent'
+                : deliveredCount > 0
+                  ? 'partial_sent'
+                  : 'pending',
+              eventId:
+                updated.adminNotificationState?.eventId ||
+                `evt_admin_${updated.orderId}_failed`,
+              attemptCount: (updated.adminNotificationState?.attemptCount ?? 0) + 1,
+              sentAt: allDelivered ? finIso : undefined,
+              lastError: allDelivered
+                ? undefined
+                : deliveredCount > 0
+                  ? `Частичная доставка алерта сбоя (${deliveredCount}/${uniqueAdminIds.length})`
+                  : 'Не удалось доставить алерт сбоя ни одному администратору',
+              recipientDeliveries: deliveries,
+            },
+            updatedAt: finIso,
+          })
+          .catch(() => {});
       }
-      await firestoreRepo
-        .updateDoc<Order>('orders', updated.orderId, {
-          adminNotifiedAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        })
-        .catch(() => {});
     }
     return updated;
   }

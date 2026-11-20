@@ -916,7 +916,11 @@ export function formatAdminOrderCard(order: Order): string {
       : '',
     order.adminNotificationState?.status === 'delivery_uncertain'
       ? `${oe('warning')} Уведомление админам: <b>delivery_uncertain</b> (event: <code>${escapeHtml(order.adminNotificationState.eventId)}</code>, попыток: ${order.adminNotificationState.attemptCount}) — результат доставки не подтверждён после сбоя`
-      : '',
+      : order.adminNotificationState?.status === 'partial_sent'
+        ? `${oe('warning')} Уведомление админам: <b>partial_sent</b> (${escapeHtml(order.adminNotificationState.lastError || 'часть администраторов не получила сообщение')})`
+        : order.adminNotificationState?.status === 'no_recipients'
+          ? `${oe('warning')} Уведомление админам: <b>no_recipients</b> (не настроены ADMIN_IDS / OWNER_TELEGRAM_ID)`
+          : '',
     order.fulfillmentNote
       ? `${oe('edit')} Примечание: ${escapeHtml(order.fulfillmentNote)}`
       : '',
@@ -943,9 +947,19 @@ export function formatAdminNotificationReviewMessage(order: Order): string {
       pending: '⏳ pending (ожидает отправки)',
       sending: '🔄 sending (активный lease отправки)',
       sent: '✅ sent (подтверждено)',
+      partial_sent:
+        '⚠️ partial_sent (доставлено не всем администраторам; уже получившие не будут дублироваться при повторе)',
+      no_recipients:
+        '⚠️ no_recipients (не настроены получатели ADMIN_IDS / OWNER_TELEGRAM_ID; уведомление не отправлялось)',
       delivery_uncertain:
         '⚠️ delivery_uncertain (процесс завершился во время отправки; доставка в Telegram не подтверждена)',
     };
+    const recipientEntries = state.recipientDeliveries
+      ? Object.values(state.recipientDeliveries).map(
+          (rec) =>
+            `  ↳ Админ <code>${rec.adminTelegramId}</code>: <b>${escapeHtml(rec.status)}</b> (попыток: ${rec.attemptCount}${rec.sentAt ? `, доставлено: ${formatDateRu(rec.sentAt)}` : ''}${rec.lastError ? `, ошибка: ${escapeHtml(rec.lastError.slice(0, 120))}` : ''})`,
+        )
+      : [];
     const lines = [
       `<b>${title}:</b> ${statusLabel[state.status] || escapeHtml(state.status)}`,
       `• eventId: <code>${escapeHtml(state.eventId)}</code>`,
@@ -958,6 +972,7 @@ export function formatAdminNotificationReviewMessage(order: Order): string {
         ? `• Подтверждено админом (${state.acknowledgedByAdminId ?? '—'}): <code>${formatDateRu(state.acknowledgedAt)}</code>`
         : '',
       state.lastError ? `• Последняя ошибка: <code>${escapeHtml(state.lastError)}</code>` : '',
+      ...recipientEntries,
     ];
     return lines.filter(Boolean);
   };

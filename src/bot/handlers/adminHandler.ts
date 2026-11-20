@@ -710,6 +710,7 @@ export function registerAdminHandlers(
         res.order.totalPrice,
         `Контролируемая повторная отправка уведомления (${target})${res.skippedInFlight ? ' [пропущено: уже выполняется]' : ''}`,
       );
+      const adminStatus = res.order.adminNotificationState?.status;
       await safeAnswerCbQuery(
         ctx,
         res.skippedInFlight
@@ -719,8 +720,12 @@ export function registerAdminHandlers(
               ? 'Уведомление повторно отправлено покупателю.'
               : 'Не удалось доставить уведомление покупателю.'
             : res.sentAdmin
-              ? 'Уведомление повторно отправлено администраторам.'
-              : 'Не удалось доставить уведомление администраторам.',
+              ? 'Уведомление доставлено всем администраторам.'
+              : adminStatus === 'partial_sent'
+                ? 'Уведомление доставлено частично (часть администраторов не получила сообщение).'
+                : adminStatus === 'no_recipients'
+                  ? 'Получатели ADMIN_IDS / OWNER_TELEGRAM_ID не настроены — отправка не выполнялась.'
+                  : 'Не удалось доставить уведомление администраторам.',
         true,
       );
       await safeRespondOrEdit(

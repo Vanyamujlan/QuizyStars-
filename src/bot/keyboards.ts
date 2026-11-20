@@ -875,7 +875,9 @@ export function buildAdminOrderActionKeyboard(order: Order) {
 
   if (
     order.buyerNotificationState?.status === 'delivery_uncertain' ||
-    order.adminNotificationState?.status === 'delivery_uncertain'
+    order.adminNotificationState?.status === 'delivery_uncertain' ||
+    order.adminNotificationState?.status === 'partial_sent' ||
+    order.adminNotificationState?.status === 'no_recipients'
   ) {
     rows.push([
       Markup.button.callback(

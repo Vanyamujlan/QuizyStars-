@@ -310,7 +310,25 @@ export type NotificationDeliveryStatus =
   | 'pending'
   | 'sending'
   | 'sent'
+  | 'partial_sent'
+  | 'no_recipients'
   | 'delivery_uncertain';
+
+export type RecipientDeliveryStatus =
+  | 'pending'
+  | 'sent'
+  | 'failed'
+  | 'delivery_uncertain';
+
+export interface AdminRecipientDeliveryRecord {
+  adminTelegramId: number;
+  status: RecipientDeliveryStatus;
+  attemptCount: number;
+  sentAt?: string;
+  lastAttemptAt?: string;
+  lastError?: string;
+  operationId?: string;
+}
 
 export interface NotificationDeliveryState {
   status: NotificationDeliveryStatus;
@@ -325,6 +343,8 @@ export interface NotificationDeliveryState {
   acknowledgedByAdminId?: number;
   acknowledgedAt?: string;
   lastError?: string;
+  /** Per-admin delivery breakdown keyed by String(adminTelegramId) */
+  recipientDeliveries?: Record<string, AdminRecipientDeliveryRecord>;
 }
 
 export interface MyStarsPollCheckpoint {
