@@ -1,6 +1,6 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
+import { initializeApp, getApps, getApp, deleteApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
+import { getFirestore, doc, getDocFromServer, terminate } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { OperationType, FirestoreErrorInfo } from '../types.ts';
 
@@ -35,8 +35,11 @@ export function handleFirestoreError(
 }
 
 export async function testConnection(): Promise<{ ok: boolean; details: string }> {
+  const probeAppName = `startup-probe-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const probeApp = initializeApp(firebaseConfig, probeAppName);
+  const probeDb = getFirestore(probeApp, firebaseConfig.firestoreDatabaseId);
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
+    await getDocFromServer(doc(probeDb, 'test', 'connection'));
     return { ok: true, details: 'Connected to Firestore server.' };
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
@@ -48,5 +51,8 @@ export async function testConnection(): Promise<{ ok: boolean; details: string }
       ok: true,
       details: `Firestore server reachable (${firebaseConfig.projectId} / ${firebaseConfig.firestoreDatabaseId}).`,
     };
+  } finally {
+    await terminate(probeDb).catch(() => {});
+    await deleteApp(probeApp).catch(() => {});
   }
 }

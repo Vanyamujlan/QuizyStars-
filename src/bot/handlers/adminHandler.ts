@@ -679,7 +679,7 @@ export function registerAdminHandlers(
     );
   });
 
-  // Возврат заказа, оплаченного с внутреннего баланса, обратно на внутренний баланс (Шаг 1 из 2)
+  // Возврат заказа на внутренний баланс покупателя (Шаг 1 из 2 — явное подтверждение админом)
   bot.action(/^adm:ord_bal_refund:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
@@ -690,12 +690,8 @@ export function registerAdminHandlers(
     }
 
     const order = await OrderService.getOrderById(orderId);
-    if (!order || order.paymentMethod !== 'balance') {
-      await safeAnswerCbQuery(
-        ctx,
-        'Заказ не найден или не был оплачен с внутреннего баланса.',
-        true,
-      );
+    if (!order) {
+      await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
       return;
     }
 
@@ -714,6 +710,8 @@ export function registerAdminHandlers(
     }
 
     const refundCents = order.totalPriceUsdCents ?? order.totalPrice;
+    const isExternalGateway =
+      order.paymentMethod !== 'balance' && order.paymentMethod !== 'internal_balance';
     const confirmText = [
       '⚠️ <b>Подтверждение возврата средств на внутренний баланс (Шаг 2 из 2)</b>',
       '',
@@ -721,6 +719,9 @@ export function registerAdminHandlers(
       `Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
       `Покупатель: <code>${order.userTelegramId}</code>${order.username ? ` (@${escapeHtml(order.username)})` : ''}`,
       `Сумма к возврату на внутренний баланс: <b>+${formatUsdCents(refundCents)}</b>`,
+      isExternalGateway
+        ? `ℹ️ Способ оплаты заказа: <code>${escapeHtml(order.paymentMethod || 'external')}</code> — сумма будет зачислена в USD на внутренний баланс покупателя.`
+        : '',
       order.fulfillmentStatus === 'completed'
         ? '\n🚨 <b>ВНИМАНИЕ: Заказ уже ВЫПОЛНЕН!</b> При подтверждении средства вернутся на баланс покупателя.'
         : '',
@@ -756,6 +757,7 @@ export function registerAdminHandlers(
         orderId,
         reason: `Возврат на внутренний баланс выполнен администратором (ID: ${ctx.from!.id}).`,
         adminTelegramId: ctx.from!.id,
+        allowExternalGatewayCompensation: true,
       });
 
       if (res.alreadyRefunded) {

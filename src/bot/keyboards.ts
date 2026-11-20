@@ -887,8 +887,8 @@ export function buildAdminOrderActionKeyboard(order: Order) {
   }
 
   if (
-    (order.paymentMethod === 'balance' || order.paymentMethod === 'internal_balance') &&
     !order.balanceRefunded &&
+    order.paymentStatus !== 'refunded' &&
     (order.paymentStatus === 'paid' ||
       order.paymentStatus === 'processing' ||
       order.paymentStatus === 'completed' ||

@@ -250,11 +250,18 @@ export interface Order {
   mystarsPaymentMemo?: string;
   mystarsPaymentAmountUsdt?: string;
   mystarsPurchaseTx?: string;
+  mystarsPaymentTx?: string;
+  mystarsReversalTx?: string;
   mystarsFailureReason?: string;
   mystarsExpiresAt?: string;
   mystarsLastPolledAt?: string;
   mystarsPollAttempts?: number;
   mystarsLastPollError?: string;
+  mystarsPollLease?: DistributedLeaseRecord;
+  mystarsStuckAlertedAt?: string;
+  mystarsUnknownStatusSeen?: string;
+  mystarsCreateInFlight?: boolean;
+  mystarsAmbiguousPostAt?: string;
   fulfillmentNote?: string;
   fulfillmentStartedAt?: string;
   fulfillmentAttempts?: number;
@@ -273,10 +280,44 @@ export interface Order {
   refundStatsAdjusted?: boolean;
   adminNotifiedAt?: string;
   buyerNotifiedAt?: string;
+  buyerNotificationState?: NotificationDeliveryState;
+  adminNotificationState?: NotificationDeliveryState;
   createdAt: string;
   paidAt?: string;
   completedAt?: string;
   updatedAt: string;
+}
+
+export type FirestoreTimestampLike =
+  | {
+      seconds?: number;
+      nanoseconds?: number;
+      _seconds?: number;
+      _nanoseconds?: number;
+      toMillis?: () => number;
+    }
+  | string
+  | number;
+
+export interface DistributedLeaseRecord {
+  leaseOwner: string;
+  operationId: string;
+  leaseUntil: FirestoreTimestampLike;
+  acquiredAt: FirestoreTimestampLike;
+}
+
+export type NotificationDeliveryStatus = 'pending' | 'sending' | 'sent';
+
+export interface NotificationDeliveryState {
+  status: NotificationDeliveryStatus;
+  eventId: string;
+  operationId?: string;
+  leaseOwner?: string;
+  leaseUntil?: FirestoreTimestampLike;
+  attemptCount: number;
+  sentAt?: string;
+  deliveryUncertainAfterCrash?: boolean;
+  lastError?: string;
 }
 
 export interface PaymentRecord {

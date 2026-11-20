@@ -1386,14 +1386,20 @@ export class BalanceService {
       }
 
       const paymentDocId = order.balancePaymentId || order.activePaymentId;
-      const [userSnap, existingPayment] = await Promise.all([
+      const txId = `tx_bal_refund_${order.orderId}`;
+      const [userSnap, existingPayment, existingRefundTx] = await Promise.all([
         tx.get<StoreUser>('users', order.userId),
         paymentDocId
           ? tx.get<PaymentRecord>('payments', paymentDocId)
           : Promise.resolve(null),
+        tx.get<StoreTransaction>('transactions', txId),
       ]);
 
-      if (order.paymentStatus === 'refunded' || order.balanceRefunded === true) {
+      if (
+        order.paymentStatus === 'refunded' ||
+        order.balanceRefunded === true ||
+        Boolean(existingRefundTx)
+      ) {
         const balCents = getUserBalanceCentsFromDoc(userSnap);
         return {
           refunded: true,
@@ -1462,8 +1468,6 @@ export class BalanceService {
         fulfillmentNote: params.reason,
         updatedAt: now,
       };
-
-      const txId = `tx_bal_refund_${order.orderId}`;
       const adminTag = params.adminTelegramId
         ? ` (admin tg_${params.adminTelegramId})`
         : '';

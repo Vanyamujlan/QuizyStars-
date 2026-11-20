@@ -867,10 +867,30 @@ export function formatAdminOrderCard(order: Order): string {
         }`
       : '',
     order.mystarsPayToAddress
-      ? `🏦 Адрес оплаты MyStars: <code>${escapeHtml(order.mystarsPayToAddress)}</code> (MEMO: <code>${escapeHtml(order.mystarsPaymentMemo || order.mystarsOrderId || '')}</code>)`
+      ? `🏦 Адрес оплаты MyStars: <code>${escapeHtml(order.mystarsPayToAddress)}</code> (MEMO: <code>${escapeHtml(order.mystarsPaymentMemo || order.mystarsOrderId || '')}</code>${
+          order.mystarsPaymentAmountUsdt
+            ? `, сумма: <code>${escapeHtml(order.mystarsPaymentAmountUsdt)} ${(order.mystarsCurrency || 'usdt_ton').toUpperCase()}</code>`
+            : ''
+        }${
+          order.mystarsExpiresAt
+            ? `, до: <code>${formatDateRu(order.mystarsExpiresAt)}</code>`
+            : ''
+        })`
+      : '',
+    order.mystarsPaymentTx
+      ? `💳 MyStars Payment TX: <code>${escapeHtml(order.mystarsPaymentTx)}</code>`
       : '',
     order.mystarsPurchaseTx
       ? `🔗 MyStars Purchase TX: <code>${escapeHtml(order.mystarsPurchaseTx)}</code>`
+      : '',
+    order.mystarsReversalTx
+      ? `↩️ MyStars Reversal TX: <code>${escapeHtml(order.mystarsReversalTx)}</code>`
+      : '',
+    order.mystarsUnknownStatusSeen
+      ? `${oe('warning')} Неизвестный статус MyStars: <code>${escapeHtml(order.mystarsUnknownStatusSeen)}</code>`
+      : '',
+    order.mystarsStuckAlertedAt
+      ? `⏳ Мониторинг зависания (>15 мин): <code>${formatDateRu(order.mystarsStuckAlertedAt)}</code>`
       : '',
     order.mystarsFailureReason
       ? `${oe('warning')} Ошибка MyStars: ${escapeHtml(order.mystarsFailureReason)}`

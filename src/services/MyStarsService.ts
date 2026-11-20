@@ -44,6 +44,23 @@ export const MYSTARS_TERMINAL_STATUSES = new Set<string>([
   'cancelled',
 ]);
 
+export const MYSTARS_ACTIVE_STATUSES = new Set<string>([
+  'received',
+  'awaiting_payment',
+  'paid',
+  'reserved',
+  'swapping',
+  'funding',
+  'purchasing',
+  'fulfilling',
+  'held',
+]);
+
+export const MYSTARS_KNOWN_STATUSES = new Set<string>([
+  ...MYSTARS_ACTIVE_STATUSES,
+  ...MYSTARS_TERMINAL_STATUSES,
+]);
+
 export const MYSTARS_SUCCESS_STATUSES = new Set<string>(['delivered', 'completed']);
 
 export const MYSTARS_FAILURE_STATUSES = new Set<string>([
@@ -174,6 +191,26 @@ export class MyStarsApiError extends Error {
     this.telegramMessage = params.telegramMessage;
     this.retryable = Boolean(params.retryable);
     this.mystarsStatus = params.mystarsStatus;
+  }
+}
+
+export class MyStarsValidationError extends MyStarsApiError {
+  public readonly endpoint: string;
+
+  constructor(params: {
+    message: string;
+    endpoint: string;
+    httpStatus?: number;
+    code?: string;
+  }) {
+    super({
+      message: params.message,
+      httpStatus: params.httpStatus ?? 502,
+      code: params.code || 'invalid_api_payload',
+      retryable: true,
+    });
+    this.name = 'MyStarsValidationError';
+    this.endpoint = params.endpoint;
   }
 }
 
@@ -698,6 +735,153 @@ export class MyStarsClient {
     throw lastError;
   }
 
+  private ensurePlainObject(raw: unknown, endpoint: string): Record<string, unknown> {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new MyStarsValidationError({
+        message: `Некорректный JSON-ответ MyStars API (${endpoint}): ожидался объект, получено ${raw === null ? 'null' : typeof raw}.`,
+        endpoint,
+      });
+    }
+    const rec = raw as Record<string, unknown>;
+    if (
+      'rawText' in rec &&
+      Object.keys(rec).length === 1 &&
+      typeof rec.rawText === 'string'
+    ) {
+      throw new MyStarsValidationError({
+        message: `Некорректный не-JSON ответ MyStars API (${endpoint}): ${rec.rawText.slice(0, 120)}`,
+        endpoint,
+      });
+    }
+    return rec;
+  }
+
+  private validatePricingResponse(raw: unknown, endpoint: string): MyStarsPricingQuote {
+    const rec = this.ensurePlainObject(raw, endpoint);
+    const amount = rec.amount !== undefined && rec.amount !== null ? String(rec.amount).trim() : '';
+    const currency = typeof rec.currency === 'string' ? rec.currency.trim() : '';
+    if (!amount || !currency) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют обязательные поля amount или currency.`,
+        endpoint,
+      });
+    }
+    return {
+      ...(rec as unknown as MyStarsPricingQuote),
+      amount,
+      currency,
+    };
+  }
+
+  private validateRecipientCheckResponse(
+    raw: unknown,
+    endpoint: string,
+  ): MyStarsRecipientCheckResult {
+    const rec = this.ensurePlainObject(raw, endpoint);
+    const hasBooleanFlags =
+      typeof rec.resolved === 'boolean' && typeof rec.eligible === 'boolean';
+    const hasIndeterminate = typeof rec.indeterminate === 'boolean';
+    if (!hasBooleanFlags && !hasIndeterminate) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют булевы поля resolved/eligible.`,
+        endpoint,
+      });
+    }
+    return {
+      resolved: typeof rec.resolved === 'boolean' ? rec.resolved : false,
+      eligible: typeof rec.eligible === 'boolean' ? rec.eligible : false,
+      ...(typeof rec.indeterminate === 'boolean' ? { indeterminate: rec.indeterminate } : {}),
+      ...(rec.recipient_name !== undefined
+        ? { recipient_name: rec.recipient_name as string | null }
+        : {}),
+      ...(rec.reason !== undefined ? { reason: rec.reason as string | null } : {}),
+      ...(rec.telegram_message !== undefined
+        ? { telegram_message: rec.telegram_message as string | null }
+        : {}),
+    };
+  }
+
+  private validateCreateOrderResponse(
+    raw: unknown,
+    endpoint: string,
+  ): MyStarsCreateOrderResult {
+    const rec = this.ensurePlainObject(raw, endpoint);
+    const rawOrderId =
+      typeof rec.order_id === 'string' && rec.order_id.trim()
+        ? rec.order_id.trim()
+        : typeof rec.id === 'string' && rec.id.trim()
+          ? rec.id.trim()
+          : '';
+    const rawStatus =
+      typeof rec.status === 'string' && rec.status.trim() ? rec.status.trim() : '';
+
+    if (!rawOrderId || !rawStatus) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют обязательные строковые поля order_id или status.`,
+        endpoint,
+      });
+    }
+
+    return {
+      ...(rec as unknown as MyStarsCreateOrderResult),
+      order_id: rawOrderId,
+      status: rawStatus,
+    };
+  }
+
+  private validateOrderRecordResponse(
+    raw: unknown,
+    endpoint: string,
+  ): MyStarsOrderRecord {
+    const rec = this.ensurePlainObject(raw, endpoint);
+    const rawOrderId =
+      typeof rec.order_id === 'string' && rec.order_id.trim()
+        ? rec.order_id.trim()
+        : typeof rec.id === 'string' && rec.id.trim()
+          ? rec.id.trim()
+          : '';
+    const rawStatus =
+      typeof rec.status === 'string' && rec.status.trim() ? rec.status.trim() : '';
+
+    if (!rawOrderId || !rawStatus) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): отсутствуют обязательные строковые поля order_id или status.`,
+        endpoint,
+      });
+    }
+
+    return {
+      ...(rec as unknown as MyStarsOrderRecord),
+      order_id: rawOrderId,
+      status: rawStatus,
+    };
+  }
+
+  private validateOrderPageResponse(raw: unknown, endpoint: string): MyStarsOrderPage {
+    if (Array.isArray(raw)) {
+      return {
+        orders: raw.map((item, idx) =>
+          this.validateOrderRecordResponse(item, `${endpoint}[${idx}]`),
+        ),
+        next_cursor: null,
+      };
+    }
+    const rec = this.ensurePlainObject(raw, endpoint);
+    if (!Array.isArray(rec.orders)) {
+      throw new MyStarsValidationError({
+        message: `Некорректная схема ответа MyStars API (${endpoint}): поле orders должно быть массивом.`,
+        endpoint,
+      });
+    }
+    return {
+      orders: rec.orders.map((item, idx) =>
+        this.validateOrderRecordResponse(item, `${endpoint}.orders[${idx}]`),
+      ),
+      next_cursor:
+        typeof rec.next_cursor === 'string' ? rec.next_cursor : null,
+    };
+  }
+
   public async getCurrencies(): Promise<MyStarsCurrencyInfo[]> {
     return this.requestJson<MyStarsCurrencyInfo[]>({
       method: 'GET',
@@ -728,11 +912,12 @@ export class MyStarsClient {
     } else {
       query.months = validateMyStarsMonths(params.months);
     }
-    return this.requestJson<MyStarsPricingQuote>({
+    const raw = await this.requestJson<unknown>({
       method: 'GET',
       path: '/pricing',
       query,
     });
+    return this.validatePricingResponse(raw, 'GET /v1/pricing');
   }
 
   public async checkRecipient(params: {
@@ -748,11 +933,12 @@ export class MyStarsClient {
     if (params.type === 'premium' && params.months !== undefined) {
       body.months = validateMyStarsMonths(params.months);
     }
-    return this.requestJson<MyStarsRecipientCheckResult>({
+    const raw = await this.requestJson<unknown>({
       method: 'POST',
       path: '/recipients/check',
       body,
     });
+    return this.validateRecipientCheckResponse(raw, 'POST /v1/recipients/check');
   }
 
   public async createOrder(params: {
@@ -779,12 +965,13 @@ export class MyStarsClient {
 
     // Polling-only mode: callback_url is intentionally omitted so MyStars order tracking
     // relies exclusively on GET /v1/orders/{order_id} without requiring public webhook URLs.
-    return this.requestJson<MyStarsCreateOrderResult>({
+    const raw = await this.requestJson<unknown>({
       method: 'POST',
       path: '/orders',
       body,
       idempotencyKey: params.idempotencyKey || crypto.randomUUID(),
     });
+    return this.validateCreateOrderResponse(raw, 'POST /v1/orders');
   }
 
   public async getOrder(mystarsOrderId: string): Promise<MyStarsOrderRecord> {
@@ -797,10 +984,12 @@ export class MyStarsClient {
         retryable: false,
       });
     }
-    return this.requestJson<MyStarsOrderRecord>({
+    const path = `/orders/${encodeURIComponent(cleanId)}`;
+    const raw = await this.requestJson<unknown>({
       method: 'GET',
-      path: `/orders/${encodeURIComponent(cleanId)}`,
+      path,
     });
+    return this.validateOrderRecordResponse(raw, `GET /v1${path}`);
   }
 
   public async cancelOrder(mystarsOrderId: string): Promise<MyStarsCancelResult> {
@@ -827,7 +1016,7 @@ export class MyStarsClient {
     limit?: number;
     cursor?: string;
   }): Promise<MyStarsOrderPage> {
-    return this.requestJson<MyStarsOrderPage>({
+    const raw = await this.requestJson<unknown>({
       method: 'GET',
       path: '/orders',
       query: {
@@ -836,6 +1025,7 @@ export class MyStarsClient {
         cursor: params?.cursor,
       },
     });
+    return this.validateOrderPageResponse(raw, 'GET /v1/orders');
   }
 
   /**
@@ -1018,6 +1208,82 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
     };
   }
 
+  /**
+   * Bounded reconciliation via `GET /v1/orders` when a previous `POST /v1/orders` timed out
+   * or dropped before `mystarsOrderId` was persisted in Firestore.
+   */
+  public async reconcileAmbiguousCreateOrder(order: Order): Promise<{
+    status: 'found' | 'not_found' | 'ambiguous_multiple';
+    mystarsOrderId?: string;
+    mystarsStatus?: string;
+    count?: number;
+  }> {
+    if (!this.client.isConfigured()) {
+      return { status: 'not_found' };
+    }
+    if (order.category !== 'stars' && order.category !== 'premium') {
+      return { status: 'not_found' };
+    }
+
+    const cleanUsername = validateMyStarsUsername(
+      order.recipientUsername || order.username,
+    );
+    const page = await this.client.listOrders({ limit: 20 });
+    const startedAtMs = order.fulfillmentStartedAt
+      ? Date.parse(order.fulfillmentStartedAt)
+      : Date.parse(order.createdAt);
+
+    const matches = page.orders.filter((item) => {
+      if (item.type !== order.category) return false;
+      const itemUser = (item.recipient_username || '').trim().replace(/^@/, '').toLowerCase();
+      if (itemUser && itemUser !== cleanUsername) return false;
+      if (order.category === 'stars') {
+        if (item.quantity !== undefined && item.quantity !== null && Number(item.quantity) !== Number(order.quantity)) {
+          return false;
+        }
+      } else if (order.category === 'premium') {
+        const expectedMonths = Number(order.durationMonths ?? 3);
+        if (item.months !== undefined && item.months !== null && Number(item.months) !== expectedMonths) {
+          return false;
+        }
+      }
+      if (item.created_at && Number.isFinite(startedAtMs)) {
+        const itemCreatedMs = Date.parse(item.created_at);
+        if (Number.isFinite(itemCreatedMs) && itemCreatedMs < startedAtMs - 60_000) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    if (matches.length === 1) {
+      const matched = matches[0];
+      const resolvedId = matched.order_id;
+      const resolvedStatus = (matched.status || '').toLowerCase();
+      await this.persistMyStarsOrderMetadata(order, {
+        mystarsOrderId: resolvedId,
+        externalExecutionReference: resolvedId,
+        mystarsOrderStatus: resolvedStatus,
+        mystarsCreateInFlight: false,
+        mystarsAmbiguousPostAt: undefined,
+      });
+      return {
+        status: 'found',
+        mystarsOrderId: resolvedId,
+        mystarsStatus: resolvedStatus,
+      };
+    }
+
+    if (matches.length > 1) {
+      return {
+        status: 'ambiguous_multiple',
+        count: matches.length,
+      };
+    }
+
+    return { status: 'not_found' };
+  }
+
   public async checkExternalStatus(
     order: Order,
     _idempotencyKey: string,
@@ -1026,6 +1292,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
     status?: 'processing' | 'completed';
     externalReference?: string;
     details?: string;
+    unknownStatus?: string;
   }> {
     if (!this.client.isConfigured()) {
       return { alreadyExecuted: false };
@@ -1049,6 +1316,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       remoteOrder.order_id ||
       (typeof remoteRec.id === 'string' ? remoteRec.id : mystarsOrderId);
     const status = (remoteOrder.status || '').toLowerCase();
+    const isUnknownStatus = !MYSTARS_KNOWN_STATUSES.has(status);
 
     const remotePayment = remoteRec.payment as MyStarsPaymentInstruction | undefined;
     const wholesaleTotalUsdt =
@@ -1078,9 +1346,32 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       mystarsLastPolledAt: nowIso,
       mystarsPollAttempts: (order.mystarsPollAttempts ?? 0) + 1,
       mystarsLastPollError: undefined,
+      mystarsCreateInFlight: false,
+      mystarsAmbiguousPostAt: undefined,
       ...(remoteOrder.purchase_tx ? { mystarsPurchaseTx: remoteOrder.purchase_tx } : {}),
+      ...(remoteOrder.payment_tx ? { mystarsPaymentTx: remoteOrder.payment_tx } : {}),
+      ...(remoteOrder.reversal_tx ? { mystarsReversalTx: remoteOrder.reversal_tx } : {}),
       ...(remoteOrder.failure_reason ? { mystarsFailureReason: remoteOrder.failure_reason } : {}),
+      ...(isUnknownStatus ? { mystarsUnknownStatusSeen: status } : {}),
     });
+
+    if (isUnknownStatus) {
+      console.warn(
+        '[MyStars] Получен неизвестный статус заказа от API (заказ оставлен в processing):',
+        JSON.stringify({
+          orderId: order.orderId,
+          mystarsOrderId: resolvedOrderId,
+          unknownStatus: status,
+        }),
+      );
+      return {
+        alreadyExecuted: true,
+        status: 'processing',
+        externalReference: resolvedOrderId,
+        unknownStatus: status,
+        details: `MyStars заказ ${resolvedOrderId} вернул неизвестный статус "${status}" — заказ оставлен в обработке (processing) для проверки администратором.`,
+      };
+    }
 
     if (MYSTARS_SUCCESS_STATUSES.has(status)) {
       return {
@@ -1221,6 +1512,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       created.order_id ||
       (typeof createdRec.id === 'string' ? createdRec.id : `ms_${order.orderId}`);
     const status = (created.status || '').toLowerCase();
+    const isUnknownStatus = !MYSTARS_KNOWN_STATUSES.has(status);
     const payment = created.payment;
     const flatPaymentAmount =
       typeof createdRec.payment_amount === 'string' ? createdRec.payment_amount : undefined;
@@ -1255,13 +1547,33 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       mystarsLastPolledAt: nowIso,
       mystarsPollAttempts: order.mystarsPollAttempts ?? 0,
       mystarsLastPollError: undefined,
+      mystarsCreateInFlight: false,
+      mystarsAmbiguousPostAt: undefined,
       mystarsPayToAddress: payment?.pay_to_address || flatPayToAddress || undefined,
       mystarsPaymentMemo: payment?.memo || flatPaymentMemo || resolvedOrderId,
       mystarsPaymentAmountUsdt: payment?.amount || flatPaymentAmount || wholesaleTotalUsdt,
       ...(flatPurchaseTx ? { mystarsPurchaseTx: flatPurchaseTx } : {}),
+      ...(isUnknownStatus ? { mystarsUnknownStatusSeen: status } : {}),
       mystarsExpiresAt: created.expires_at,
       externalExecutionReference: resolvedOrderId,
     });
+
+    if (isUnknownStatus) {
+      console.warn(
+        '[MyStars] POST /v1/orders вернул неизвестный статус заказа (оставлен в processing):',
+        JSON.stringify({
+          orderId: order.orderId,
+          mystarsOrderId: resolvedOrderId,
+          unknownStatus: status,
+        }),
+      );
+      return {
+        handledAutomatically: false,
+        status: 'processing',
+        externalReference: resolvedOrderId,
+        details: `Создан заказ MyStars ${resolvedOrderId} с неизвестным статусом "${status}" — оставлен в обработке для проверки.`,
+      };
+    }
 
     if (MYSTARS_SUCCESS_STATUSES.has(status)) {
       return {

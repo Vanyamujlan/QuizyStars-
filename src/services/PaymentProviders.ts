@@ -1503,18 +1503,55 @@ export class PaymentProviderGateway {
     }
 
     if (params.provider === 'xrocket') {
-      const url = buildXRocketApiV1Url(
+      const safeExternalId = encodeURIComponent(
+        params.externalInvoiceId.trim().slice(0, 100),
+      );
+      const safeClientInvoiceId = params.paymentId
+        ? encodeURIComponent(params.paymentId.trim().slice(0, 100))
+        : '';
+      const singleInvoicePath = safeClientInvoiceId
+        ? `/invoice?invoiceId=${safeExternalId}&clientInvoiceId=${safeClientInvoiceId}`
+        : `/invoice?invoiceId=${safeExternalId}`;
+      const primaryUrl = buildXRocketApiV1Url(
+        creds.xrocketApiUrl,
+        singleInvoicePath,
+      );
+      const fallbackUrl = buildXRocketApiV1Url(
         creds.xrocketApiUrl,
         `/invoices?ids=${encodeURIComponent(params.externalInvoiceId)}`,
       );
-      const res = await this.transport({
-        url,
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          Authorization: `Bearer ${creds.xrocketApiKey}`,
-        },
-      });
+
+      const reqHeaders = {
+        Accept: 'application/json',
+        Authorization: `Bearer ${creds.xrocketApiKey}`,
+      };
+
+      let res: { status: number; ok: boolean; json: unknown; text?: string };
+      try {
+        res = await this.transport({
+          url: primaryUrl,
+          method: 'GET',
+          headers: reqHeaders,
+        });
+        if (!res.ok && (res.status === 400 || res.status === 404)) {
+          const fallbackRes = await this.transport({
+            url: fallbackUrl,
+            method: 'GET',
+            headers: reqHeaders,
+          }).catch(() => null);
+          if (fallbackRes && fallbackRes.ok) {
+            res = fallbackRes;
+          }
+        }
+      } catch (primaryErr) {
+        res = await this.transport({
+          url: fallbackUrl,
+          method: 'GET',
+          headers: reqHeaders,
+        }).catch(() => {
+          throw primaryErr;
+        });
+      }
 
       if (!res.ok) {
         const { errorMessage, details } = parseXRocketErrorDetails(

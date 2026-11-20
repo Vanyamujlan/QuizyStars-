@@ -1,7 +1,15 @@
+import crypto from 'crypto';
+import { Timestamp } from 'firebase-admin/firestore';
 import { Telegraf } from 'telegraf';
 import { getEnvConfig } from '../config/env.ts';
 import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
-import { Order, StoreTransaction } from '../types.ts';
+import {
+  DistributedLeaseRecord,
+  FirestoreTimestampLike,
+  NotificationDeliveryState,
+  Order,
+  StoreTransaction,
+} from '../types.ts';
 import { OrderService } from './OrderService.ts';
 import { PaymentService } from './PaymentService.ts';
 import { balanceService } from './BalanceService.ts';
@@ -50,6 +58,7 @@ export interface FulfillmentProviderAdapter {
     status?: 'processing' | 'completed';
     details?: string;
     externalReference?: string;
+    unknownStatus?: string;
   }>;
 }
 
@@ -78,6 +87,11 @@ export class FulfillmentService {
   public static readonly MAX_FULFILLMENT_ATTEMPTS = 3;
   public static baseRetryDelayMs = 2000;
   public static staleProcessingLeaseMs = 60_000;
+  public static pollLeaseTtlMs = 45_000;
+  public static notificationLeaseTtlMs = 45_000;
+  public static staleOrderAlertThresholdMs = 15 * 60 * 1000;
+  public static pollBatchBudget = 50;
+  public static workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
   private static myStarsAdapter = new MyStarsFulfillmentAdapter(myStarsClient);
@@ -86,6 +100,162 @@ export class FulfillmentService {
   private static isRecoveryPassRunning = false;
   private static mystarsPollCooldownUntilMs = 0;
   private static inFlightMyStarsPollOrders = new Set<string>();
+
+  /**
+   * Normalizes a Firestore Timestamp (or serialized plain-object / ISO / epoch representation)
+   * into epoch milliseconds.
+   */
+  public static timestampToMillis(ts: FirestoreTimestampLike | undefined | null): number {
+    if (ts === undefined || ts === null) return 0;
+    if (typeof ts === 'number') {
+      return Number.isFinite(ts) ? ts : 0;
+    }
+    if (typeof ts === 'string') {
+      const parsed = Date.parse(ts);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+    if (typeof ts === 'object') {
+      if (typeof ts.toMillis === 'function') {
+        return ts.toMillis();
+      }
+      if (typeof ts.seconds === 'number') {
+        return ts.seconds * 1000 + Math.floor((ts.nanoseconds ?? 0) / 1e6);
+      }
+      if (typeof ts._seconds === 'number') {
+        return ts._seconds * 1000 + Math.floor((ts._nanoseconds ?? 0) / 1e6);
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Atomically acquires a per-order distributed polling lease in Firestore using `Timestamp`.
+   * Prevents multiple workers/replicas from polling the same order concurrently.
+   */
+  public static async acquireOrderPollLease(params: {
+    orderId: string;
+    leaseOwner?: string;
+    operationId?: string;
+    ttlMs?: number;
+    nowMs?: number;
+  }): Promise<{
+    acquired: boolean;
+    lease?: DistributedLeaseRecord;
+    order?: Order;
+  }> {
+    const leaseOwner = params.leaseOwner || this.workerInstanceId;
+    const operationId =
+      params.operationId || `poll_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const ttlMs = params.ttlMs ?? this.pollLeaseTtlMs;
+    const nowMs = params.nowMs ?? Date.now();
+
+    return firestoreRepo.runTransaction(async (tx) => {
+      const current = await tx.get<Order>('orders', params.orderId);
+      if (!current || current.fulfillmentStatus !== 'processing') {
+        return { acquired: false };
+      }
+
+      const existingLease = current.mystarsPollLease;
+      const existingUntilMs = this.timestampToMillis(existingLease?.leaseUntil);
+      if (existingLease && existingUntilMs > nowMs) {
+        const isSameOperation =
+          existingLease.leaseOwner === leaseOwner &&
+          existingLease.operationId === operationId;
+        if (!isSameOperation) {
+          return {
+            acquired: false,
+            lease: existingLease,
+            order: current,
+          };
+        }
+      }
+
+      const lease: DistributedLeaseRecord = {
+        leaseOwner,
+        operationId,
+        acquiredAt: Timestamp.fromMillis(nowMs),
+        leaseUntil: Timestamp.fromMillis(nowMs + ttlMs),
+      };
+
+      const updated: Order = {
+        ...current,
+        mystarsPollLease: lease,
+      };
+      tx.set<Order>('orders', updated.orderId, updated);
+      return {
+        acquired: true,
+        lease,
+        order: updated,
+      };
+    });
+  }
+
+  /**
+   * Atomically renews an active polling lease if and only if both `leaseOwner` and `operationId` match.
+   */
+  public static async renewOrderPollLease(params: {
+    orderId: string;
+    leaseOwner: string;
+    operationId: string;
+    ttlMs?: number;
+    nowMs?: number;
+  }): Promise<boolean> {
+    const ttlMs = params.ttlMs ?? this.pollLeaseTtlMs;
+    const nowMs = params.nowMs ?? Date.now();
+
+    return firestoreRepo.runTransaction(async (tx) => {
+      const current = await tx.get<Order>('orders', params.orderId);
+      if (!current || !current.mystarsPollLease) {
+        return false;
+      }
+      if (
+        current.mystarsPollLease.leaseOwner !== params.leaseOwner ||
+        current.mystarsPollLease.operationId !== params.operationId
+      ) {
+        return false;
+      }
+
+      const renewed: DistributedLeaseRecord = {
+        ...current.mystarsPollLease,
+        leaseUntil: Timestamp.fromMillis(nowMs + ttlMs),
+      };
+      tx.set<Order>('orders', current.orderId, {
+        ...current,
+        mystarsPollLease: renewed,
+      });
+      return true;
+    });
+  }
+
+  /**
+   * Atomically releases an active polling lease if and only if `leaseOwner` and `operationId` match.
+   * Guarantees an expired worker can never delete or clobber a newer worker's lease.
+   */
+  public static async releaseOrderPollLease(params: {
+    orderId: string;
+    leaseOwner: string;
+    operationId: string;
+  }): Promise<boolean> {
+    return firestoreRepo.runTransaction(async (tx) => {
+      const current = await tx.get<Order>('orders', params.orderId);
+      if (!current || !current.mystarsPollLease) {
+        return false;
+      }
+      if (
+        current.mystarsPollLease.leaseOwner !== params.leaseOwner ||
+        current.mystarsPollLease.operationId !== params.operationId
+      ) {
+        return false;
+      }
+
+      const updated: Order = {
+        ...current,
+        mystarsPollLease: undefined,
+      };
+      tx.set<Order>('orders', updated.orderId, updated);
+      return true;
+    });
+  }
 
   public static resetMyStarsPollingState(): void {
     this.mystarsPollCooldownUntilMs = 0;
@@ -144,30 +314,113 @@ export class FulfillmentService {
   }
 
   /**
-   * Sends admin notification with retry and records `adminNotifiedAt` on success.
-   * Never throws or rolls back confirmed payment/fulfillment if Telegram API fails.
+   * Sends admin notification using a resilient state machine (`pending` -> `sending` -> `sent`)
+   * with atomic claim, event ID, and lease protection.
+   * If a process crashes while in `sending` (after Telegram may have accepted the request) and
+   * its lease expires, transitions to `sent` with `deliveryUncertainAfterCrash: true` to avoid
+   * duplicate spam while recording the uncertain post-crash state.
    */
   public static async ensureAdminNotified(
     order: Order,
     bot: Telegraf | null | undefined,
     forceResend = false,
   ): Promise<Order> {
-    if (!forceResend && order.adminNotifiedAt) {
+    if (!forceResend && (order.adminNotifiedAt || order.adminNotificationState?.status === 'sent')) {
       return order;
     }
     if (!bot) {
       return order;
     }
 
+    const eventId = `evt_admin_${order.orderId}_${order.fulfillmentStatus}`;
+    const operationId = `op_admin_notify_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const leaseOwner = this.workerInstanceId;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+
     const { adminIds } = getEnvConfig();
     if (adminIds.length === 0) {
-      const now = new Date().toISOString();
+      const sentState: NotificationDeliveryState = {
+        status: 'sent',
+        eventId,
+        operationId,
+        leaseOwner,
+        attemptCount: (order.adminNotificationState?.attemptCount ?? 0) + 1,
+        sentAt: nowIso,
+      };
       return (
         (await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
-          adminNotifiedAt: now,
-          updatedAt: now,
+          adminNotifiedAt: nowIso,
+          adminNotificationState: sentState,
+          updatedAt: nowIso,
         })) || order
       );
+    }
+
+    type AdminNotifyClaim =
+      | { action: 'already_sent'; order: Order }
+      | { action: 'in_flight'; order: Order }
+      | { action: 'recovered_after_crash'; order: Order }
+      | { action: 'claimed'; order: Order };
+
+    const claim = await firestoreRepo.runTransaction<AdminNotifyClaim>(async (tx) => {
+      const current = (await tx.get<Order>('orders', order.orderId)) || order;
+      const state = current.adminNotificationState;
+
+      if (!forceResend) {
+        if (current.adminNotifiedAt || state?.status === 'sent') {
+          return { action: 'already_sent', order: current };
+        }
+        if (state?.status === 'sending') {
+          const leaseUntilMs = this.timestampToMillis(state.leaseUntil);
+          if (leaseUntilMs > nowMs) {
+            return { action: 'in_flight', order: current };
+          }
+          // Previous worker crashed during `sending` and its lease expired:
+          // Mark `sent` with `deliveryUncertainAfterCrash: true` to avoid duplicate messages
+          const recoveredState: NotificationDeliveryState = {
+            ...state,
+            status: 'sent',
+            leaseUntil: undefined,
+            sentAt: nowIso,
+            deliveryUncertainAfterCrash: true,
+          };
+          const recoveredOrder: Order = {
+            ...current,
+            adminNotifiedAt: current.adminNotifiedAt || nowIso,
+            adminNotificationState: recoveredState,
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', recoveredOrder.orderId, recoveredOrder);
+          return { action: 'recovered_after_crash', order: recoveredOrder };
+        }
+      }
+
+      const claimingState: NotificationDeliveryState = {
+        status: 'sending',
+        eventId,
+        operationId,
+        leaseOwner,
+        leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
+        attemptCount: (state?.attemptCount ?? 0) + 1,
+        deliveryUncertainAfterCrash: false,
+      };
+      const claimedOrder: Order = {
+        ...current,
+        adminNotificationState: claimingState,
+        updatedAt: nowIso,
+      };
+      tx.set<Order>('orders', claimedOrder.orderId, claimedOrder);
+      return { action: 'claimed', order: claimedOrder };
+    });
+
+    if (claim.action !== 'claimed') {
+      if (claim.action === 'recovered_after_crash') {
+        console.warn(
+          `[FulfillmentService] Восстановлено состояние adminNotificationState после истечения sending-lease для заказа #${order.orderId} (deliveryUncertainAfterCrash=true).`,
+        );
+      }
+      return claim.order;
     }
 
     let deliveredCount = 0;
@@ -176,11 +429,11 @@ export class FulfillmentService {
         bot,
         adminId,
         `🔔 <b>Новый оплаченный заказ поступил на выдачу!</b>\n\n${formatAdminOrderCard(
-          order,
+          claim.order,
         )}`,
         {
           parse_mode: 'HTML',
-          ...buildAdminOrderActionKeyboard(order),
+          ...buildAdminOrderActionKeyboard(claim.order),
         },
       );
       if (ok) {
@@ -188,53 +441,202 @@ export class FulfillmentService {
       }
     }
 
-    if (deliveredCount > 0) {
-      const now = new Date().toISOString();
-      return (
-        (await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
-          adminNotifiedAt: now,
-          updatedAt: now,
-        })) || order
-      );
-    }
+    const finIso = new Date().toISOString();
+    return firestoreRepo.runTransaction<Order>(async (tx) => {
+      const latest = (await tx.get<Order>('orders', order.orderId)) || claim.order;
+      const latestState = latest.adminNotificationState;
+      if (
+        latestState &&
+        latestState.operationId &&
+        latestState.operationId !== operationId
+      ) {
+        return latest;
+      }
 
-    return order;
+      if (deliveredCount > 0) {
+        const sentState: NotificationDeliveryState = {
+          status: 'sent',
+          eventId,
+          operationId,
+          leaseOwner,
+          attemptCount: latestState?.attemptCount ?? 1,
+          sentAt: finIso,
+          deliveryUncertainAfterCrash: false,
+        };
+        const updated: Order = {
+          ...latest,
+          adminNotifiedAt: finIso,
+          adminNotificationState: sentState,
+          updatedAt: finIso,
+        };
+        tx.set<Order>('orders', updated.orderId, updated);
+        return updated;
+      }
+
+      const pendingState: NotificationDeliveryState = {
+        status: 'pending',
+        eventId,
+        operationId,
+        leaseOwner,
+        attemptCount: latestState?.attemptCount ?? 1,
+        lastError: 'Не удалось доставить уведомление ни одному администратору',
+      };
+      const updated: Order = {
+        ...latest,
+        adminNotificationState: pendingState,
+        updatedAt: finIso,
+      };
+      tx.set<Order>('orders', updated.orderId, updated);
+      return updated;
+    });
   }
 
   /**
-   * Sends buyer completion notification with retry and records `buyerNotifiedAt` on success.
-   * Never throws or cancels completed fulfillment if Telegram API fails.
+   * Sends buyer completion notification using a resilient state machine (`pending` -> `sending` -> `sent`)
+   * with atomic claim, event ID, and lease protection.
+   * Never claims absolute `exactly-once` across process crashes right after Telegram accepts an HTTP request:
+   * if a process crashes while in `sending` and `leaseUntil` expires, transitions to `sent` with
+   * `deliveryUncertainAfterCrash: true` to prevent duplicate completion spam while logging the state.
    */
   public static async ensureBuyerNotified(
     order: Order,
     bot: Telegraf | null | undefined,
     forceResend = false,
   ): Promise<Order> {
-    if (!forceResend && order.buyerNotifiedAt) {
+    if (!forceResend && (order.buyerNotifiedAt || order.buyerNotificationState?.status === 'sent')) {
       return order;
     }
     if (!bot) {
       return order;
     }
 
+    const eventId = `evt_buyer_completed_${order.orderId}`;
+    const operationId = `op_buyer_notify_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const leaseOwner = this.workerInstanceId;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+
+    type BuyerNotifyClaim =
+      | { action: 'already_sent'; order: Order }
+      | { action: 'in_flight'; order: Order }
+      | { action: 'recovered_after_crash'; order: Order }
+      | { action: 'claimed'; order: Order };
+
+    const claim = await firestoreRepo.runTransaction<BuyerNotifyClaim>(async (tx) => {
+      const current = (await tx.get<Order>('orders', order.orderId)) || order;
+      const state = current.buyerNotificationState;
+
+      if (!forceResend) {
+        if (current.buyerNotifiedAt || state?.status === 'sent') {
+          return { action: 'already_sent', order: current };
+        }
+        if (state?.status === 'sending') {
+          const leaseUntilMs = this.timestampToMillis(state.leaseUntil);
+          if (leaseUntilMs > nowMs) {
+            return { action: 'in_flight', order: current };
+          }
+          // Previous worker crashed during `sending` and its lease expired:
+          // Transition to `sent` with `deliveryUncertainAfterCrash: true` so the buyer is never spammed
+          const recoveredState: NotificationDeliveryState = {
+            ...state,
+            status: 'sent',
+            leaseUntil: undefined,
+            sentAt: nowIso,
+            deliveryUncertainAfterCrash: true,
+          };
+          const recoveredOrder: Order = {
+            ...current,
+            buyerNotifiedAt: current.buyerNotifiedAt || nowIso,
+            buyerNotificationState: recoveredState,
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', recoveredOrder.orderId, recoveredOrder);
+          return { action: 'recovered_after_crash', order: recoveredOrder };
+        }
+      }
+
+      const claimingState: NotificationDeliveryState = {
+        status: 'sending',
+        eventId,
+        operationId,
+        leaseOwner,
+        leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
+        attemptCount: (state?.attemptCount ?? 0) + 1,
+        deliveryUncertainAfterCrash: false,
+      };
+      const claimedOrder: Order = {
+        ...current,
+        buyerNotificationState: claimingState,
+        updatedAt: nowIso,
+      };
+      tx.set<Order>('orders', claimedOrder.orderId, claimedOrder);
+      return { action: 'claimed', order: claimedOrder };
+    });
+
+    if (claim.action !== 'claimed') {
+      if (claim.action === 'recovered_after_crash') {
+        console.warn(
+          `[FulfillmentService] Восстановлено состояние buyerNotificationState после истечения sending-lease для заказа #${order.orderId} (deliveryUncertainAfterCrash=true).`,
+        );
+      }
+      return claim.order;
+    }
+
     const ok = await this.sendTelegramMessageWithRetry(
       bot,
-      order.userTelegramId,
-      formatOrderCompletedUserNotice(order),
+      claim.order.userTelegramId,
+      formatOrderCompletedUserNotice(claim.order),
       { parse_mode: 'HTML' },
     );
 
-    if (ok) {
-      const now = new Date().toISOString();
-      return (
-        (await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
-          buyerNotifiedAt: now,
-          updatedAt: now,
-        })) || order
-      );
-    }
+    const finIso = new Date().toISOString();
+    return firestoreRepo.runTransaction<Order>(async (tx) => {
+      const latest = (await tx.get<Order>('orders', order.orderId)) || claim.order;
+      const latestState = latest.buyerNotificationState;
+      if (
+        latestState &&
+        latestState.operationId &&
+        latestState.operationId !== operationId
+      ) {
+        return latest;
+      }
 
-    return order;
+      if (ok) {
+        const sentState: NotificationDeliveryState = {
+          status: 'sent',
+          eventId,
+          operationId,
+          leaseOwner,
+          attemptCount: latestState?.attemptCount ?? 1,
+          sentAt: finIso,
+          deliveryUncertainAfterCrash: false,
+        };
+        const updated: Order = {
+          ...latest,
+          buyerNotifiedAt: finIso,
+          buyerNotificationState: sentState,
+          updatedAt: finIso,
+        };
+        tx.set<Order>('orders', updated.orderId, updated);
+        return updated;
+      }
+
+      const pendingState: NotificationDeliveryState = {
+        status: 'pending',
+        eventId,
+        operationId,
+        leaseOwner,
+        attemptCount: latestState?.attemptCount ?? 1,
+        lastError: 'Не удалось доставить уведомление покупателю в Telegram',
+      };
+      const updated: Order = {
+        ...latest,
+        buyerNotificationState: pendingState,
+        updatedAt: finIso,
+      };
+      tx.set<Order>('orders', updated.orderId, updated);
+      return updated;
+    });
   }
 
   public static async retryOrderNotifications(
@@ -401,6 +803,11 @@ export class FulfillmentService {
         fulfillmentStartedAt: nowIso,
         fulfillmentAttempts: nextAttempt,
         fulfillmentIdempotencyKey: current.fulfillmentIdempotencyKey || idempotencyKey,
+        ...(activeAdapter instanceof MyStarsFulfillmentAdapter &&
+        !current.mystarsOrderId &&
+        !current.externalExecutionReference
+          ? { mystarsCreateInFlight: true }
+          : {}),
         updatedAt: nowIso,
       };
 
@@ -432,8 +839,37 @@ export class FulfillmentService {
     // =========================================================================
     // PHASE 2: EXECUTE EXTERNAL ADAPTER (ONLY FOR THE WORKER THAT WON THE CLAIM)
     // =========================================================================
-    const { order: claimedOrder, attempt } = claim;
+    let { order: claimedOrder } = claim;
+    const { attempt } = claim;
     try {
+      // If a previous attempt had an ambiguous POST /v1/orders timeout before saving mystarsOrderId,
+      // run bounded reconciliation via GET /v1/orders before sending another POST /v1/orders.
+      if (
+        activeAdapter instanceof MyStarsFulfillmentAdapter &&
+        !claimedOrder.mystarsOrderId &&
+        claimedOrder.mystarsAmbiguousPostAt
+      ) {
+        const reconciled = await activeAdapter.reconcileAmbiguousCreateOrder(claimedOrder);
+        if (reconciled.status === 'ambiguous_multiple') {
+          throw new MyStarsApiError({
+            message: `Обнаружено несколько (${reconciled.count}) подходящих заказов в MyStars после таймаута POST /v1/orders. Автоповтор заблокирован для защиты от дублирования.`,
+            httpStatus: 409,
+            code: 'ambiguous_create_order',
+            retryable: false,
+          });
+        }
+        if (reconciled.status === 'found' && reconciled.mystarsOrderId) {
+          claimedOrder = {
+            ...claimedOrder,
+            mystarsOrderId: reconciled.mystarsOrderId,
+            externalExecutionReference: reconciled.mystarsOrderId,
+            mystarsOrderStatus: reconciled.mystarsStatus,
+            mystarsCreateInFlight: false,
+            mystarsAmbiguousPostAt: undefined,
+          };
+        }
+      }
+
       const adapterResult = await activeAdapter.requestFulfillment(claimedOrder, {
         idempotencyKey: claimedOrder.fulfillmentIdempotencyKey || idempotencyKey,
         attempt,
@@ -460,6 +896,8 @@ export class FulfillmentService {
           externalExecutionReference:
             adapterResult.externalReference ||
             `${activeAdapter.providerName}:${idempotencyKey}`,
+          mystarsCreateInFlight: false,
+          mystarsAmbiguousPostAt: undefined,
           fulfillmentLastError: undefined,
           fulfillmentNextRetryAt: undefined,
           completedAt: isAutoCompleted ? latest.completedAt || nowIso : latest.completedAt,
@@ -515,6 +953,11 @@ export class FulfillmentService {
         delayMs = Math.min(Math.max(error.retryAfterSeconds * 1000, 10), 120_000);
       }
       const nextRetryIso = canRetry ? new Date(nowMs + delayMs).toISOString() : undefined;
+      const isAmbiguousCreateError =
+        activeAdapter instanceof MyStarsFulfillmentAdapter &&
+        !claimedOrder.mystarsOrderId &&
+        (error instanceof MyStarsTransportError ||
+          (error instanceof MyStarsApiError && error.httpStatus >= 500));
 
       const failedOrder = await firestoreRepo.runTransaction<Order>(async (tx) => {
         const latest = (await tx.get<Order>('orders', claimedOrder.orderId)) || claimedOrder;
@@ -524,6 +967,14 @@ export class FulfillmentService {
           fulfillmentLastError: errMsg.slice(0, 500),
           fulfillmentNextRetryAt: nextRetryIso,
           needsManualReconciliation: !canRetry,
+          ...(isAmbiguousCreateError && !latest.mystarsOrderId
+            ? {
+                mystarsCreateInFlight: true,
+                mystarsAmbiguousPostAt: latest.mystarsAmbiguousPostAt || nowIso,
+              }
+            : {
+                mystarsCreateInFlight: false,
+              }),
           fulfillmentNote: canRetry
             ? `Ошибка попытки выдачи #${attempt}: ${errMsg}. Запланирован повтор.`
             : isNonRetryable
@@ -564,19 +1015,91 @@ export class FulfillmentService {
 
   /**
    * Reconciles an order that was left in 'processing' without an externalExecutionReference
-   * due to a server crash mid-execution.
+   * due to a server crash or ambiguous POST timeout mid-execution.
    * - If the adapter supports `checkExternalStatus`, queries the provider first.
-   * - If the adapter does not support status checking and is not idempotent, marks the order
-   *   for manual reconciliation (`fulfillmentStatus: 'failed'`, `needsManualReconciliation: true`)
-   *   so the product is NEVER delivered twice!
+   * - If the order was in the middle of `POST /v1/orders` without a saved `mystarsOrderId`,
+   *   runs bounded reconciliation via `GET /v1/orders` (`reconcileAmbiguousCreateOrder`).
+   *   If `fulfillmentIdempotencyKey` is missing or multiple matches are found, quarantines
+   *   the order for manual admin review so a duplicate order is never created.
    */
   private static async reconcileStaleProcessingOrder(
     staleOrder: Order,
     bot: Telegraf | null | undefined,
   ): Promise<Order> {
+    const hasLockedIdempotencyKey = Boolean(
+      staleOrder.fulfillmentIdempotencyKey && staleOrder.fulfillmentIdempotencyKey.trim(),
+    );
     const idempotencyKey =
       staleOrder.fulfillmentIdempotencyKey || `fulfill_${staleOrder.orderId}`;
     const activeAdapter = this.getActiveAdapter();
+
+    // If MyStars POST /v1/orders crashed or timed out before mystarsOrderId was persisted,
+    // attempt bounded reconciliation via GET /v1/orders first.
+    if (
+      activeAdapter instanceof MyStarsFulfillmentAdapter &&
+      !staleOrder.mystarsOrderId &&
+      !staleOrder.externalExecutionReference
+    ) {
+      try {
+        const reconciled = await activeAdapter.reconcileAmbiguousCreateOrder(staleOrder);
+        if (reconciled.status === 'found' && reconciled.mystarsOrderId) {
+          staleOrder = {
+            ...staleOrder,
+            mystarsOrderId: reconciled.mystarsOrderId,
+            externalExecutionReference: reconciled.mystarsOrderId,
+            mystarsOrderStatus: reconciled.mystarsStatus,
+            mystarsCreateInFlight: false,
+            mystarsAmbiguousPostAt: undefined,
+          };
+        } else if (reconciled.status === 'ambiguous_multiple' || !hasLockedIdempotencyKey) {
+          const nowIso = new Date().toISOString();
+          const reason =
+            reconciled.status === 'ambiguous_multiple'
+              ? `Обнаружено несколько (${reconciled.count}) подходящих заказов в MyStars после сбоя POST /v1/orders. Автоповтор заблокирован для защиты от дублирования.`
+              : 'Сервер перезапустился во время POST /v1/orders без сохранённого Idempotency-Key. Автоповтор заблокирован для защиты от двойного создания заказа.';
+          const quarantined = await firestoreRepo.runTransaction<Order>(async (tx) => {
+            const current = (await tx.get<Order>('orders', staleOrder.orderId)) || staleOrder;
+            const updated: Order = {
+              ...current,
+              fulfillmentStatus: 'failed',
+              needsManualReconciliation: true,
+              mystarsCreateInFlight: false,
+              fulfillmentLastError: reason,
+              fulfillmentNote: reason,
+              updatedAt: nowIso,
+            };
+            tx.set<Order>('orders', updated.orderId, updated);
+            return updated;
+          });
+          return this.ensureAdminNotified(quarantined, bot);
+        }
+      } catch (reconcileErr) {
+        console.warn(
+          `[FulfillmentService] Ошибка сверки GET /v1/orders для зависшего заказа #${staleOrder.orderId}:`,
+          reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr),
+        );
+        if (!hasLockedIdempotencyKey) {
+          const nowIso = new Date().toISOString();
+          const quarantined = await firestoreRepo.runTransaction<Order>(async (tx) => {
+            const current = (await tx.get<Order>('orders', staleOrder.orderId)) || staleOrder;
+            const updated: Order = {
+              ...current,
+              fulfillmentStatus: 'failed',
+              needsManualReconciliation: true,
+              mystarsCreateInFlight: false,
+              fulfillmentLastError:
+                'Не удалось сверить статус POST /v1/orders после сбоя без сохранённого Idempotency-Key. Требуется ручная проверка.',
+              fulfillmentNote:
+                'Требуется ручная сверка администратором (защита от двойной выдачи).',
+              updatedAt: nowIso,
+            };
+            tx.set<Order>('orders', updated.orderId, updated);
+            return updated;
+          });
+          return this.ensureAdminNotified(quarantined, bot);
+        }
+      }
+    }
 
     if (activeAdapter.checkExternalStatus) {
       const extStatus = await activeAdapter.checkExternalStatus(
@@ -599,6 +1122,8 @@ export class FulfillmentService {
             ).slice(0, 500),
             externalExecutionReference:
               extStatus.externalReference || `reconciled_${idempotencyKey}`,
+            mystarsCreateInFlight: false,
+            mystarsAmbiguousPostAt: undefined,
             fulfillmentLastError: undefined,
             completedAt:
               finalStatus === 'completed'
@@ -641,13 +1166,14 @@ export class FulfillmentService {
     }
 
     // Adapter is explicitly idempotent (or checkExternalStatus confirmed it wasn't executed yet):
-    // Reset to 'paid' inside transaction and run initiateFulfillment with the same idempotencyKey
+    // Reset to 'paid' inside transaction and run initiateFulfillment with the same locked idempotencyKey
     await firestoreRepo.runTransaction<void>(async (tx) => {
       const current = await tx.get<Order>('orders', staleOrder.orderId);
       if (!current || current.fulfillmentStatus !== 'processing') return;
       tx.set<Order>('orders', current.orderId, {
         ...current,
         fulfillmentStatus: 'paid',
+        fulfillmentIdempotencyKey: current.fulfillmentIdempotencyKey || idempotencyKey,
         updatedAt: new Date().toISOString(),
       });
     });
@@ -826,11 +1352,13 @@ export class FulfillmentService {
 
   /**
    * Dedicated MyStars FaaS v1 Polling Pass (`GET /v1/orders/{order_id}`).
-   * - Polls all unfinished `processing` orders linked to a MyStars external order ID.
-   * - Persists updated MyStars status, transaction hash, P&L, and polling timestamp.
-   * - Guarantees idempotency via per-order concurrency guard + atomic completion/failure transactions.
+   * - Scans all active `processing` orders across cursor-paginated pages so >50 active orders
+   *   and legacy documents without `mystarsLastPolledAt` are never starved.
+   * - Sorts candidates by `mystarsLastPolledAt` ascending (with missing `mystarsLastPolledAt` first).
+   * - Acquires an atomic Firestore `Timestamp` lease (`mystarsPollLease`) per order before polling.
+   * - Alerts admins once on unknown MyStars status (`mystarsUnknownStatusSeen`) or orders stuck
+   *   in `processing` for >15 minutes (`mystarsStuckAlertedAt`) while continuing polling.
    * - Respects HTTP 429 Retry-After cooldowns without marking orders as failed.
-   * - Survives timeouts / 5xx errors and automatically resumes after bot restarts.
    */
   public static async pollMyStarsOrders(
     bot: Telegraf | null | undefined,
@@ -871,32 +1399,68 @@ export class FulfillmentService {
       return summary;
     }
 
-    const processingOrders = await firestoreRepo.queryDocs<Order>('orders', {
-      where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
-      orderBy: { field: 'createdAt', direction: 'asc' },
-      limit: 50,
-    });
+    // Cursor-paginated scan of all 'processing' orders ordered by 'createdAt' (always present),
+    // ensuring legacy documents without `mystarsLastPolledAt` are never excluded by Firestore indexes
+    // and orders #51+ are fairly scheduled in round-robin order.
+    const allProcessingOrders: Order[] = [];
+    let cursorOrderId: string | undefined;
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 10;
 
-    for (const ord of processingOrders) {
-      const hasMyStarsRef = Boolean(
-        ord.mystarsOrderId ||
-          (ord.externalExecutionReference &&
-            (ord.externalExecutionReference.startsWith('ord_') ||
-              ord.externalExecutionReference.startsWith('ms_'))),
-      );
-      if (!hasMyStarsRef) {
+    for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
+      const page = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
+        orderBy: { field: 'createdAt', direction: 'asc' },
+        limit: PAGE_SIZE,
+        ...(cursorOrderId ? { startAfterDocId: cursorOrderId } : {}),
+      });
+      if (page.length === 0) break;
+      allProcessingOrders.push(...page);
+      if (page.length < PAGE_SIZE) break;
+      cursorOrderId = page[page.length - 1].orderId;
+    }
+
+    const myStarsCandidates = allProcessingOrders
+      .filter((ord) =>
+        Boolean(
+          ord.mystarsOrderId ||
+            (ord.externalExecutionReference &&
+              (ord.externalExecutionReference.startsWith('ord_') ||
+                ord.externalExecutionReference.startsWith('ms_'))),
+        ),
+      )
+      .sort((a, b) => {
+        const aPolledMs = a.mystarsLastPolledAt ? Date.parse(a.mystarsLastPolledAt) || 0 : 0;
+        const bPolledMs = b.mystarsLastPolledAt ? Date.parse(b.mystarsLastPolledAt) || 0 : 0;
+        if (aPolledMs !== bPolledMs) {
+          return aPolledMs - bPolledMs;
+        }
+        return (a.createdAt || '').localeCompare(b.createdAt || '');
+      });
+
+    const batchToPoll = myStarsCandidates.slice(0, Math.max(1, this.pollBatchBudget));
+
+    for (const ord of batchToPoll) {
+      if (this.inFlightMyStarsPollOrders.has(ord.orderId)) {
         continue;
       }
 
-      if (this.inFlightMyStarsPollOrders.has(ord.orderId)) {
+      const leaseOwner = this.workerInstanceId;
+      const operationId = `poll_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const leaseClaim = await this.acquireOrderPollLease({
+        orderId: ord.orderId,
+        leaseOwner,
+        operationId,
+        ttlMs: this.pollLeaseTtlMs,
+      });
+      if (!leaseClaim.acquired || !leaseClaim.order) {
         continue;
       }
 
       this.inFlightMyStarsPollOrders.add(ord.orderId);
       try {
-        // Re-read authoritative state before calling upstream API to avoid duplicate processing
-        const latest = await OrderService.getOrderById(ord.orderId);
-        if (!latest || latest.fulfillmentStatus !== 'processing') {
+        const latest = leaseClaim.order;
+        if (latest.fulfillmentStatus !== 'processing') {
           continue;
         }
 
@@ -917,6 +1481,54 @@ export class FulfillmentService {
           summary.completed += 1;
           summary.orders.push(completed);
           continue;
+        }
+
+        // If MyStars returned an unknown status, send a one-time alert to admins
+        if (extStatus.unknownStatus && !latest.mystarsUnknownStatusSeen && bot) {
+          const refreshedForUnknown = (await OrderService.getOrderById(latest.orderId)) || latest;
+          const { adminIds } = getEnvConfig();
+          for (const adminId of adminIds) {
+            await this.sendTelegramMessageWithRetry(
+              bot,
+              adminId,
+              `⚠️ <b>Неизвестный статус MyStars: "${extStatus.unknownStatus}"</b>\nЗаказ оставлен в статусе processing для безопасной проверки.\n\n${formatAdminOrderCard(refreshedForUnknown)}`,
+              {
+                parse_mode: 'HTML',
+                ...buildAdminOrderActionKeyboard(refreshedForUnknown),
+              },
+            );
+          }
+        }
+
+        // Check if order has been stuck in 'processing' longer than staleOrderAlertThresholdMs (15m)
+        const processingStartIso =
+          latest.fulfillmentStartedAt || latest.paidAt || latest.createdAt;
+        const processingStartMs = processingStartIso ? Date.parse(processingStartIso) : 0;
+        if (
+          processingStartMs > 0 &&
+          Date.now() - processingStartMs >= this.staleOrderAlertThresholdMs &&
+          !latest.mystarsStuckAlertedAt
+        ) {
+          const alertIso = new Date().toISOString();
+          const alertedOrder =
+            (await firestoreRepo.updateDoc<Order>('orders', latest.orderId, {
+              mystarsStuckAlertedAt: alertIso,
+              updatedAt: alertIso,
+            })) || { ...latest, mystarsStuckAlertedAt: alertIso };
+          if (bot) {
+            const { adminIds } = getEnvConfig();
+            for (const adminId of adminIds) {
+              await this.sendTelegramMessageWithRetry(
+                bot,
+                adminId,
+                `⏳ <b>Заказ MyStars в обработке более 15 минут</b>\nАвтоматический polling продолжается. Проверьте статус оплаты поставщику MyStars.\n\n${formatAdminOrderCard(alertedOrder)}`,
+                {
+                  parse_mode: 'HTML',
+                  ...buildAdminOrderActionKeyboard(alertedOrder),
+                },
+              );
+            }
+          }
         }
 
         summary.stillProcessing += 1;
@@ -965,7 +1577,7 @@ export class FulfillmentService {
           continue;
         }
 
-        // 3. Transient timeout / network error / HTTP 5xx: keep order in 'processing' and retry on next tick
+        // 3. Transient timeout / network error / HTTP 5xx / malformed payload: keep order in 'processing' and retry on next tick
         summary.transientErrors += 1;
         summary.stillProcessing += 1;
         await firestoreRepo
@@ -984,6 +1596,11 @@ export class FulfillmentService {
         );
       } finally {
         this.inFlightMyStarsPollOrders.delete(ord.orderId);
+        await this.releaseOrderPollLease({
+          orderId: ord.orderId,
+          leaseOwner,
+          operationId,
+        }).catch(() => {});
       }
     }
 
