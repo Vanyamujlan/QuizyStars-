@@ -24,7 +24,7 @@ import {
   compareScaledDecimal,
   usdInputToCents,
 } from './Money.ts';
-import { normalizeRecipientUsername } from './OrderService.ts';
+import { OrderService, normalizeRecipientUsername } from './OrderService.ts';
 import {
   isActiveSupplierConfigured,
   validateRecipientWithActiveSupplier,
@@ -597,8 +597,6 @@ export class BalanceService {
     }
 
     if (
-      existingTopUp.paymentStatus === 'cancelled' ||
-      existingTopUp.paymentStatus === 'expired' ||
       existingTopUp.paymentStatus === 'failed' ||
       existingTopUp.paymentStatus === 'underpaid'
     ) {
@@ -621,7 +619,23 @@ export class BalanceService {
       paymentId: existingTopUp.paymentId,
     });
 
-    if (verified.status === 'expired' || isLocallyExpired) {
+    if (
+      verified.status !== 'paid' &&
+      existingTopUp.paymentStatus === 'cancelled'
+    ) {
+      return {
+        ok: false,
+        duplicate: false,
+        status: 'cancelled',
+        topUp: existingTopUp,
+        reason: 'TOPUP_ALREADY_CANCELLED',
+      };
+    }
+
+    if (
+      verified.status === 'expired' ||
+      (verified.status !== 'paid' && isLocallyExpired)
+    ) {
       const expiredTopUp = await this.markTopUpTerminalFailure(
         paymentId,
         'expired',
@@ -855,7 +869,11 @@ export class BalanceService {
         };
       }
 
-      if (freshTopUp.paymentStatus !== 'pending') {
+      if (
+        freshTopUp.paymentStatus !== 'pending' &&
+        freshTopUp.paymentStatus !== 'expired' &&
+        freshTopUp.paymentStatus !== 'cancelled'
+      ) {
         return {
           ok: false,
           duplicate: false,
@@ -1100,6 +1118,12 @@ export class BalanceService {
         tx.get<Product>('products', params.productId),
         tx.get<StoreUser>('users', userId),
       ]);
+      const balancePaymentId = `bal_pay_${resolvedOrderId}`;
+      const prevExternalPayment =
+        existingOrder?.activePaymentId &&
+        existingOrder.activePaymentId !== balancePaymentId
+          ? await tx.get<PaymentRecord>('payments', existingOrder.activePaymentId)
+          : null;
 
       if (
         existingOrder &&
@@ -1223,7 +1247,6 @@ export class BalanceService {
       }
       const newBalanceUsd = fromMinorUnits(newBalanceCents);
       const now = new Date().toISOString();
-      const balancePaymentId = `bal_pay_${resolvedOrderId}`;
 
       const updatedUser: StoreUser = userSnap
         ? {
@@ -1267,6 +1290,9 @@ export class BalanceService {
             grossRevenueUsdCents: totalPriceUsdCents,
             providerFeeUsdCents: 0,
             mystarsCurrency: 'usdt_ton',
+            fulfillmentProvider:
+              existingOrder.fulfillmentProvider ||
+              OrderService.resolveOrderFulfillmentProvider(product.category),
             paymentStatus: 'paid',
             fulfillmentStatus: 'paid',
             paidAt: now,
@@ -1295,6 +1321,9 @@ export class BalanceService {
             grossRevenueUsdCents: totalPriceUsdCents,
             providerFeeUsdCents: 0,
             mystarsCurrency: 'usdt_ton',
+            fulfillmentProvider: OrderService.resolveOrderFulfillmentProvider(
+              product.category,
+            ),
             paymentStatus: 'paid',
             fulfillmentStatus: 'paid',
             fulfillmentIdempotencyKey: `fulfill_${resolvedOrderId}`,
@@ -1339,6 +1368,15 @@ export class BalanceService {
         details: `Оплата заказа ${resolvedOrderId} (${product.name}) с внутреннего баланса: списано=${formatUsdCents(totalPriceUsdCents)}, остаток=${formatUsdCents(newBalanceCents)}`,
         createdAt: now,
       };
+
+      if (prevExternalPayment && prevExternalPayment.status === 'pending') {
+        tx.set<PaymentRecord>('payments', prevExternalPayment.paymentId, {
+          ...prevExternalPayment,
+          status: 'cancelled',
+          failureReason: 'PAID_WITH_INTERNAL_BALANCE',
+          updatedAt: now,
+        });
+      }
 
       tx.set<StoreUser>('users', userId, updatedUser);
       tx.set<Order>('orders', resolvedOrderId, paidOrder);

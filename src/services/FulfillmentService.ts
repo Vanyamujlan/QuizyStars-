@@ -1901,7 +1901,13 @@ export class FulfillmentService {
       // =========================================================================
       const finalizedOrder = await firestoreRepo.runTransaction<Order>(async (tx) => {
         const latest = (await tx.get<Order>('orders', claimedOrder.orderId)) || claimedOrder;
-        if (latest.fulfillmentStatus === 'completed') {
+        if (
+          latest.fulfillmentStatus === 'completed' ||
+          latest.fulfillmentStatus === 'refunded' ||
+          latest.fulfillmentStatus === 'cancelled' ||
+          latest.paymentStatus === 'refunded' ||
+          latest.paymentStatus === 'cancelled'
+        ) {
           return latest;
         }
 
@@ -1982,6 +1988,15 @@ export class FulfillmentService {
 
       const failedOrder = await firestoreRepo.runTransaction<Order>(async (tx) => {
         const latest = (await tx.get<Order>('orders', claimedOrder.orderId)) || claimedOrder;
+        if (
+          latest.fulfillmentStatus === 'completed' ||
+          latest.fulfillmentStatus === 'refunded' ||
+          latest.fulfillmentStatus === 'cancelled' ||
+          latest.paymentStatus === 'refunded' ||
+          latest.paymentStatus === 'cancelled'
+        ) {
+          return latest;
+        }
         const failed: Order = {
           ...latest,
           fulfillmentStatus: 'failed',
@@ -2646,6 +2661,7 @@ export class FulfillmentService {
         const retryDue =
           !ord.fulfillmentNextRetryAt || ord.fulfillmentNextRetryAt <= nowIso;
         if (
+          (ord.paymentStatus === 'paid' || ord.paymentStatus === 'processing') &&
           !ord.needsManualReconciliation &&
           attempts < this.MAX_FULFILLMENT_ATTEMPTS &&
           retryDue
@@ -3366,7 +3382,13 @@ export class FulfillmentService {
     }>(async (tx) => {
       const current = await tx.get<Order>('orders', orderId);
       if (!current) return { newlyFailed: false, order: null };
-      if (current.fulfillmentStatus === 'completed') {
+      if (
+        current.fulfillmentStatus === 'completed' ||
+        current.fulfillmentStatus === 'refunded' ||
+        current.fulfillmentStatus === 'cancelled' ||
+        current.paymentStatus === 'refunded' ||
+        current.paymentStatus === 'cancelled'
+      ) {
         return { newlyFailed: false, order: current };
       }
       if (current.fulfillmentStatus === 'failed' && current.needsManualReconciliation) {

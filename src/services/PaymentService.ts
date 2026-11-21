@@ -323,6 +323,20 @@ export class PaymentService {
         );
       }
 
+      const prevPayment =
+        freshOrder.activePaymentId && freshOrder.activePaymentId !== paymentId
+          ? await tx.get<PaymentRecord>('payments', freshOrder.activePaymentId)
+          : null;
+
+      if (prevPayment && prevPayment.status === 'pending') {
+        tx.set<PaymentRecord>('payments', prevPayment.paymentId, {
+          ...prevPayment,
+          status: 'cancelled',
+          failureReason: 'SUPERSEDED_BY_NEW_INVOICE',
+          updatedAt: now,
+        });
+      }
+
       const nextOrder: Order = {
         ...freshOrder,
         paymentMethod: params.provider,
@@ -529,8 +543,6 @@ export class PaymentService {
     }
 
     if (
-      existingPayment.status === 'cancelled' ||
-      existingPayment.status === 'expired' ||
       existingPayment.status === 'failed' ||
       existingPayment.status === 'underpaid'
     ) {
@@ -544,6 +556,24 @@ export class PaymentService {
         payment: existingPayment,
         reason: `PAYMENT_ALREADY_${existingPayment.status.toUpperCase()}`,
       };
+    }
+
+    if (
+      existingPayment.status === 'cancelled' ||
+      existingPayment.status === 'expired'
+    ) {
+      const ord = await OrderService.getOrderById(existingPayment.orderId);
+      if (!ord || ord.paymentStatus !== 'pending') {
+        return {
+          ok: false,
+          duplicate: false,
+          needsFulfillmentRecovery: false,
+          status: existingPayment.status,
+          order: ord || undefined,
+          payment: existingPayment,
+          reason: `PAYMENT_ALREADY_${existingPayment.status.toUpperCase()}`,
+        };
+      }
     }
 
     if (
@@ -570,7 +600,23 @@ export class PaymentService {
       paymentId: existingPayment.paymentId,
     });
 
-    if (verified.status === 'expired' || isLocallyExpired) {
+    if (verified.status !== 'paid' && existingPayment.status === 'cancelled') {
+      const ord = await OrderService.getOrderById(existingPayment.orderId);
+      return {
+        ok: false,
+        duplicate: false,
+        needsFulfillmentRecovery: false,
+        status: 'cancelled',
+        order: ord || undefined,
+        payment: existingPayment,
+        reason: 'PAYMENT_ALREADY_CANCELLED',
+      };
+    }
+
+    if (
+      verified.status === 'expired' ||
+      (verified.status !== 'paid' && isLocallyExpired)
+    ) {
       const { payment, order } = await this.markOrderPaymentIssue(
         existingPayment.paymentId,
         'expired',
@@ -824,9 +870,38 @@ export class PaymentService {
           freshOrder.paymentStatus !== 'pending' ||
           freshOrder.fulfillmentStatus !== 'pending'
         ) {
-          throw new Error(
-            `Заказ #${freshOrder.orderId} уже имеет статус оплаты "${freshOrder.paymentStatus}" и не может быть повторно оплачен другим платежом.`,
-          );
+          const conflictNow = new Date().toISOString();
+          const conflictReason = `ORDER_ALREADY_${freshOrder.paymentStatus.toUpperCase()}`;
+          const closedPayment: PaymentRecord = {
+            ...freshPayment,
+            status: 'failed',
+            failureReason: conflictReason,
+            updatedAt: conflictNow,
+          };
+          tx.set<PaymentRecord>('payments', closedPayment.paymentId, closedPayment);
+
+          const conflictTxId = sanitizeDocId(`tx_ord_conflict_${freshPayment.paymentId}`);
+          tx.set<StoreTransaction>('transactions', conflictTxId, {
+            transactionId: conflictTxId,
+            orderId: freshOrder.orderId,
+            userId: freshOrder.userId,
+            type: 'error',
+            amount: freshPayment.expectedUsdCents ?? freshPayment.totalAmount,
+            amountUsdCents: freshPayment.expectedUsdCents ?? freshPayment.totalAmount,
+            currency: 'USD',
+            details: `Поступило подтверждение платежа ${freshPayment.paymentId} (ext=${externalInvoiceId}), но заказ #${freshOrder.orderId} уже находится в статусе оплаты "${freshOrder.paymentStatus}" (выдача: "${freshOrder.fulfillmentStatus}"). Платёж переведён в статус failed (${conflictReason}).`,
+            createdAt: conflictNow,
+          });
+
+          return {
+            ok: false,
+            duplicate: false,
+            needsFulfillmentRecovery: false,
+            status: 'failed',
+            order: freshOrder,
+            payment: closedPayment,
+            reason: conflictReason,
+          };
         }
 
         if (freshOrder.category === 'premium') {

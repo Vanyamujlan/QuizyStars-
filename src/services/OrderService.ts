@@ -417,6 +417,11 @@ export class OrderService {
       const existing = await tx.get<Order>('orders', params.orderId);
       if (!existing) return null;
 
+      const activePayment =
+        existing.activePaymentId
+          ? await tx.get<PaymentRecord>('payments', existing.activePaymentId)
+          : null;
+
       const now = new Date().toISOString();
       const nextFulfillment = params.fulfillmentStatus ?? existing.fulfillmentStatus;
       const nextPayment = params.paymentStatus ?? existing.paymentStatus;
@@ -476,6 +481,19 @@ export class OrderService {
             : existing.completedAt,
         updatedAt: now,
       };
+
+      if (
+        (nextPayment === 'cancelled' || nextFulfillment === 'cancelled') &&
+        activePayment &&
+        activePayment.status === 'pending'
+      ) {
+        tx.set<PaymentRecord>('payments', activePayment.paymentId, {
+          ...activePayment,
+          status: 'cancelled',
+          failureReason: 'ORDER_CANCELLED',
+          updatedAt: now,
+        });
+      }
 
       tx.set<Order>('orders', updated.orderId, updated);
       return updated;

@@ -430,6 +430,7 @@ export interface PaymentRecord {
   payUrl?: string;
   status: PaymentRecordStatus;
   statusReason?: string;
+  failureReason?: string;
   expiresAt?: string;
   paidAt?: string;
   confirmedAt?: string;
