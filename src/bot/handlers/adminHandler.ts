@@ -13,6 +13,7 @@ import { OrderService } from '../../services/OrderService.ts';
 import { FulfillmentService } from '../../services/FulfillmentService.ts';
 import { myStarsClient } from '../../services/MyStarsService.ts';
 import { balanceService } from '../../services/BalanceService.ts';
+import { PaymentService } from '../../services/PaymentService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
   paymentProviderGateway,
@@ -40,6 +41,7 @@ import {
   buildAdminOrderActionKeyboard,
   buildAdminOrderBalanceRefundConfirmKeyboard,
   buildAdminOrdersKeyboard,
+  buildAdminPaymentReconciliationKeyboard,
   buildAdminPremiumDurationPickKeyboard,
   buildAdminProductManageKeyboard,
   buildAdminProductsKeyboard,
@@ -52,10 +54,13 @@ import {
   buildOwnerProductKeysKeyboard,
 } from '../keyboards.ts';
 import {
+  ADMIN_RECONCILIATION_MAX_RECORDS,
+  AdminReconciliationScope,
   escapeHtml,
   formatAdminCatalogDiagnosticsSummary,
   formatAdminNotificationReviewMessage,
   formatAdminOrderCard,
+  formatAdminPaymentReconciliationMessage,
   formatAdminStatsMessage,
   formatAdminTopUpCard,
   formatDateRu,
@@ -413,6 +418,64 @@ export function registerAdminHandlers(
       const msg = error instanceof Error ? error.message : String(error);
       await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
     }
+  });
+
+  // 1c. Возвраты / финансовая сверка (refund_required: конфликтные оплаты заказов и пополнения баланса)
+  const renderAdminPaymentReconciliation = async (
+    ctx: Context,
+    scope: AdminReconciliationScope,
+    page: number,
+  ): Promise<void> => {
+    const [orderPayments, topUps] = await Promise.all([
+      PaymentService.getReconciliationRequiredPayments(
+        ADMIN_RECONCILIATION_MAX_RECORDS,
+      ),
+      balanceService.getAllTopUps(
+        'refund_required',
+        ADMIN_RECONCILIATION_MAX_RECORDS,
+      ),
+    ]);
+
+    const formatted = formatAdminPaymentReconciliationMessage({
+      orderPayments,
+      topUps,
+      scope,
+      page,
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      formatted.text,
+      buildAdminPaymentReconciliationKeyboard({
+        scope,
+        page: formatted.safePage,
+        totalPages: formatted.totalPages,
+        totalOrderPayments: formatted.totalOrderPayments,
+        totalTopUps: formatted.totalTopUps,
+      }),
+    );
+  };
+
+  bot.action('adm:reconcile', async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:reconcile')) return;
+    await renderAdminPaymentReconciliation(ctx, 'all', 0);
+  });
+
+  bot.action(/^adm:reconcile:(all|orders|topups):(\d+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const scope = ctx.match[1] as AdminReconciliationScope;
+    const pageRaw = Number.parseInt(ctx.match[2], 10);
+    const page = Number.isFinite(pageRaw) && pageRaw >= 0 ? pageRaw : 0;
+    if (
+      isDuplicateCallbackClick(
+        ctx.from!.id,
+        `adm:reconcile:${scope}:${page}`,
+      )
+    ) {
+      return;
+    }
+    await renderAdminPaymentReconciliation(ctx, scope, page);
   });
 
   // 2. Список заказов (с фильтрацией)

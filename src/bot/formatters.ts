@@ -700,11 +700,20 @@ export function formatAdminTopUpCard(topUp: BalanceTopUpRecord): string {
     `${oe('fee')} Комиссия (${topUp.feePercent}%): <code>−${formatUsdCents(feeCents)}</code>`,
     `${oe('credited')} К зачислению: <code>+${formatUsdCents(creditedCents)}</code>`,
     `📌 Статус: <b>${escapeHtml(topUp.paymentStatus.toUpperCase())}</b>`,
+    topUp.reconciliationReason
+      ? `⚠️ Причина сверки: <code>${escapeHtml(topUp.reconciliationReason)}</code>`
+      : '',
+    topUp.verifiedAmountStr
+      ? `✅ Подтверждено провайдером: <code>${escapeHtml(topUp.verifiedAmountStr)} ${escapeHtml(topUp.verifiedCurrency || topUp.currency)}${topUp.verifiedNetwork ? ` (${escapeHtml(topUp.verifiedNetwork)})` : ''}</code>`
+      : '',
     topUp.failureReason || topUp.statusReason
       ? `${oe('warning')} Причина: ${escapeHtml(topUp.failureReason || topUp.statusReason)}`
       : '',
     `🕒 Создан: ${formatDateRu(topUp.createdAt)}`,
     topUp.paidAt ? `${oe('check')} Оплачен: ${formatDateRu(topUp.paidAt)}` : '',
+    topUp.confirmedAt
+      ? `🔒 Зафиксирован: <code>${escapeHtml(topUp.confirmedAt)}</code>`
+      : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -1179,3 +1188,242 @@ export function formatAdminCatalogDiagnosticsSummary(diagnostics: {
     ...issueLines,
   ].join('\n');
 }
+
+export const ADMIN_RECONCILIATION_PAGE_SIZE = 5;
+export const ADMIN_RECONCILIATION_MAX_RECORDS = 100;
+export type AdminReconciliationScope = 'all' | 'orders' | 'topups';
+
+function formatReconciliationOrderPaymentItem(
+  payment: PaymentRecord,
+  index: number,
+): string {
+  const externalInvoiceId = payment.providerPaymentId || '—';
+  const verifiedAmountStr =
+    payment.verifiedAmountStr ||
+    payment.actualAmountStr ||
+    payment.expectedAmountStr ||
+    '—';
+  const verifiedCurrency = payment.verifiedCurrency || payment.currency || '—';
+  const verifiedNetwork = payment.verifiedNetwork || payment.network || '—';
+  const reconciliationReason =
+    payment.reconciliationReason ||
+    payment.failureReason ||
+    payment.statusReason ||
+    'REFUND_REQUIRED';
+  const confirmedAt =
+    payment.confirmedAt || payment.paidAt || payment.updatedAt || '—';
+
+  const lines = [
+    `<b>#${index}. Конфликтный платёж заказа</b> [<code>${escapeHtml(payment.status)}</code>]`,
+    `• paymentId: <code>${escapeHtml(payment.paymentId)}</code>`,
+    `• orderId: <code>${escapeHtml(payment.orderId)}</code>`,
+    `• userTelegramId: <code>${payment.userTelegramId}</code>`,
+    `• provider: <code>${escapeHtml(payment.provider)}</code>`,
+    `• externalInvoiceId: <code>${escapeHtml(externalInvoiceId)}</code>`,
+    `• verifiedAmountStr: <code>${escapeHtml(verifiedAmountStr)}</code>`,
+    `• verifiedCurrency: <code>${escapeHtml(verifiedCurrency)}</code>`,
+    `• verifiedNetwork: <code>${escapeHtml(verifiedNetwork)}</code>`,
+    `• reconciliationReason: <code>${escapeHtml(reconciliationReason)}</code>`,
+    `• confirmedAt: <code>${escapeHtml(confirmedAt)}</code>`,
+  ];
+
+  if (payment.supersededByPaymentId) {
+    lines.push(
+      `• supersededByPaymentId: <code>${escapeHtml(payment.supersededByPaymentId)}</code>`,
+    );
+  }
+
+  return lines.join('\n');
+}
+
+function formatReconciliationTopUpItem(
+  topUp: BalanceTopUpRecord,
+  index: number,
+): string {
+  const externalInvoiceId = topUp.externalInvoiceId || '—';
+  const verifiedAmountStr =
+    topUp.verifiedAmountStr ||
+    topUp.actualAmountStr ||
+    topUp.expectedAmountStr ||
+    String(topUp.amountPaid);
+  const verifiedCurrency = topUp.verifiedCurrency || topUp.currency || '—';
+  const verifiedNetwork = topUp.verifiedNetwork || topUp.network || '—';
+  const reconciliationReason =
+    topUp.reconciliationReason ||
+    topUp.failureReason ||
+    topUp.statusReason ||
+    'REFUND_REQUIRED';
+  const confirmedAt =
+    topUp.confirmedAt || topUp.paidAt || topUp.updatedAt || '—';
+
+  const lines = [
+    `<b>#${index}. Конфликтное пополнение баланса</b> [<code>${escapeHtml(topUp.paymentStatus)}</code>]`,
+    `• paymentId: <code>${escapeHtml(topUp.paymentId)}</code>`,
+    `• orderId: <code>— (пополнение баланса)</code>`,
+    `• userTelegramId: <code>${topUp.userTelegramId}</code>`,
+    `• provider: <code>${escapeHtml(topUp.provider)}</code>`,
+    `• externalInvoiceId: <code>${escapeHtml(externalInvoiceId)}</code>`,
+    `• verifiedAmountStr: <code>${escapeHtml(verifiedAmountStr)}</code>`,
+    `• verifiedCurrency: <code>${escapeHtml(verifiedCurrency)}</code>`,
+    `• verifiedNetwork: <code>${escapeHtml(verifiedNetwork)}</code>`,
+    `• reconciliationReason: <code>${escapeHtml(reconciliationReason)}</code>`,
+    `• confirmedAt: <code>${escapeHtml(confirmedAt)}</code>`,
+  ];
+
+  return lines.join('\n');
+}
+
+export function formatAdminPaymentReconciliationMessage(params: {
+  orderPayments: PaymentRecord[];
+  topUps: BalanceTopUpRecord[];
+  scope?: AdminReconciliationScope;
+  page?: number;
+  pageSize?: number;
+}): {
+  text: string;
+  safePage: number;
+  totalPages: number;
+  totalOrderPayments: number;
+  totalTopUps: number;
+  totalUnprocessed: number;
+} {
+  const scope: AdminReconciliationScope = params.scope || 'all';
+  const pageSize = Math.max(
+    1,
+    Math.min(params.pageSize || ADMIN_RECONCILIATION_PAGE_SIZE, 10),
+  );
+
+  const sortedOrders = [...params.orderPayments]
+    .filter((p) => p.status === 'refund_required')
+    .sort(
+      (a, b) =>
+        (b.confirmedAt || b.createdAt).localeCompare(
+          a.confirmedAt || a.createdAt,
+        ) ||
+        b.createdAt.localeCompare(a.createdAt) ||
+        a.paymentId.localeCompare(b.paymentId),
+    )
+    .slice(0, ADMIN_RECONCILIATION_MAX_RECORDS);
+
+  const sortedTopUps = [...params.topUps]
+    .filter((t) => t.paymentStatus === 'refund_required')
+    .sort(
+      (a, b) =>
+        (b.confirmedAt || b.createdAt).localeCompare(
+          a.confirmedAt || a.createdAt,
+        ) ||
+        b.createdAt.localeCompare(a.createdAt) ||
+        a.paymentId.localeCompare(b.paymentId),
+    )
+    .slice(0, ADMIN_RECONCILIATION_MAX_RECORDS);
+
+  const totalOrderPayments = sortedOrders.length;
+  const totalTopUps = sortedTopUps.length;
+  const totalUnprocessed = totalOrderPayments + totalTopUps;
+
+  const activeCollectionLength =
+    scope === 'orders'
+      ? totalOrderPayments
+      : scope === 'topups'
+        ? totalTopUps
+        : Math.max(totalOrderPayments, totalTopUps);
+
+  const totalPages = Math.max(1, Math.ceil(activeCollectionLength / pageSize));
+  const requestedPage =
+    typeof params.page === 'number' && Number.isFinite(params.page)
+      ? Math.trunc(params.page)
+      : 0;
+  const safePage = Math.max(0, Math.min(requestedPage, totalPages - 1));
+  const startIdx = safePage * pageSize;
+  const endIdx = startIdx + pageSize;
+
+  const scopeTitle =
+    scope === 'orders'
+      ? 'Конфликтные оплаты заказов'
+      : scope === 'topups'
+        ? 'Конфликтные пополнения баланса'
+        : 'Все конфликтные операции (заказы + пополнения)';
+
+  const headerLines = [
+    '⚠️ <b>Возвраты / финансовая сверка (refund_required)</b>',
+    `📊 Всего необработанных записей: <b>${totalUnprocessed}</b> (платежи заказов: <b>${totalOrderPayments}</b>, пополнения баланса: <b>${totalTopUps}</b>)`,
+    `🗂 Режим просмотра: <b>${scopeTitle}</b> | Страница: <b>${safePage + 1}/${totalPages}</b> (лимит страницы: ${pageSize})`,
+    '',
+  ];
+
+  if (totalUnprocessed === 0) {
+    return {
+      text: [
+        ...headerLines,
+        '✅ <b>Очередь финансовой сверки пуста.</b>',
+        'Необработанных платежей заказов и пополнений баланса со статусом <code>refund_required</code> нет.',
+      ].join('\n'),
+      safePage,
+      totalPages,
+      totalOrderPayments,
+      totalTopUps,
+      totalUnprocessed,
+    };
+  }
+
+  const bodyBlocks: string[] = [];
+
+  if (scope === 'all' || scope === 'orders') {
+    const orderSlice = sortedOrders.slice(startIdx, endIdx);
+    bodyBlocks.push(
+      `📦 <b>Конфликтные оплаты заказов (PaymentRecord: refund_required) — всего: ${totalOrderPayments}</b>`,
+    );
+    if (totalOrderPayments === 0) {
+      bodyBlocks.push('• Конфликтных оплат заказов нет.');
+    } else if (orderSlice.length === 0) {
+      bodyBlocks.push(
+        `• На странице ${safePage + 1} записей по заказам нет (показаны на стр. 1..${Math.ceil(totalOrderPayments / pageSize)}).`,
+      );
+    } else {
+      for (let i = 0; i < orderSlice.length; i++) {
+        bodyBlocks.push(
+          formatReconciliationOrderPaymentItem(orderSlice[i], startIdx + i + 1),
+        );
+      }
+    }
+  }
+
+  if (scope === 'all') {
+    bodyBlocks.push('');
+  }
+
+  if (scope === 'all' || scope === 'topups') {
+    const topUpSlice = sortedTopUps.slice(startIdx, endIdx);
+    bodyBlocks.push(
+      `💳 <b>Конфликтные пополнения баланса (BalanceTopUpRecord: refund_required) — всего: ${totalTopUps}</b>`,
+    );
+    if (totalTopUps === 0) {
+      bodyBlocks.push('• Конфликтных пополнений баланса нет.');
+    } else if (topUpSlice.length === 0) {
+      bodyBlocks.push(
+        `• На странице ${safePage + 1} записей по пополнениям нет (показаны на стр. 1..${Math.ceil(totalTopUps / pageSize)}).`,
+      );
+    } else {
+      for (let i = 0; i < topUpSlice.length; i++) {
+        bodyBlocks.push(
+          formatReconciliationTopUpItem(topUpSlice[i], startIdx + i + 1),
+        );
+      }
+    }
+  }
+
+  bodyBlocks.push(
+    '',
+    'ℹ️ <i>Только просмотр: автоматические возвраты отключены. Финансовые статусы не изменяются без отдельного подтверждённого действия администратора.</i>',
+  );
+
+  return {
+    text: [...headerLines, ...bodyBlocks].join('\n'),
+    safePage,
+    totalPages,
+    totalOrderPayments,
+    totalTopUps,
+    totalUnprocessed,
+  };
+}
+

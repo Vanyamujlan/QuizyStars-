@@ -16959,6 +16959,412 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  // =========================================================================
+  // STAGE 2.5.2 — ADMIN PAYMENT RECONCILIATION VISIBILITY (S252-01 .. S252-04)
+  // =========================================================================
+
+  await runTest(
+    'S252-01',
+    'Payments',
+    'Stage 2.5.2 (1/4): Кнопка «Возвраты / финансовая сверка» в админ-панели и корректное отображение пустой очереди сверки',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      const adminUser = {
+        id: 777000111,
+        username: 'quizystars_admin',
+        first_name: 'Admin',
+      };
+      const adminHarness = createWiredBotHarness(true);
+
+      await adminHarness.sendText(adminUser, '/admin');
+      const mainAdmUi = adminHarness.lastUiCall()!;
+      assert.ok(
+        mainAdmUi.callbacks.includes('adm:reconcile'),
+        'Главное меню админ-панели должно содержать кнопку adm:reconcile («Возвраты / финансовая сверка»)',
+      );
+
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:reconcile');
+      const emptyUi = adminHarness.lastUiCall()!;
+      assert.ok(emptyUi.text.includes('Возвраты / финансовая сверка'));
+      assert.ok(
+        emptyUi.text.includes(
+          'Всего необработанных записей: <b>0</b> (платежи заказов: <b>0</b>, пополнения баланса: <b>0</b>)',
+        ),
+      );
+      assert.ok(emptyUi.text.includes('Очередь финансовой сверки пуста'));
+      assert.deepEqual(emptyUi.callbacks, [
+        'adm:reconcile:all:0',
+        'adm:reconcile:orders:0',
+        'adm:reconcile:topups:0',
+        'adm:reconcile:all:0',
+        'adm:home',
+      ]);
+
+      return 'Кнопка «Возвраты / финансовая сверка» доступна в админ-меню, а пустая очередь корректно отображает 0 необработанных записей.';
+    },
+  );
+
+  await runTest(
+    'S252-02',
+    'Security',
+    'Stage 2.5.2 (2/4): Обычный пользователь не получает доступ к разделу «Возвраты / финансовая сверка» и чужим финансовым записям',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      await UserService.upsertFromTelegram(buyer1);
+
+      const now = '2026-11-21T19:00:00.000Z';
+      await firestoreRepo.setDoc<PaymentRecord>('payments', 'pay_ord_secret_252', {
+        paymentId: 'pay_ord_secret_252',
+        kind: 'order',
+        orderId: 'ord_secret_252',
+        userId: 'tg_999888777',
+        userTelegramId: 999888777,
+        provider: 'cryptobot',
+        providerPaymentId: 'cb_secret_ext_252',
+        totalAmount: 1390,
+        expectedUsdCents: 1390,
+        expectedAmountStr: '13.90',
+        actualAmountStr: '13.90',
+        verifiedAmountStr: '13.90',
+        feeUsdCents: 0,
+        netUsdCents: 1390,
+        currency: 'USD',
+        verifiedCurrency: 'USD',
+        invoicePayload: 'pay_ord_secret_252',
+        status: 'refund_required',
+        needsManualReconciliation: true,
+        refundRequired: true,
+        reconciliationState: 'refund_required',
+        reconciliationReason: 'LATE_PAYMENT_ORDER_CANCELLED',
+        confirmedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const buyerHarness = createWiredBotHarness(true);
+      await buyerHarness.sendCallback(buyer1, 'adm:reconcile');
+      assert.equal(
+        buyerHarness.lastUiCall(),
+        undefined,
+        'Обычному пользователю не должно рендериться сообщение финансовой сверки',
+      );
+      assert.ok(
+        buyerHarness
+          .lastAnswer()
+          ?.text.includes('Доступ разрешён только администраторам'),
+      );
+
+      clearCallbackDebounceMap();
+      await buyerHarness.sendCallback(buyer1, 'adm:reconcile:orders:0');
+      assert.equal(buyerHarness.lastUiCall(), undefined);
+
+      clearCallbackDebounceMap();
+      await buyerHarness.sendCallback(buyer1, 'adm:reconcile:topups:0');
+      assert.equal(buyerHarness.lastUiCall(), undefined);
+
+      return 'Доступ обычного пользователя к маршрутам adm:reconcile* строго заблокирован без утечки чужих финансовых записей.';
+    },
+  );
+
+  await runTest(
+    'S252-03',
+    'Payments',
+    'Stage 2.5.2 (3/4): Администратор видит конфликтные платежи заказов (со всеми 11 обязательными полями) и отдельно конфликтные пополнения баланса без автоматического изменения их статусов',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      const adminUser = {
+        id: 777000111,
+        username: 'quizystars_admin',
+        first_name: 'Admin',
+      };
+
+      const orderConfirmedAt = '2026-11-21T19:10:00.000Z';
+      const topUpConfirmedAt = '2026-11-21T19:15:00.000Z';
+
+      await firestoreRepo.setDoc<PaymentRecord>('payments', 'pay_ord_conflict_252', {
+        paymentId: 'pay_ord_conflict_252',
+        kind: 'order',
+        orderId: 'ord_conflict_252',
+        userId: `tg_${buyer1.id}`,
+        userTelegramId: buyer1.id,
+        provider: 'xrocket',
+        providerPaymentId: 'xr_ext_inv_252_01',
+        totalAmount: 1390,
+        expectedUsdCents: 1390,
+        expectedAmountStr: '13.90',
+        actualAmountStr: '13.90',
+        verifiedAmountStr: '13.90',
+        feeUsdCents: 0,
+        netUsdCents: 1390,
+        currency: 'USDT',
+        verifiedCurrency: 'USDT',
+        network: 'TON',
+        verifiedNetwork: 'TON',
+        invoicePayload: 'pay_ord_conflict_252',
+        status: 'refund_required',
+        needsManualReconciliation: true,
+        refundRequired: true,
+        reconciliationState: 'refund_required',
+        reconciliationReason: 'LATE_PAYMENT_SUPERSEDED_INVOICE',
+        supersededByPaymentId: 'pay_ord_new_active_252',
+        confirmedAt: orderConfirmedAt,
+        paidAt: orderConfirmedAt,
+        createdAt: orderConfirmedAt,
+        updatedAt: orderConfirmedAt,
+      });
+
+      await firestoreRepo.setDoc('balance_topups', 'topup_conflict_252', {
+        paymentId: 'topup_conflict_252',
+        userId: `tg_${buyer1.id}`,
+        userTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        externalInvoiceId: 'cb_topup_ext_252_01',
+        amountUsdCents: 2500,
+        feeUsdCents: 75,
+        amountCreditedUsdCents: 2425,
+        amountUsd: 25,
+        amountPaid: 25,
+        feePercent: 3,
+        feeAmount: 0.75,
+        amountCredited: 24.25,
+        currency: 'USDT',
+        expectedAmountStr: '25.00',
+        actualAmountStr: '25.00',
+        verifiedAmountStr: '25.00',
+        verifiedCurrency: 'USDT',
+        verifiedNetwork: 'TRC20',
+        paymentStatus: 'refund_required',
+        needsManualReconciliation: true,
+        refundRequired: true,
+        reconciliationState: 'refund_required',
+        reconciliationReason: 'LATE_TOPUP_CANCELLED_INVOICE',
+        confirmedAt: topUpConfirmedAt,
+        paidAt: topUpConfirmedAt,
+        createdAt: topUpConfirmedAt,
+        updatedAt: topUpConfirmedAt,
+      });
+
+      const adminHarness = createWiredBotHarness(true);
+      await adminHarness.sendCallback(adminUser, 'adm:reconcile');
+      const allViewText = adminHarness.lastUiCall()!.text;
+
+      // Проверяем общее количество необработанных записей
+      assert.ok(
+        allViewText.includes(
+          'Всего необработанных записей: <b>2</b> (платежи заказов: <b>1</b>, пополнения баланса: <b>1</b>)',
+        ),
+      );
+
+      // Проверяем все 11 обязательных полей для PaymentRecord
+      assert.ok(allViewText.includes('paymentId: <code>pay_ord_conflict_252</code>'));
+      assert.ok(allViewText.includes('orderId: <code>ord_conflict_252</code>'));
+      assert.ok(allViewText.includes(`userTelegramId: <code>${buyer1.id}</code>`));
+      assert.ok(allViewText.includes('provider: <code>xrocket</code>'));
+      assert.ok(allViewText.includes('externalInvoiceId: <code>xr_ext_inv_252_01</code>'));
+      assert.ok(allViewText.includes('verifiedAmountStr: <code>13.90</code>'));
+      assert.ok(allViewText.includes('verifiedCurrency: <code>USDT</code>'));
+      assert.ok(allViewText.includes('verifiedNetwork: <code>TON</code>'));
+      assert.ok(
+        allViewText.includes(
+          'reconciliationReason: <code>LATE_PAYMENT_SUPERSEDED_INVOICE</code>',
+        ),
+      );
+      assert.ok(allViewText.includes(`confirmedAt: <code>${orderConfirmedAt}</code>`));
+      assert.ok(
+        allViewText.includes(
+          'supersededByPaymentId: <code>pay_ord_new_active_252</code>',
+        ),
+      );
+
+      // Проверяем отдельный просмотр только заказов (adm:reconcile:orders:0)
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:reconcile:orders:0');
+      const ordersOnlyText = adminHarness.lastUiCall()!.text;
+      assert.ok(ordersOnlyText.includes('pay_ord_conflict_252'));
+      assert.equal(ordersOnlyText.includes('topup_conflict_252'), false);
+
+      // Проверяем отдельный просмотр только конфликтных пополнений баланса (adm:reconcile:topups:0)
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:reconcile:topups:0');
+      const topUpsOnlyText = adminHarness.lastUiCall()!.text;
+      assert.ok(topUpsOnlyText.includes('paymentId: <code>topup_conflict_252</code>'));
+      assert.ok(
+        topUpsOnlyText.includes('externalInvoiceId: <code>cb_topup_ext_252_01</code>'),
+      );
+      assert.ok(topUpsOnlyText.includes('verifiedAmountStr: <code>25.00</code>'));
+      assert.ok(topUpsOnlyText.includes('verifiedCurrency: <code>USDT</code>'));
+      assert.ok(topUpsOnlyText.includes('verifiedNetwork: <code>TRC20</code>'));
+      assert.ok(
+        topUpsOnlyText.includes(
+          'reconciliationReason: <code>LATE_TOPUP_CANCELLED_INVOICE</code>',
+        ),
+      );
+      assert.ok(topUpsOnlyText.includes(`confirmedAt: <code>${topUpConfirmedAt}</code>`));
+      assert.equal(topUpsOnlyText.includes('pay_ord_conflict_252'), false);
+
+      // Статусы в БД не изменились от просмотра
+      const payDoc = await firestoreRepo.getDoc<PaymentRecord>(
+        'payments',
+        'pay_ord_conflict_252',
+      );
+      const topUpDoc = await new BalanceService().getTopUpById('topup_conflict_252');
+      assert.equal(payDoc?.status, 'refund_required');
+      assert.equal(topUpDoc?.paymentStatus, 'refund_required');
+
+      return 'Администратор видит все 11 полей конфликтных платежей заказов и отдельно конфликтные пополнения баланса без мутации финансовых статусов.';
+    },
+  );
+
+  await runTest(
+    'S252-04',
+    'Payments',
+    'Stage 2.5.2 (4/4): Безопасная пагинация и ограничение количества записей — отсутствие дубликатов и пропусков между страницами',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      const adminUser = {
+        id: 777000111,
+        username: 'quizystars_admin',
+        first_name: 'Admin',
+      };
+
+      const expectedOrderPayIds: string[] = [];
+      for (let i = 1; i <= 12; i++) {
+        const pid = `pay_page_ord_${String(i).padStart(2, '0')}`;
+        expectedOrderPayIds.push(pid);
+        const ts = new Date(Date.UTC(2026, 10, 21, 19, 0, i)).toISOString();
+        await firestoreRepo.setDoc<PaymentRecord>('payments', pid, {
+          paymentId: pid,
+          kind: 'order',
+          orderId: `ord_page_${i}`,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: i % 2 === 0 ? 'xrocket' : 'cryptobot',
+          providerPaymentId: `ext_ord_${i}`,
+          totalAmount: 1000 + i,
+          expectedUsdCents: 1000 + i,
+          expectedAmountStr: `10.${String(i).padStart(2, '0')}`,
+          actualAmountStr: `10.${String(i).padStart(2, '0')}`,
+          verifiedAmountStr: `10.${String(i).padStart(2, '0')}`,
+          feeUsdCents: 0,
+          netUsdCents: 1000 + i,
+          currency: 'USD',
+          verifiedCurrency: 'USD',
+          invoicePayload: pid,
+          status: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_PAYMENT_ORDER_CANCELLED',
+          confirmedAt: ts,
+          createdAt: ts,
+          updatedAt: ts,
+        });
+      }
+
+      const expectedTopUpIds: string[] = [];
+      for (let j = 1; j <= 7; j++) {
+        const tid = `topup_page_${String(j).padStart(2, '0')}`;
+        expectedTopUpIds.push(tid);
+        const ts = new Date(Date.UTC(2026, 10, 21, 19, 30, j)).toISOString();
+        await firestoreRepo.setDoc('balance_topups', tid, {
+          paymentId: tid,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: 'cryptobot',
+          externalInvoiceId: `ext_topup_${j}`,
+          amountUsdCents: 2000 + j,
+          feeUsdCents: 60,
+          amountCreditedUsdCents: 1940 + j,
+          amountUsd: 20,
+          amountPaid: 20,
+          feePercent: 3,
+          feeAmount: 0.6,
+          amountCredited: 19.4,
+          currency: 'USD',
+          expectedAmountStr: '20.00',
+          actualAmountStr: '20.00',
+          verifiedAmountStr: '20.00',
+          verifiedCurrency: 'USD',
+          paymentStatus: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_TOPUP_CANCELLED_INVOICE',
+          confirmedAt: ts,
+          createdAt: ts,
+          updatedAt: ts,
+        });
+      }
+
+      const adminHarness = createWiredBotHarness(true);
+      const extractIds = (text: string, prefix: string): string[] => {
+        const regex = new RegExp(`paymentId: <code>(${prefix}[a-zA-Z0-9_]+)</code>`, 'g');
+        const found: string[] = [];
+        let m: RegExpExecArray | null;
+        while ((m = regex.exec(text)) !== null) {
+          found.push(m[1]);
+        }
+        return found;
+      };
+
+      // Пагинация по 12 платежам заказов: 3 страницы (5 + 5 + 2)
+      const seenOrders: string[] = [];
+      const pageCountsOrders: number[] = [];
+      for (const page of [0, 1, 2]) {
+        clearCallbackDebounceMap();
+        await adminHarness.sendCallback(adminUser, `adm:reconcile:orders:${page}`);
+        const ui = adminHarness.lastUiCall()!;
+        assert.ok(
+          ui.text.includes(
+            'Всего необработанных записей: <b>19</b> (платежи заказов: <b>12</b>, пополнения баланса: <b>7</b>)',
+          ),
+        );
+        const idsOnPage = extractIds(ui.text, 'pay_page_ord_');
+        pageCountsOrders.push(idsOnPage.length);
+        for (const id of idsOnPage) {
+          assert.equal(
+            seenOrders.includes(id),
+            false,
+            `Запись ${id} не должна дублироваться на странице ${page}`,
+          );
+          seenOrders.push(id);
+        }
+      }
+      assert.deepEqual(pageCountsOrders, [5, 5, 2]);
+      assert.equal(seenOrders.length, 12);
+      assert.deepEqual([...seenOrders].sort(), [...expectedOrderPayIds].sort());
+
+      // Пагинация по 7 пополнениям баланса: 2 страницы (5 + 2)
+      const seenTopUps: string[] = [];
+      const pageCountsTopUps: number[] = [];
+      for (const page of [0, 1]) {
+        clearCallbackDebounceMap();
+        await adminHarness.sendCallback(adminUser, `adm:reconcile:topups:${page}`);
+        const ui = adminHarness.lastUiCall()!;
+        const idsOnPage = extractIds(ui.text, 'topup_page_');
+        pageCountsTopUps.push(idsOnPage.length);
+        for (const id of idsOnPage) {
+          assert.equal(
+            seenTopUps.includes(id),
+            false,
+            `Запись пополнения ${id} не должна дублироваться на странице ${page}`,
+          );
+          seenTopUps.push(id);
+        }
+      }
+      assert.deepEqual(pageCountsTopUps, [5, 2]);
+      assert.equal(seenTopUps.length, 7);
+      assert.deepEqual([...seenTopUps].sort(), [...expectedTopUpIds].sort());
+
+      return 'Пагинация по конфликтным заказам (5+5+2=12) и пополнениям (5+2=7) работает без пропусков и без дубликатов.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {

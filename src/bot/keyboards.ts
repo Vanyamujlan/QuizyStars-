@@ -592,6 +592,12 @@ export function buildAdminMainKeyboard(isOwner = false) {
       Markup.button.callback('✉️ Написать юзеру', 'adm:msg_user_start'),
       Markup.button.callback('🔌 Интеграции и логи', 'adm:integrations'),
     ],
+    [
+      Markup.button.callback(
+        '⚠️ Возвраты / финансовая сверка',
+        'adm:reconcile',
+      ),
+    ],
   ];
 
   if (isOwner) {
@@ -1027,3 +1033,64 @@ export function buildAdminUserManageKeyboard(user: StoreUser) {
     [Markup.button.callback('⬅️ К пользователям', 'adm:users')],
   ]);
 }
+
+export function buildAdminPaymentReconciliationKeyboard(params: {
+  scope: 'all' | 'orders' | 'topups';
+  page: number;
+  totalPages: number;
+  totalOrderPayments: number;
+  totalTopUps: number;
+}) {
+  const { scope, page, totalPages, totalOrderPayments, totalTopUps } = params;
+  const totalUnprocessed = totalOrderPayments + totalTopUps;
+
+  const filterRow = [
+    Markup.button.callback(
+      `${scope === 'all' ? '🔘' : '⚪'} Все (${totalUnprocessed})`,
+      'adm:reconcile:all:0',
+    ),
+    Markup.button.callback(
+      `${scope === 'orders' ? '🔘' : '⚪'} Заказы (${totalOrderPayments})`,
+      'adm:reconcile:orders:0',
+    ),
+    Markup.button.callback(
+      `${scope === 'topups' ? '🔘' : '⚪'} Пополнения (${totalTopUps})`,
+      'adm:reconcile:topups:0',
+    ),
+  ];
+
+  const rows: Array<Array<ReturnType<typeof Markup.button.callback>>> = [
+    filterRow,
+  ];
+
+  if (totalPages > 1) {
+    const navRow: Array<ReturnType<typeof Markup.button.callback>> = [];
+    if (page > 0) {
+      navRow.push(
+        Markup.button.callback(
+          `⬅️ Стр. ${page}`,
+          `adm:reconcile:${scope}:${page - 1}`,
+        ),
+      );
+    }
+    if (page + 1 < totalPages) {
+      navRow.push(
+        Markup.button.callback(
+          `Стр. ${page + 2} ➡️`,
+          `adm:reconcile:${scope}:${page + 1}`,
+        ),
+      );
+    }
+    if (navRow.length > 0) {
+      rows.push(navRow);
+    }
+  }
+
+  rows.push([
+    Markup.button.callback('🔄 Обновить', `adm:reconcile:${scope}:${page}`),
+    Markup.button.callback('⬅️ В админ-панель', 'adm:home'),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
