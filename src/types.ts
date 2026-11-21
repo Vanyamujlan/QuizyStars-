@@ -28,10 +28,6 @@ export type ProductCategory = 'stars' | 'premium' | 'gifts';
 
 export type FulfillmentType = 'manual' | 'provider_adapter' | 'mystars';
 
-export type FulfillmentProviderType = 'manual' | 'mystars' | 'fragment';
-
-export type FragmentWalletVersion = 'v4r2' | 'v5r1';
-
 export type OrderStatus =
   | 'pending'
   | 'paid'
@@ -239,8 +235,6 @@ export interface Order {
   fulfillmentStatus: OrderStatus;
   telegramPaymentChargeId?: string;
   providerPaymentChargeId?: string;
-  /** Fulfillment provider locked when the order was created ('manual' | 'mystars' | 'fragment') */
-  fulfillmentProvider?: FulfillmentProviderType;
   /** MyStars Stage 4.3/4.4 P&L, wholesale accounting & FaaS v1 order fields */
   grossRevenueUsdCents?: number;
   providerFeeUsdCents?: number;
@@ -362,24 +356,6 @@ export interface MyStarsPollCheckpoint {
   updatedAt: string;
   /** Monotonic administrative reset generation; prevents pre-reset in-flight workers from undoing a reset. */
   resetEpoch?: number;
-}
-
-export interface FragmentAuthSessionRecord {
-  key: 'fragment_auth';
-  walletAddress: string;
-  walletAddressFriendly: string;
-  walletType: FragmentWalletVersion;
-  kycMode: false;
-  apiBaseUrl: string;
-  /** AES-256-GCM encrypted auth_key payload: ivB64:tagB64:ciphertextB64 */
-  encryptedAuthKey: string;
-  /** Non-reversible 8-char sha256 prefix for rotation correlation (never a secret) */
-  keyFingerprint: string;
-  issuedAt: string;
-  lastUsedAt: string;
-  idleExpiresAt: string;
-  maxExpiresAt: string;
-  updatedAt: string;
 }
 
 export interface PaymentRecord {

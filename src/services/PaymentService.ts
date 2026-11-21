@@ -22,7 +22,7 @@ import {
   OrderService,
   normalizeRecipientUsername,
 } from './OrderService.ts';
-import { validateRecipientWithActiveSupplier } from './SupplierValidation.ts';
+import { myStarsClient } from './MyStarsService.ts';
 import { ProductService } from './ProductService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
@@ -214,7 +214,7 @@ export class PaymentService {
       normalizedRecipient &&
       (product.category === 'stars' || product.category === 'premium')
     ) {
-      await validateRecipientWithActiveSupplier({
+      await myStarsClient.validateRecipientBeforeCheckout({
         category: product.category,
         recipientUsername: normalizedRecipient,
         durationMonths:

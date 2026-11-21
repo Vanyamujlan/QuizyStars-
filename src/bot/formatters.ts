@@ -846,43 +846,7 @@ export function formatAdminOrderCard(order: Order): string {
     `${oe('topup')} Оплата: ${formatOrderPaymentMethodLabel(order)}`,
     `${oe('amount')} Сумма: <code>${formatOrderAmountLabel(order)}</code>`,
     `📌 Оплата: ${ORDER_STATUS_LABELS[order.paymentStatus]}`,
-    `🚚 Выдача: ${ORDER_STATUS_LABELS[order.fulfillmentStatus]}${
-      order.fulfillmentProvider
-        ? ` (поставщик: <code>${escapeHtml(order.fulfillmentProvider)}</code>)`
-        : ''
-    }`,
-    order.fragmentOrderId
-      ? `🔷 Fragment ID: <code>${escapeHtml(order.fragmentOrderId)}</code>${
-          order.fragmentOrderStatus
-            ? ` (статус: <b>${escapeHtml(order.fragmentOrderStatus)}</b>)`
-            : ''
-        }${
-          order.fragmentRefId
-            ? ` | ref: <code>${escapeHtml(order.fragmentRefId)}</code>`
-            : ''
-        }`
-      : '',
-    order.fragmentPriceAmount
-      ? `💎 Расход Fragment: <code>${escapeHtml(order.fragmentPriceAmount)} ${(order.fragmentCurrency || 'ton').toUpperCase()}</code>${
-          order.fragmentFeeAmount
-            ? ` (комиссия: <code>${escapeHtml(order.fragmentFeeAmount)}</code>)`
-            : ''
-        }`
-      : '',
-    order.fragmentLastPolledAt
-      ? `🔄 Fragment Polling: проверен <code>${formatDateRu(order.fragmentLastPolledAt)}</code>${
-          order.fragmentPollAttempts ? ` (проверок: ${order.fragmentPollAttempts})` : ''
-        }`
-      : '',
-    order.fragmentUnknownStatusSeen
-      ? `${oe('warning')} Неизвестный статус Fragment: <code>${escapeHtml(order.fragmentUnknownStatusSeen)}</code>`
-      : '',
-    order.fragmentAmbiguousPostAt
-      ? `${oe('warning')} Неопределённый POST Fragment: <code>${formatDateRu(order.fragmentAmbiguousPostAt)}</code> (требуется ручная сверка)`
-      : '',
-    order.fragmentFailureReason
-      ? `${oe('warning')} Ошибка Fragment: ${escapeHtml(order.fragmentFailureReason)}`
-      : '',
+    `🚚 Выдача: ${ORDER_STATUS_LABELS[order.fulfillmentStatus]}`,
     order.mystarsOrderId
       ? `⭐ MyStars ID: <code>${escapeHtml(order.mystarsOrderId)}</code>${
           order.mystarsOrderStatus

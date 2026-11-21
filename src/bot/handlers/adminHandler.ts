@@ -12,7 +12,6 @@ import { ProductService } from '../../services/ProductService.ts';
 import { OrderService } from '../../services/OrderService.ts';
 import { FulfillmentService } from '../../services/FulfillmentService.ts';
 import { myStarsClient } from '../../services/MyStarsService.ts';
-import { fragmentAuthService } from '../../services/FragmentAuthService.ts';
 import { balanceService } from '../../services/BalanceService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
@@ -1420,7 +1419,6 @@ export function registerAdminHandlers(
         : ['• Ошибок платежей или выдачи не зафиксировано ✅'];
 
     const mystarsDiag = myStarsClient.getStatusSummary();
-    const fragmentDiag = fragmentAuthService.getStatusSummary();
 
     const text = [
       '🔌 <b>Статус интеграций и системный монитор</b>',
@@ -1452,13 +1450,6 @@ export function registerAdminHandlers(
         mystarsDiag.configured
           ? `✅ Настроен (ключ: <code>${escapeHtml(mystarsDiag.maskedApiKey)}</code>, режим: <code>polling</code>, интервал: <code>${Math.round(mystarsDiag.pollIntervalMs / 1000)}с</code>, валюта: <code>${escapeHtml(mystarsDiag.paymentCurrency)}</code>)`
           : '⚠️ Не настроен (MYSTARS_API_KEY не задан — активен режим ручной выдачи)'
-      }`,
-      `💠 <b>Поставщик Fragment API v3 (без KYC, Auth-only 4.6.1):</b> ${
-        fragmentDiag.walletConfigured
-          ? `✅ Кошелёк <code>${escapeHtml(fragmentDiag.walletType)}</code> (<code>${escapeHtml(fragmentDiag.walletAddressFriendly || '')}</code>, auth_key: ${
-              fragmentDiag.authenticated ? 'активен' : 'не получен'
-            })`
-          : 'ℹ️ Не настроен (TON_SEED не задан)'
       }`,
       `👑 <b>Администраторов в ADMIN_IDS:</b> ${envConfig.adminIds.length}`,
       '',

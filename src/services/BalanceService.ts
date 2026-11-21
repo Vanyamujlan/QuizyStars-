@@ -25,10 +25,7 @@ import {
   usdInputToCents,
 } from './Money.ts';
 import { normalizeRecipientUsername } from './OrderService.ts';
-import {
-  isActiveSupplierConfigured,
-  validateRecipientWithActiveSupplier,
-} from './SupplierValidation.ts';
+import { myStarsClient } from './MyStarsService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
   PaymentProviderGateway,
@@ -1062,7 +1059,7 @@ export class BalanceService {
 
     if (
       !isAlreadySettled &&
-      isActiveSupplierConfigured() &&
+      myStarsClient.isConfigured() &&
       preProduct &&
       preProduct.isActive
     ) {
@@ -1083,7 +1080,7 @@ export class BalanceService {
         preEffectiveRecipient &&
         (preProduct.category === 'stars' || preProduct.category === 'premium')
       ) {
-        await validateRecipientWithActiveSupplier({
+        await myStarsClient.validateRecipientBeforeCheckout({
           category: preProduct.category,
           recipientUsername: preEffectiveRecipient,
           durationMonths:

@@ -88,11 +88,6 @@ export interface AppConfig {
   mystarsWebhookSecret?: string;
   mystarsCallbackUrl?: string;
   tonWalletAddress: string;
-  /** Supplier switch ('mystars' | 'fragment'), defaults to existing auto MyStars/Manual behavior when unset */
-  fulfillmentProvider?: 'mystars' | 'fragment';
-  fragmentApiUrl: string;
-  fragmentRequestTimeoutMs: number;
-  fragmentWalletVersion: 'v4r2' | 'v5r1';
 }
 
 function parseAdminIds(raw: string | undefined): number[] {
@@ -260,60 +255,7 @@ export function getEnvConfig(): AppConfig {
       'TON_WALLET_ADDRESS',
       process.env.TON_WALLET_ADDRESS,
     ),
-    fulfillmentProvider: (() => {
-      const raw = cleanEnvValue(
-        'FULFILLMENT_PROVIDER',
-        process.env.FULFILLMENT_PROVIDER,
-      ).toLowerCase();
-      if (raw === 'fragment') return 'fragment';
-      if (raw === 'mystars') return 'mystars';
-      return undefined;
-    })(),
-    fragmentApiUrl:
-      cleanEnvValue('FRAGMENT_API_URL', process.env.FRAGMENT_API_URL) ||
-      'https://api.fragment-api.net',
-    fragmentRequestTimeoutMs: (() => {
-      const raw = Number(
-        cleanEnvValue(
-          'FRAGMENT_REQUEST_TIMEOUT_MS',
-          process.env.FRAGMENT_REQUEST_TIMEOUT_MS,
-        ),
-      );
-      if (!Number.isFinite(raw) || raw <= 0) return 15_000;
-      return Math.min(Math.max(Math.round(raw), 3_000), 60_000);
-    })(),
-    fragmentWalletVersion: (() => {
-      const raw = cleanEnvValue(
-        'FRAGMENT_WALLET_VERSION',
-        process.env.FRAGMENT_WALLET_VERSION,
-      ).toLowerCase();
-      return raw === 'v5r1' ? 'v5r1' : 'v4r2';
-    })(),
   };
-}
-
-/**
- * Reads the TON wallet mnemonic seed phrase dynamically from runtime environment variables ONLY.
- * Never caches into serializable AppConfig, never logs, and never stored in .env.example or Firestore.
- */
-export function readFragmentWalletSeedFromEnv(): string {
-  const raw = process.env.TON_SEED ?? process.env.FRAGMENT_WALLET_SEED;
-  if (!raw) return '';
-  let val = raw.trim();
-  const prefixPattern = /^(?:TON_SEED|FRAGMENT_WALLET_SEED)\s*=\s*/i;
-  if (prefixPattern.test(val)) {
-    val = val.replace(prefixPattern, '').trim();
-  }
-  if (
-    (val.startsWith('"') && val.endsWith('"')) ||
-    (val.startsWith("'") && val.endsWith("'"))
-  ) {
-    val = val.slice(1, -1).trim();
-  }
-  if (val.toLowerCase() === 'undefined' || val.toLowerCase() === 'null') {
-    return '';
-  }
-  return val;
 }
 
 export function isAdminTelegramId(telegramId: number | undefined): boolean {

@@ -23,10 +23,6 @@ import {
   MyStarsTransportError,
   myStarsClient,
 } from './MyStarsService.ts';
-import {
-  FragmentApiError,
-  fragmentAuthService,
-} from './FragmentAuthService.ts';
 import { redactSecretsFromText } from './PaymentProviders.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
 import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
@@ -89,29 +85,6 @@ export class ManualAdminFulfillmentAdapter implements FulfillmentProviderAdapter
   }
 }
 
-/**
- * Stage 4.6.1 Preparation Adapter for Fragment API v3 (Auth Only — Option 1).
- * Real Stars/Premium purchases and TON transfers are strictly disabled in Stage 4.6.1.
- */
-export class FragmentPreparationAdapter implements FulfillmentProviderAdapter {
-  public readonly providerName = 'FragmentAPIv3 (Stage 4.6.1: Подготовка и Auth без KYC)';
-  public readonly supportsIdempotency = true;
-
-  public isConfigured(): boolean {
-    return fragmentAuthService.isWalletConfigured();
-  }
-
-  public async requestFulfillment(
-    order: Order,
-  ): Promise<FulfillmentAdapterResult> {
-    throw new FragmentApiError({
-      message: `Покупка через Fragment API v3 для заказа #${order.orderId} отключена на этапе Stage 4.6.1 (подготовлена только авторизация кошелька без транзакций). Переключите FULFILLMENT_PROVIDER=mystars для автовыдачи или выполните заказ вручную.`,
-      code: 'FRAGMENT_PURCHASE_NOT_ENABLED_STAGE_4_6_1',
-      retryable: false,
-    });
-  }
-}
-
 export class MyStarsCheckpointError extends Error {
   public readonly operation: 'load' | 'save';
 
@@ -141,7 +114,6 @@ export class FulfillmentService {
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
   private static myStarsAdapter = new MyStarsFulfillmentAdapter(myStarsClient);
-  private static fragmentPrepAdapter = new FragmentPreparationAdapter();
   private static customAdapterOverride: FulfillmentProviderAdapter | null = null;
   private static recoveryIntervalHandle: ReturnType<typeof setInterval> | null = null;
   private static isRecoveryPassRunning = false;
@@ -788,39 +760,10 @@ export class FulfillmentService {
     if (this.customAdapterOverride) {
       return this.customAdapterOverride;
     }
-    const config = getEnvConfig();
-    if (config.fulfillmentProvider === 'fragment') {
-      return this.fragmentPrepAdapter;
-    }
-    if (config.fulfillmentProvider === 'mystars') {
-      return myStarsClient.isConfigured() ? this.myStarsAdapter : this.manualAdapter;
-    }
     if (myStarsClient.isConfigured()) {
       return this.myStarsAdapter;
     }
     return this.manualAdapter;
-  }
-
-  /**
-   * Resolves the adapter pinned to a specific order so unfinished orders keep using
-   * the supplier recorded on the order even if FULFILLMENT_PROVIDER is switched later.
-   */
-  public static getAdapterForOrder(
-    order?: Pick<Order, 'fulfillmentProvider'>,
-  ): FulfillmentProviderAdapter {
-    if (this.customAdapterOverride) {
-      return this.customAdapterOverride;
-    }
-    if (order?.fulfillmentProvider === 'mystars') {
-      return myStarsClient.isConfigured() ? this.myStarsAdapter : this.manualAdapter;
-    }
-    if (order?.fulfillmentProvider === 'manual') {
-      return this.manualAdapter;
-    }
-    if (order?.fulfillmentProvider === 'fragment') {
-      return this.fragmentPrepAdapter;
-    }
-    return this.getActiveAdapter();
   }
 
   public static getAdapterInfo(): { name: string; configured: boolean } {
@@ -1578,7 +1521,7 @@ export class FulfillmentService {
   ): Promise<Order> {
     const idempotencyKey =
       orderInput.fulfillmentIdempotencyKey || `fulfill_${orderInput.orderId}`;
-    const activeAdapter = this.getAdapterForOrder(orderInput);
+    const activeAdapter = this.getActiveAdapter();
 
     // Stage 3.3: Check if digital keys are available for this product (for ManualAdminFulfillmentAdapter or gifts category)
     if (
@@ -1941,7 +1884,7 @@ export class FulfillmentService {
     );
     const idempotencyKey =
       staleOrder.fulfillmentIdempotencyKey || `fulfill_${staleOrder.orderId}`;
-    const activeAdapter = this.getAdapterForOrder(staleOrder);
+    const activeAdapter = this.getActiveAdapter();
 
     // If MyStars POST /v1/orders crashed or timed out before mystarsOrderId was persisted,
     // attempt bounded reconciliation via GET /v1/orders first.
@@ -2320,14 +2263,8 @@ export class FulfillmentService {
       return summary;
     }
 
-    const pollingAdapter =
-      this.customAdapterOverride ??
-      (myStarsClient.isConfigured() ? this.myStarsAdapter : null);
-    if (
-      !pollingAdapter ||
-      !pollingAdapter.checkExternalStatus ||
-      !pollingAdapter.isConfigured()
-    ) {
+    const activeAdapter = this.getActiveAdapter();
+    if (!activeAdapter.checkExternalStatus || !activeAdapter.isConfigured()) {
       return summary;
     }
 
@@ -2378,8 +2315,6 @@ export class FulfillmentService {
     const budget = Math.max(1, this.pollBatchBudget);
     const pageSize = Math.max(1, this.pollPageSize);
     const isMyStarsCandidate = (ord: Order): boolean =>
-      ord.fulfillmentProvider !== 'fragment' &&
-      ord.fulfillmentProvider !== 'manual' &&
       Boolean(
         ord.mystarsOrderId ||
           (ord.externalExecutionReference &&
@@ -2561,7 +2496,7 @@ export class FulfillmentService {
         }
 
         summary.polled += 1;
-        const extStatus = await pollingAdapter.checkExternalStatus(
+        const extStatus = await activeAdapter.checkExternalStatus(
           latest,
           latest.fulfillmentIdempotencyKey || `fulfill_${latest.orderId}`,
         );
