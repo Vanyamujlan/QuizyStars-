@@ -10,6 +10,7 @@ import {
   BalanceTopUpStatus,
   Order,
   PaymentLockRecord,
+  PaymentReconciliationReason,
   PaymentRecord,
   Product,
   StoreTransaction,
@@ -596,9 +597,23 @@ export class BalanceService {
       };
     }
 
+    if (existingTopUp.paymentStatus === 'refund_required') {
+      const balCents = await this.getBalanceUsdCentsByUserId(existingTopUp.userId);
+      return {
+        ok: false,
+        duplicate: true,
+        status: 'refund_required',
+        topUp: existingTopUp,
+        newBalance: fromMinorUnits(balCents),
+        newBalanceUsdCents: balCents,
+        reason: existingTopUp.reconciliationReason || 'REFUND_REQUIRED',
+      };
+    }
+
     if (
       existingTopUp.paymentStatus === 'failed' ||
-      existingTopUp.paymentStatus === 'underpaid'
+      existingTopUp.paymentStatus === 'underpaid' ||
+      existingTopUp.paymentStatus === 'refunded'
     ) {
       return {
         ok: false,
@@ -636,6 +651,15 @@ export class BalanceService {
       verified.status === 'expired' ||
       (verified.status !== 'paid' && isLocallyExpired)
     ) {
+      if (existingTopUp.paymentStatus === 'expired') {
+        return {
+          ok: false,
+          duplicate: false,
+          status: 'expired',
+          topUp: existingTopUp,
+          reason: 'INVOICE_EXPIRED',
+        };
+      }
       const expiredTopUp = await this.markTopUpTerminalFailure(
         paymentId,
         'expired',
@@ -869,24 +893,24 @@ export class BalanceService {
         };
       }
 
-      if (
-        freshTopUp.paymentStatus !== 'pending' &&
-        freshTopUp.paymentStatus !== 'expired' &&
-        freshTopUp.paymentStatus !== 'cancelled'
-      ) {
+      if (freshTopUp.paymentStatus === 'refund_required') {
+        const balCents = getUserBalanceCentsFromDoc(userSnap);
         return {
           ok: false,
-          duplicate: false,
-          status: freshTopUp.paymentStatus,
+          duplicate: true,
+          status: 'refund_required',
           topUp: freshTopUp,
-          reason: `TOPUP_ALREADY_${freshTopUp.paymentStatus.toUpperCase()}`,
+          newBalance: fromMinorUnits(balCents),
+          newBalanceUsdCents: balCents,
+          reason: freshTopUp.reconciliationReason || 'REFUND_REQUIRED',
         };
       }
 
       if (
         existingLock &&
         (existingLock.targetType !== 'topup' ||
-          existingLock.targetId !== freshTopUp.paymentId)
+          existingLock.targetId !== freshTopUp.paymentId ||
+          existingLock.paymentId !== freshTopUp.paymentId)
       ) {
         throw new Error(
           `PAYMENT_LOCK_CONFLICT: внешний инвойс ${freshTopUp.externalInvoiceId} уже использован для ${existingLock.targetType}:${existingLock.targetId}.`,
@@ -898,14 +922,108 @@ export class BalanceService {
         freshTopUp.amountUsdCents,
         freshTopUp.provider,
       );
-      if (
+      const hasCommissionConflict =
         freshTopUp.amountCreditedUsdCents !== expectedCalc.amountCreditedUsdCents ||
         freshTopUp.feeUsdCents !== expectedCalc.feeUsdCents ||
-        freshTopUp.feeBps !== expectedCalc.feeBps
+        freshTopUp.feeBps !== expectedCalc.feeBps;
+
+      const isTopUpCancelled = freshTopUp.paymentStatus === 'cancelled';
+      const isUserBlocked = Boolean(userSnap?.isBlocked);
+      const isTopUpIncompatibleStatus =
+        freshTopUp.paymentStatus !== 'pending' &&
+        freshTopUp.paymentStatus !== 'expired';
+
+      if (
+        isTopUpCancelled ||
+        isUserBlocked ||
+        isTopUpIncompatibleStatus ||
+        hasCommissionConflict
       ) {
-        throw new Error(
-          `Обнаружено нарушение целостности расчёта комиссии для счёта ${paymentId}. Зачисление заблокировано.`,
-        );
+        const conflictNow = new Date().toISOString();
+        const currentBalanceCents = getUserBalanceCentsFromDoc(userSnap);
+        let reconciliationReason: PaymentReconciliationReason;
+        if (isTopUpCancelled) {
+          reconciliationReason = 'LATE_TOPUP_CANCELLED_INVOICE';
+        } else if (isUserBlocked) {
+          reconciliationReason = 'TOPUP_USER_BLOCKED';
+        } else if (hasCommissionConflict) {
+          reconciliationReason = 'TOPUP_COMMISSION_INTEGRITY_CONFLICT';
+        } else {
+          reconciliationReason = 'TOPUP_INCOMPATIBLE_STATE';
+        }
+
+        const resolvedNet = verifiedNet || expectedNet || undefined;
+        const providerTitle =
+          PAYMENT_PROVIDER_CATALOG[freshTopUp.provider]?.shortTitle ||
+          freshTopUp.provider;
+        const netSuffix = resolvedNet ? ` [${resolvedNet}]` : '';
+        const reconciliationDetails =
+          `Подтверждена оплата счёта пополнения ${freshTopUp.paymentId} (${providerTitle}, ext=${freshTopUp.externalInvoiceId}): получено ${verifiedStr} ${verifiedCurr}${netSuffix}, но безопасное зачисление на баланс невозможно (статус="${freshTopUp.paymentStatus}", причина=${reconciliationReason}). Требуется возврат средств или ручная финансовая сверка.`;
+
+        const reconciliationTopUp: BalanceTopUpRecord = {
+          ...freshTopUp,
+          paymentStatus: 'refund_required',
+          actualAmountStr: verifiedStr,
+          verifiedAmountStr: verifiedStr,
+          verifiedCurrency: verifiedCurr,
+          ...(resolvedNet ? { verifiedNetwork: resolvedNet } : {}),
+          paidAt: verified.paidAt || conflictNow,
+          confirmedAt: conflictNow,
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason,
+          statusReason: reconciliationDetails,
+          failureReason: reconciliationReason,
+          updatedAt: conflictNow,
+        };
+
+        const conflictLock: PaymentLockRecord = {
+          lockId,
+          provider: freshTopUp.provider,
+          providerPaymentId: String(freshTopUp.externalInvoiceId),
+          targetType: 'topup',
+          targetId: freshTopUp.paymentId,
+          paymentId: freshTopUp.paymentId,
+          userId: freshTopUp.userId,
+          amountUsdCents: freshTopUp.amountUsdCents,
+          claimedAt: conflictNow,
+        };
+
+        const conflictTxId = sanitizeDocId(`tx_topup_refund_req_${paymentId}`);
+        const conflictTxRecord: StoreTransaction = {
+          transactionId: conflictTxId,
+          orderId: paymentId,
+          userId: freshTopUp.userId,
+          paymentId: freshTopUp.paymentId,
+          provider: freshTopUp.provider,
+          externalInvoiceId: String(freshTopUp.externalInvoiceId),
+          verifiedAmountStr: verifiedStr,
+          verifiedCurrency: verifiedCurr,
+          ...(resolvedNet ? { network: resolvedNet } : {}),
+          reconciliationReason,
+          confirmedAt: conflictNow,
+          type: 'payment_refund_required',
+          amount: freshTopUp.amountUsdCents,
+          amountUsdCents: freshTopUp.amountUsdCents,
+          currency: 'USD',
+          details: reconciliationDetails,
+          createdAt: conflictNow,
+        };
+
+        tx.set<PaymentLockRecord>('payment_locks', lockId, conflictLock);
+        tx.set<BalanceTopUpRecord>('balance_topups', paymentId, reconciliationTopUp);
+        tx.set<StoreTransaction>('transactions', conflictTxId, conflictTxRecord);
+
+        return {
+          ok: false,
+          duplicate: false,
+          status: 'refund_required',
+          topUp: reconciliationTopUp,
+          newBalance: fromMinorUnits(currentBalanceCents),
+          newBalanceUsdCents: currentBalanceCents,
+          reason: reconciliationReason,
+        };
       }
 
       const now = new Date().toISOString();
@@ -913,6 +1031,7 @@ export class BalanceService {
       const newBalanceCents = currentBalanceCents + freshTopUp.amountCreditedUsdCents;
       const newBalanceUsd = fromMinorUnits(newBalanceCents);
       const terminalPaidStatus: BalanceTopUpStatus = isOverpaid ? 'overpaid' : 'paid';
+      const resolvedNet = verifiedNet || expectedNet || undefined;
 
       const updatedUser: StoreUser = userSnap
         ? {
@@ -940,6 +1059,9 @@ export class BalanceService {
         ...freshTopUp,
         paymentStatus: terminalPaidStatus,
         actualAmountStr: verifiedStr,
+        verifiedAmountStr: verifiedStr,
+        verifiedCurrency: verifiedCurr,
+        ...(resolvedNet ? { verifiedNetwork: resolvedNet } : {}),
         statusReason: isOverpaid
           ? `Переплата (${verifiedStr} > ${expectedStr}); на баланс зачислена строго сумма по тарифу ${formatUsdCents(freshTopUp.amountCreditedUsdCents)}.`
           : undefined,
@@ -1002,7 +1124,11 @@ export class BalanceService {
       if (!fresh) {
         throw new Error(`Счёт пополнения ${paymentId} не найден.`);
       }
-      if (fresh.paymentStatus === 'paid' || fresh.paymentStatus === 'overpaid') {
+      if (
+        fresh.paymentStatus === 'paid' ||
+        fresh.paymentStatus === 'overpaid' ||
+        fresh.paymentStatus === 'refund_required'
+      ) {
         return fresh;
       }
       const now = new Date().toISOString();
@@ -1374,6 +1500,7 @@ export class BalanceService {
           ...prevExternalPayment,
           status: 'cancelled',
           failureReason: 'PAID_WITH_INTERNAL_BALANCE',
+          supersededByPaymentId: balancePaymentId,
           updatedAt: now,
         });
       }

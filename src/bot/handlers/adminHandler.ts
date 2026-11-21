@@ -306,6 +306,7 @@ export function registerAdminHandlers(
           ? allTopUps.filter(
               (t) =>
                 t.paymentStatus === 'failed' ||
+                t.paymentStatus === 'refund_required' ||
                 t.paymentStatus === 'underpaid' ||
                 t.paymentStatus === 'expired' ||
                 t.paymentStatus === 'cancelled',

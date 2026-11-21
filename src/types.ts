@@ -64,7 +64,8 @@ export type BalanceTopUpStatus =
   | 'expired'
   | 'cancelled'
   | 'failed'
-  | 'refunded';
+  | 'refunded'
+  | 'refund_required';
 
 export type PaymentRecordStatus =
   | 'pending'
@@ -74,7 +75,19 @@ export type PaymentRecordStatus =
   | 'expired'
   | 'cancelled'
   | 'failed'
-  | 'refunded';
+  | 'refunded'
+  | 'refund_required';
+
+export type PaymentReconciliationReason =
+  | 'LATE_PAYMENT_SUPERSEDED_INVOICE'
+  | 'LATE_PAYMENT_ORDER_ALREADY_PAID'
+  | 'LATE_PAYMENT_ORDER_CANCELLED'
+  | 'LATE_PAYMENT_ORDER_REFUNDED'
+  | 'LATE_PAYMENT_ORDER_INCOMPATIBLE_STATE'
+  | 'LATE_TOPUP_CANCELLED_INVOICE'
+  | 'TOPUP_USER_BLOCKED'
+  | 'TOPUP_COMMISSION_INTEGRITY_CONFLICT'
+  | 'TOPUP_INCOMPATIBLE_STATE';
 
 export type OrderPaymentMethod =
   | 'cryptobot'
@@ -112,6 +125,9 @@ export interface BalanceTopUpRecord {
   expectedAmountStr: string;
   /** Actual amount reported by provider upon payment (if any) */
   actualAmountStr?: string;
+  verifiedAmountStr?: string;
+  verifiedCurrency?: string;
+  verifiedNetwork?: string;
   /** Legacy numeric mirrors derived from cents/strings */
   amountUsd?: number;
   amountPaid: number;
@@ -131,6 +147,10 @@ export interface BalanceTopUpRecord {
   payUrl?: string;
   recipientMerchantId?: string;
   failureReason?: string;
+  needsManualReconciliation?: boolean;
+  refundRequired?: boolean;
+  reconciliationState?: 'refund_required' | 'manual_reconciliation' | 'resolved';
+  reconciliationReason?: PaymentReconciliationReason | string;
   expiresAt?: string;
   createdAt: string;
   paidAt?: string;
@@ -423,6 +443,9 @@ export interface PaymentRecord {
   netUsdCents: number;
   expectedAmountStr: string;
   actualAmountStr?: string;
+  verifiedAmountStr?: string;
+  verifiedCurrency?: string;
+  verifiedNetwork?: string;
   exchangeRateUsdStr?: string;
   currency: string;
   network?: string;
@@ -431,6 +454,13 @@ export interface PaymentRecord {
   status: PaymentRecordStatus;
   statusReason?: string;
   failureReason?: string;
+  needsManualReconciliation?: boolean;
+  refundRequired?: boolean;
+  reconciliationState?: 'refund_required' | 'manual_reconciliation' | 'resolved';
+  reconciliationReason?: PaymentReconciliationReason | string;
+  conflictingOrderStatus?: OrderStatus;
+  conflictingFulfillmentStatus?: OrderStatus;
+  supersededByPaymentId?: string;
   expiresAt?: string;
   paidAt?: string;
   confirmedAt?: string;
@@ -467,6 +497,7 @@ export type TransactionType =
   | 'fulfillment_retry'
   | 'order_cancelled'
   | 'payment_refunded'
+  | 'payment_refund_required'
   | 'balance_topup_created'
   | 'balance_topup_paid'
   | 'balance_topup_underpaid'
@@ -488,6 +519,15 @@ export interface StoreTransaction {
   transactionId: string;
   orderId: string;
   userId: string;
+  paymentId?: string;
+  supersededByPaymentId?: string;
+  provider?: PaymentProviderType;
+  externalInvoiceId?: string;
+  verifiedAmountStr?: string;
+  verifiedCurrency?: string;
+  network?: string;
+  reconciliationReason?: PaymentReconciliationReason | string;
+  confirmedAt?: string;
   type: TransactionType;
   amount: number;
   amountUsdCents?: number;

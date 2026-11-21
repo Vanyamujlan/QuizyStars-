@@ -383,6 +383,7 @@ export function formatOrderPaymentInvoiceMessage(
     expired: `${oe('warning')} Срок действия истёк`,
     cancelled: `${oe('error')} Отменён`,
     failed: `${oe('error')} Ошибка оплаты`,
+    refund_required: `${oe('warning')} Оплачен по неактуальному счёту — требуется возврат / сверка`,
   };
 
   return [
@@ -563,6 +564,7 @@ export function formatTopUpInvoiceCardMessage(
     cancelled: `${oe('error')} Отменён`,
     expired: `${oe('warning')} Срок действия истёк`,
     failed: `${oe('warning')} Ошибка проверки платежа`,
+    refund_required: `${oe('warning')} Оплачен по неактуальному счёту — требуется возврат / сверка`,
   };
 
   const grossCents =

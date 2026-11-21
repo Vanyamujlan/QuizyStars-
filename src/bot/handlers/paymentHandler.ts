@@ -676,6 +676,12 @@ export function registerPaymentHandlers(bot: Telegraf): void {
           'Оплата ещё не поступила. Завершите платёж и повторите проверку.',
           true,
         );
+      } else if (verifyRes.status === 'refund_required') {
+        await safeAnswerCbQuery(
+          ctx,
+          'Оплата по неактуальному счёту зафиксирована и передана на возврат / финансовую сверку.',
+          true,
+        );
       } else {
         await safeAnswerCbQuery(
           ctx,

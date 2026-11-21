@@ -918,6 +918,12 @@ export function registerUserHandlers(bot: Telegraf): void {
           'Оплата ещё не поступила. Завершите платёж по ссылке и повторите проверку.',
           true,
         );
+      } else if (verifyRes.status === 'refund_required') {
+        await safeAnswerCbQuery(
+          ctx,
+          'Оплата зафиксирована, счёт передан на возврат / ручную финансовую сверку.',
+          true,
+        );
       } else {
         await safeAnswerCbQuery(
           ctx,

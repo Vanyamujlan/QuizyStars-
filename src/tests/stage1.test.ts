@@ -16031,6 +16031,934 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  // =========================================================================
+  // STAGE 2.5.1 — LATE PAYMENT FINANCIAL RECONCILIATION (S251-01 .. S251-05)
+  // =========================================================================
+
+  await runTest(
+    'S251-01',
+    'Security',
+    'Stage 2.5.1 (A — CryptoBot): Поздняя оплата вытесненного инвойса, оплата старого инвойса после оплаты заказа другим способом и дубликат webhook переводят платёж в refund_required без двойной выдачи и потери данных о деньгах',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        balanceUsdCents: 5000,
+        balance: 50,
+      });
+
+      let cbSeq = 1000;
+      const paidExternalInvoices = new Set<string>();
+      const payloadByExtId = new Map<string, string>();
+      const transport = async (
+        req: HttpTransportRequest,
+      ): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/createInvoice')) {
+          cbSeq++;
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          const extId = `cb_251_${cbSeq}`;
+          const payload = String(body.payload || '');
+          payloadByExtId.set(extId, payload);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                invoice_id: extId,
+                status: 'active',
+                amount: String(body.amount),
+                fiat: String(body.fiat || 'USD'),
+                currency_type: 'fiat',
+                bot_invoice_url: `https://t.me/CryptoBot?start=${extId}`,
+                payload,
+              },
+            },
+          };
+        }
+        if (req.url.endsWith('/getExchangeRates')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: [
+                {
+                  source: 'USDT',
+                  target: 'USD',
+                  rate: '1.00',
+                  is_valid: true,
+                },
+              ],
+            },
+          };
+        }
+        if (req.url.includes('/getInvoices')) {
+          const parsedUrl = new URL(req.url);
+          const extId = parsedUrl.searchParams.get('invoice_ids') || '';
+          const isPaid = paidExternalInvoices.has(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                items: [
+                  {
+                    invoice_id: extId,
+                    status: isPaid ? 'paid' : 'active',
+                    amount: '13.90',
+                    paid_amount: isPaid ? '13.90' : undefined,
+                    fiat: 'USD',
+                    currency_type: 'fiat',
+                    paid_asset: 'USDT',
+                    paid_at: '2026-11-21T18:00:00.000Z',
+                    payload: payloadByExtId.get(extId) || '',
+                  },
+                ],
+              },
+            },
+          };
+        }
+        return { status: 200, ok: true, json: {} };
+      };
+
+      const gw = new PaymentProviderGateway(transport, TEST_MOCK_CREDS);
+      const ps = new PaymentService('s251-01', gw);
+      const bs = new BalanceService(gw);
+
+      // 1. Покупатель создаёт заказ, выпускает CryptoBot инвойс #1 (USD), затем заменяет его на новый инвойс #2 (USDT),
+      //    после чего всё же оплачивает старый вытесненный инвойс #1 в CryptoBot.
+      const ord1 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@QuizyReceiver',
+      });
+      const inv1 = await ps.createOrReuseOrderPayment({
+        orderId: ord1.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USD',
+      });
+      const inv2 = await ps.createOrReuseOrderPayment({
+        orderId: ord1.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USDT',
+      });
+      assert.notEqual(inv1.payment.paymentId, inv2.payment.paymentId);
+
+      const inv1AfterReplace = await firestoreRepo.getDoc<PaymentRecord>(
+        'payments',
+        inv1.payment.paymentId,
+      );
+      assert.equal(inv1AfterReplace?.status, 'cancelled');
+      assert.equal(inv1AfterReplace?.failureReason, 'SUPERSEDED_BY_NEW_INVOICE');
+      assert.equal(inv1AfterReplace?.supersededByPaymentId, inv2.payment.paymentId);
+
+      // Покупатель оплачивает старый вытесненный инвойс #1
+      paidExternalInvoices.add(inv1.payment.providerPaymentId!);
+      const lateSupersededRes = await ps.verifyAndProcessOrderPayment(
+        inv1.payment.paymentId,
+      );
+      assert.equal(lateSupersededRes.ok, false);
+      assert.equal(lateSupersededRes.duplicate, false);
+      assert.equal(lateSupersededRes.needsFulfillmentRecovery, false);
+      assert.equal(lateSupersededRes.status, 'refund_required');
+      assert.equal(lateSupersededRes.reason, 'LATE_PAYMENT_SUPERSEDED_INVOICE');
+
+      const inv1Reconciled = await firestoreRepo.getDoc<PaymentRecord>(
+        'payments',
+        inv1.payment.paymentId,
+      );
+      assert.equal(inv1Reconciled?.status, 'refund_required');
+      assert.equal(inv1Reconciled?.needsManualReconciliation, true);
+      assert.equal(inv1Reconciled?.refundRequired, true);
+      assert.equal(inv1Reconciled?.reconciliationState, 'refund_required');
+      assert.equal(
+        inv1Reconciled?.reconciliationReason,
+        'LATE_PAYMENT_SUPERSEDED_INVOICE',
+      );
+      assert.equal(inv1Reconciled?.supersededByPaymentId, inv2.payment.paymentId);
+      assert.equal(inv1Reconciled?.verifiedAmountStr, '13.90');
+      assert.equal(inv1Reconciled?.verifiedCurrency, 'USD');
+      assert.equal(inv1Reconciled?.paidAt, '2026-11-21T18:00:00.000Z');
+      assert.ok(inv1Reconciled?.confirmedAt);
+
+      // Заказ ord1 НЕ перешёл в paid от вытесненного счёта и не отправился в выдачу
+      const ord1AfterSupersededPay = await OrderService.getOrderById(ord1.orderId);
+      assert.equal(ord1AfterSupersededPay?.paymentStatus, 'pending');
+      assert.equal(ord1AfterSupersededPay?.fulfillmentStatus, 'pending');
+      assert.equal(ord1AfterSupersededPay?.activePaymentId, inv2.payment.paymentId);
+
+      // 2. Второй заказ ord2 оплачивается с внутреннего баланса, а затем приходит оплата по его старому CryptoBot счёту.
+      const ord2 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@QuizyReceiver',
+      });
+      const ord2OldInv = await ps.createOrReuseOrderPayment({
+        orderId: ord2.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USD',
+      });
+      const ord2PaidBal = await bs.purchaseWithInternalBalance({
+        telegramId: buyer1.id,
+        productId: 'premium_3m',
+        quantity: 1,
+        orderId: ord2.orderId,
+        recipientUsername: '@QuizyReceiver',
+      });
+      assert.equal(ord2PaidBal.order.paymentStatus, 'paid');
+      const userAfterBalPay = await UserService.getUserByTelegramId(buyer1.id);
+      assert.equal(userAfterBalPay?.totalOrders, 1);
+      assert.equal(userAfterBalPay?.totalSpentUsdCents, 1390);
+
+      // Позже покупатель всё равно оплачивает старый CryptoBot счёт ord2OldInv
+      paidExternalInvoices.add(ord2OldInv.payment.providerPaymentId!);
+      const lateAlreadyPaidRes = await ps.verifyAndProcessOrderPayment(
+        ord2OldInv.payment.paymentId,
+      );
+      assert.equal(lateAlreadyPaidRes.ok, false);
+      assert.equal(lateAlreadyPaidRes.duplicate, false);
+      assert.equal(lateAlreadyPaidRes.needsFulfillmentRecovery, false);
+      assert.equal(lateAlreadyPaidRes.status, 'refund_required');
+      assert.equal(lateAlreadyPaidRes.reason, 'LATE_PAYMENT_ORDER_ALREADY_PAID');
+
+      const ord2OldInvAfter = await firestoreRepo.getDoc<PaymentRecord>(
+        'payments',
+        ord2OldInv.payment.paymentId,
+      );
+      assert.equal(ord2OldInvAfter?.status, 'refund_required');
+      assert.equal(
+        ord2OldInvAfter?.reconciliationReason,
+        'LATE_PAYMENT_ORDER_ALREADY_PAID',
+      );
+      assert.equal(ord2OldInvAfter?.conflictingOrderStatus, 'paid');
+      assert.equal(ord2OldInvAfter?.verifiedAmountStr, '13.90');
+
+      // Внутренний баланс и счётчик покупок пользователя НЕ изменились повторно
+      const userAfterLatePay = await UserService.getUserByTelegramId(buyer1.id);
+      assert.equal(userAfterLatePay?.totalOrders, 1);
+      assert.equal(userAfterLatePay?.totalSpentUsdCents, 1390);
+      assert.equal(userAfterLatePay?.balanceUsdCents, 5000 - 1390);
+
+      // 3. Повторный (дублирующий) webhook для старого инвойса идемпотентен
+      const dupRes = await ps.verifyAndProcessOrderPayment(
+        ord2OldInv.payment.paymentId,
+      );
+      assert.equal(dupRes.ok, false);
+      assert.equal(dupRes.duplicate, true);
+      assert.equal(dupRes.needsFulfillmentRecovery, false);
+      assert.equal(dupRes.status, 'refund_required');
+
+      const allTxs = await firestoreRepo.listDocs<StoreTransaction>('transactions');
+      const refundReqTxsForOrd2 = allTxs.filter(
+        (t: StoreTransaction) =>
+          t.type === 'payment_refund_required' &&
+          t.paymentId === ord2OldInv.payment.paymentId,
+      );
+      assert.equal(
+        refundReqTxsForOrd2.length,
+        1,
+        'Должна быть создана строго одна аудиторская транзакция payment_refund_required на конфликтующий платёж',
+      );
+      assert.equal(
+        refundReqTxsForOrd2[0].externalInvoiceId,
+        ord2OldInv.payment.providerPaymentId,
+      );
+      assert.equal(refundReqTxsForOrd2[0].verifiedAmountStr, '13.90');
+
+      return 'CryptoBot: поздняя оплата вытесненного счёта и уже оплаченного заказа переводит PaymentRecord в refund_required с сохранением всех данных платежа и идемпотентностью.';
+    },
+  );
+
+  await runTest(
+    'S251-02',
+    'Security',
+    'Stage 2.5.1 (B — xRocket): Поздняя оплата вытесненного xRocket инвойса, оплата после закрытия заказа другим инвойсом и дубликат webhook',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+
+      let xrSeq = 2000;
+      const paidXrInvoices = new Set<string>();
+      const payloadByXrId = new Map<string, string>();
+      const transport = async (
+        req: HttpTransportRequest,
+      ): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/api/v1/currencies')) {
+          return {
+            status: 200,
+            ok: true,
+            json: [{ currency: 'USDT', networks: ['TON', 'TRC-20'] }],
+          };
+        }
+        if (req.url.endsWith('/api/v1/rates')) {
+          return { status: 200, ok: true, json: { data: { USDT: '1.00', TON: '5.00' } } };
+        }
+        if (req.url.endsWith('/api/v1/invoices') && req.method === 'POST') {
+          xrSeq++;
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          const extId = `xr_251_${xrSeq}`;
+          const clientInvId = String(body.clientInvoiceId || '');
+          payloadByXrId.set(extId, clientInvId);
+          return {
+            status: 201,
+            ok: true,
+            json: {
+              id: extId,
+              priceAmount: String(body.priceAmount),
+              priceCurrency: 'USDT',
+              status: 'PENDING',
+              clientInvoiceId: clientInvId,
+              links: { telegramBotLink: `https://t.me/xrocket?start=${extId}` },
+            },
+          };
+        }
+        if (req.url.includes('/api/v1/invoice')) {
+          return {
+            status: 200,
+            ok: true,
+            json: Array.from(payloadByXrId.entries()).map(([extId, clientInvId]) => {
+              const isPaid = paidXrInvoices.has(extId);
+              return {
+                id: extId,
+                priceAmount: '13.90',
+                paidAmount: isPaid ? '13.90' : undefined,
+                priceCurrency: 'USDT',
+                network: 'TON',
+                status: isPaid ? 'PAID' : 'PENDING',
+                clientInvoiceId: clientInvId,
+                paidAt: isPaid ? '2026-11-21T18:10:00.000Z' : undefined,
+              };
+            }),
+          };
+        }
+        return { status: 200, ok: true, json: {} };
+      };
+
+      const gw = new PaymentProviderGateway(transport, TEST_MOCK_CREDS);
+      const ps = new PaymentService('s251-02', gw);
+
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@QuizyReceiver',
+      });
+
+      // Создаём xRocket инвойс #1 (USDT/TON), затем заменяем его на новый инвойс #2 (USDT/TON после истечения первого)
+      const xrInv1 = await ps.createOrReuseOrderPayment({
+        orderId: order.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'xrocket',
+        currency: 'USDT',
+        network: 'TON',
+      });
+      await firestoreRepo.updateDoc<PaymentRecord>(
+        'payments',
+        xrInv1.payment.paymentId,
+        {
+          expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        },
+      );
+      const xrInv2 = await ps.createOrReuseOrderPayment({
+        orderId: order.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'xrocket',
+        currency: 'USDT',
+        network: 'TON',
+      });
+      assert.notEqual(xrInv1.payment.paymentId, xrInv2.payment.paymentId);
+
+      // 1. Оплата старого вытесненного xRocket инвойса #1 пока заказ ещё pending
+      paidXrInvoices.add(xrInv1.payment.providerPaymentId!);
+      const resSuperseded = await ps.verifyAndProcessOrderPayment(
+        xrInv1.payment.paymentId,
+      );
+      assert.equal(resSuperseded.ok, false);
+      assert.equal(resSuperseded.duplicate, false);
+      assert.equal(resSuperseded.status, 'refund_required');
+      assert.equal(resSuperseded.reason, 'LATE_PAYMENT_SUPERSEDED_INVOICE');
+
+      const xrInv1Doc = await firestoreRepo.getDoc<PaymentRecord>(
+        'payments',
+        xrInv1.payment.paymentId,
+      );
+      assert.equal(xrInv1Doc?.status, 'refund_required');
+      assert.equal(xrInv1Doc?.verifiedCurrency, 'USDT');
+      assert.equal(xrInv1Doc?.verifiedNetwork, 'TON');
+      assert.equal(xrInv1Doc?.verifiedAmountStr, '13.90');
+      assert.equal(xrInv1Doc?.supersededByPaymentId, xrInv2.payment.paymentId);
+
+      // 2. Оплата актуального xRocket инвойса #2 успешно переводит заказ в paid
+      paidXrInvoices.add(xrInv2.payment.providerPaymentId!);
+      const resActive = await ps.verifyAndProcessOrderPayment(
+        xrInv2.payment.paymentId,
+      );
+      assert.equal(resActive.ok, true);
+      assert.equal(resActive.order?.paymentStatus, 'paid');
+
+      // 3. Второй сценарий xRocket: старый xRocket инвойс оплачен ПОСЛЕ того, как заказ уже оплачен другим счётом
+      const order2 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@QuizyReceiver',
+      });
+      const xrOld = await ps.createOrReuseOrderPayment({
+        orderId: order2.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'xrocket',
+        currency: 'USDT',
+        network: 'TON',
+      });
+      await firestoreRepo.updateDoc<PaymentRecord>(
+        'payments',
+        xrOld.payment.paymentId,
+        {
+          expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        },
+      );
+      const xrNew = await ps.createOrReuseOrderPayment({
+        orderId: order2.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'xrocket',
+        currency: 'USDT',
+        network: 'TON',
+      });
+
+      // Сначала оплачивается новый актуальный счёт xrNew
+      paidXrInvoices.add(xrNew.payment.providerPaymentId!);
+      const paidNewRes = await ps.verifyAndProcessOrderPayment(
+        xrNew.payment.paymentId,
+      );
+      assert.equal(paidNewRes.ok, true);
+      assert.equal(paidNewRes.order?.paymentStatus, 'paid');
+
+      // Затем приходит поздняя оплата по старому счёту xrOld
+      paidXrInvoices.add(xrOld.payment.providerPaymentId!);
+      const lateOldRes = await ps.verifyAndProcessOrderPayment(
+        xrOld.payment.paymentId,
+      );
+      assert.equal(lateOldRes.ok, false);
+      assert.equal(lateOldRes.duplicate, false);
+      assert.equal(lateOldRes.needsFulfillmentRecovery, false);
+      assert.equal(lateOldRes.status, 'refund_required');
+      assert.equal(lateOldRes.reason, 'LATE_PAYMENT_ORDER_ALREADY_PAID');
+
+      // Дубликат webhook для xrOld
+      const dupOldRes = await ps.verifyAndProcessOrderPayment(
+        xrOld.payment.paymentId,
+      );
+      assert.equal(dupOldRes.ok, false);
+      assert.equal(dupOldRes.duplicate, true);
+      assert.equal(dupOldRes.status, 'refund_required');
+
+      const allTxs = await firestoreRepo.listDocs<StoreTransaction>('transactions');
+      const xrOldTxs = allTxs.filter(
+        (t: StoreTransaction) =>
+          t.type === 'payment_refund_required' &&
+          t.paymentId === xrOld.payment.paymentId,
+      );
+      assert.equal(xrOldTxs.length, 1);
+      assert.equal(xrOldTxs[0].network, 'TON');
+      assert.equal(xrOldTxs[0].provider, 'xrocket');
+
+      return 'xRocket: поздняя оплата вытесненного инвойса и уже оплаченного заказа фиксируется в refund_required с сохранением сети TON, суммы и защитой от дубликатов.';
+    },
+  );
+
+  await runTest(
+    'S251-03',
+    'Security',
+    'Stage 2.5.1 (C — Отмена и возврат заказа): Заказ отменён или возвращён, но старый внешний инвойс всё равно оплачен — фиксация refund_required без активации заказа и без вызова MyStars',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        balanceUsdCents: 5000,
+        balance: 50,
+      });
+
+      let cbSeq = 3000;
+      const paidInvoices = new Set<string>();
+      const payloadByExtId = new Map<string, string>();
+      const transport = async (
+        req: HttpTransportRequest,
+      ): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/createInvoice')) {
+          cbSeq++;
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          const extId = `cb_cancel_${cbSeq}`;
+          const payload = String(body.payload || '');
+          payloadByExtId.set(extId, payload);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                invoice_id: extId,
+                status: 'active',
+                amount: String(body.amount),
+                fiat: 'USD',
+                currency_type: 'fiat',
+                bot_invoice_url: `https://t.me/CryptoBot?start=${extId}`,
+                payload,
+              },
+            },
+          };
+        }
+        const parsedUrl = new URL(req.url);
+        const extId = parsedUrl.searchParams.get('invoice_ids') || '';
+        const isPaid = paidInvoices.has(extId);
+        return {
+          status: 200,
+          ok: true,
+          json: {
+            ok: true,
+            result: {
+              items: [
+                {
+                  invoice_id: extId,
+                  status: isPaid ? 'paid' : 'active',
+                  amount: '13.90',
+                  paid_amount: isPaid ? '13.90' : undefined,
+                  fiat: 'USD',
+                  currency_type: 'fiat',
+                  paid_at: '2026-11-21T18:20:00.000Z',
+                  payload: payloadByExtId.get(extId) || '',
+                },
+              ],
+            },
+          },
+        };
+      };
+
+      const gw = new PaymentProviderGateway(transport, TEST_MOCK_CREDS);
+      const ps = new PaymentService('s251-03', gw);
+      const bs = new BalanceService(gw);
+
+      // 1. Заказ отменён пользователем или администратором, после чего старый инвойс оплачен
+      const cancelledOrd = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@QuizyReceiver',
+      });
+      const cancelledInv = await ps.createOrReuseOrderPayment({
+        orderId: cancelledOrd.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USD',
+      });
+
+      await OrderService.updateOrderStatus({
+        orderId: cancelledOrd.orderId,
+        paymentStatus: 'cancelled',
+        fulfillmentStatus: 'cancelled',
+        fulfillmentNote: 'Отменён покупателем до оплаты',
+      });
+
+      // Покупатель всё равно оплачивает старый инвойс по прямой ссылке в CryptoBot
+      paidInvoices.add(cancelledInv.payment.providerPaymentId!);
+      const lateCancelledRes = await ps.verifyAndProcessOrderPayment(
+        cancelledInv.payment.paymentId,
+      );
+      assert.equal(lateCancelledRes.ok, false);
+      assert.equal(lateCancelledRes.duplicate, false);
+      assert.equal(lateCancelledRes.needsFulfillmentRecovery, false);
+      assert.equal(lateCancelledRes.status, 'refund_required');
+      assert.equal(lateCancelledRes.reason, 'LATE_PAYMENT_ORDER_CANCELLED');
+
+      const payDocAfterCancel = await firestoreRepo.getDoc<PaymentRecord>(
+        'payments',
+        cancelledInv.payment.paymentId,
+      );
+      assert.equal(payDocAfterCancel?.status, 'refund_required');
+      assert.equal(
+        payDocAfterCancel?.reconciliationReason,
+        'LATE_PAYMENT_ORDER_CANCELLED',
+      );
+      assert.equal(payDocAfterCancel?.conflictingOrderStatus, 'cancelled');
+      assert.equal(payDocAfterCancel?.conflictingFulfillmentStatus, 'cancelled');
+      assert.equal(payDocAfterCancel?.verifiedAmountStr, '13.90');
+
+      const ordDocAfterCancel = await OrderService.getOrderById(
+        cancelledOrd.orderId,
+      );
+      assert.equal(ordDocAfterCancel?.paymentStatus, 'cancelled');
+      assert.equal(ordDocAfterCancel?.fulfillmentStatus, 'cancelled');
+
+      // 2. Заказ был оплачен с баланса и затем возвращён (refunded), после чего приходит оплата по старому внешнему счёту
+      const refundedOrd = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@QuizyReceiver',
+      });
+      const oldRefundedInv = await ps.createOrReuseOrderPayment({
+        orderId: refundedOrd.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USD',
+      });
+      await bs.purchaseWithInternalBalance({
+        telegramId: buyer1.id,
+        productId: 'premium_3m',
+        quantity: 1,
+        orderId: refundedOrd.orderId,
+        recipientUsername: '@QuizyReceiver',
+      });
+      await bs.refundOrderToInternalBalance({
+        orderId: refundedOrd.orderId,
+        reason: 'Возврат до прихода позднего криптоплатежа',
+        adminTelegramId: 777000111,
+      });
+
+      paidInvoices.add(oldRefundedInv.payment.providerPaymentId!);
+      const lateRefundedRes = await ps.verifyAndProcessOrderPayment(
+        oldRefundedInv.payment.paymentId,
+      );
+      assert.equal(lateRefundedRes.ok, false);
+      assert.equal(lateRefundedRes.status, 'refund_required');
+      assert.equal(lateRefundedRes.reason, 'LATE_PAYMENT_ORDER_REFUNDED');
+
+      const ordAfterLateRefunded = await OrderService.getOrderById(
+        refundedOrd.orderId,
+      );
+      assert.equal(ordAfterLateRefunded?.paymentStatus, 'refunded');
+      assert.equal(ordAfterLateRefunded?.fulfillmentStatus, 'refunded');
+
+      // Ни один обыкновенный failed статус не записан вместо refund_required
+      const allPayments = await firestoreRepo.listDocs<PaymentRecord>('payments');
+      assert.equal(
+        allPayments.some((p: PaymentRecord) => p.status === 'failed'),
+        false,
+        'Подтверждённая провайдером оплата никогда не должна помечаться обычным failed',
+      );
+
+      return 'Поздняя оплата отменённого или возвращённого заказа переводится в refund_required с причиной LATE_PAYMENT_ORDER_CANCELLED / LATE_PAYMENT_ORDER_REFUNDED без реактивации заказа.';
+    },
+  );
+
+  await runTest(
+    'S251-04',
+    'Security',
+    'Stage 2.5.1 (D — Concurrency & Restart): Параллельные webhook-и, гонка webhook + ручная кнопка проверки, перезапуск приложения после фиксации refund_required и защита от привязки одного external invoice ID к двум платежам',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const mockBot = createMockBot([]);
+
+      let lastPayload = '';
+      const transport = async (
+        req: HttpTransportRequest,
+      ): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/createInvoice')) {
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          lastPayload = String(body.payload || '');
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                invoice_id: 'cb_race_251',
+                status: 'active',
+                amount: String(body.amount),
+                fiat: 'USD',
+                currency_type: 'fiat',
+                bot_invoice_url: 'https://t.me/CryptoBot?start=cb_race_251',
+                payload: lastPayload,
+              },
+            },
+          };
+        }
+        await new Promise((r) => setTimeout(r, 15));
+        return {
+          status: 200,
+          ok: true,
+          json: {
+            ok: true,
+            result: {
+              items: [
+                {
+                  invoice_id: 'cb_race_251',
+                  status: 'paid',
+                  amount: '13.90',
+                  paid_amount: '13.90',
+                  fiat: 'USD',
+                  currency_type: 'fiat',
+                  paid_at: '2026-11-21T18:30:00.000Z',
+                  payload: lastPayload,
+                },
+              ],
+            },
+          },
+        };
+      };
+
+      const gw = new PaymentProviderGateway(transport, TEST_MOCK_CREDS);
+      const ps = new PaymentService('s251-04', gw);
+
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@QuizyReceiver',
+      });
+      const inv = await ps.createOrReuseOrderPayment({
+        orderId: ord.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USD',
+      });
+
+      // Отменяем заказ до прихода параллельных уведомлений об оплате
+      await OrderService.updateOrderStatus({
+        orderId: ord.orderId,
+        paymentStatus: 'cancelled',
+        fulfillmentStatus: 'cancelled',
+        fulfillmentNote: 'Отменён перед гонкой вебхуков',
+      });
+
+      // 1. Два параллельных webhook-а + одновременная ручная проверка (3 параллельных воркера)
+      const raceResults = await Promise.all([
+        ps.verifyAndProcessOrderPayment(inv.payment.paymentId),
+        ps.verifyAndProcessOrderPayment(inv.payment.paymentId),
+        ps.verifyAndProcessOrderPayment(inv.payment.paymentId),
+      ]);
+
+      const firstRecorded = raceResults.filter(
+        (r) => r.status === 'refund_required' && !r.duplicate,
+      );
+      const duplicateRecorded = raceResults.filter(
+        (r) => r.status === 'refund_required' && r.duplicate,
+      );
+      assert.equal(
+        firstRecorded.length,
+        1,
+        'Ровно 1 воркер должен зафиксировать первичный переход в refund_required',
+      );
+      assert.equal(
+        duplicateRecorded.length,
+        2,
+        'Остальные параллельные воркеры должны получить идемпотентный duplicate=true',
+      );
+
+      // Только одна запись в transactions
+      const txs = await firestoreRepo.listDocs<StoreTransaction>('transactions');
+      const refundTxs = txs.filter(
+        (t: StoreTransaction) =>
+          t.type === 'payment_refund_required' &&
+          t.paymentId === inv.payment.paymentId,
+      );
+      assert.equal(refundTxs.length, 1);
+
+      // 2. Перезапуск приложения после фиксации конфликтующего платежа:
+      //    recoverPendingFulfillments НЕ должен выдавать отменённый заказ, а getReconciliationRequiredPayments возвращает платёж
+      let mystarsCalls = 0;
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_s251_04',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+      });
+      FulfillmentService.resetAdapterToDefault();
+      try {
+        myStarsClient.setHttpTransport(async (): Promise<HttpTransportResponse> => {
+          mystarsCalls++;
+          return { status: 200, ok: true, json: { orders: [] } };
+        });
+
+        const recovered = await FulfillmentService.recoverPendingFulfillments(
+          mockBot,
+          { bypassLocalMutex: true },
+        );
+        assert.equal(recovered.length, 0);
+        assert.equal(mystarsCalls, 0);
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+      }
+
+      const reconciliationList = await ps.getReconciliationRequiredPayments();
+      assert.equal(reconciliationList.length, 1);
+      assert.equal(reconciliationList[0].paymentId, inv.payment.paymentId);
+      assert.equal(reconciliationList[0].status, 'refund_required');
+
+      // 3. Проверка защиты payment_locks: тот же внешний invoice_id ('cb_race_251') не может быть привязан ко второму PaymentRecord даже для того же заказа
+      lastPayload = 'pay_ord_forged_same_ext_id';
+      const forgedSameOrderPayment: PaymentRecord = {
+        ...inv.payment,
+        paymentId: 'pay_ord_forged_same_ext_id',
+        status: 'pending',
+      };
+      await firestoreRepo.setDoc(
+        'payments',
+        forgedSameOrderPayment.paymentId,
+        forgedSameOrderPayment,
+      );
+      await assert.rejects(
+        () => ps.verifyAndProcessOrderPayment(forgedSameOrderPayment.paymentId),
+        /PAYMENT_LOCK_CONFLICT/i,
+      );
+
+      return 'Параллельные webhook-и и ручная проверка сериализованы, состояние refund_required сохраняется после перезапуска, а внешний invoice ID защищён от повторной привязки.';
+    },
+  );
+
+  await runTest(
+    'S251-05',
+    'Security',
+    'Stage 2.5.1 (E — Top-Up Late Payment Reconciliation): Оплата отменённого счёта пополнения баланса или счёта заблокированного пользователя переводится в refund_required без зачисления баланса и без потери данных о платеже',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+
+      let topupSeq = 5000;
+      const paidTopupInvoices = new Set<string>();
+      const payloadByExtId = new Map<string, string>();
+      const transport = async (
+        req: HttpTransportRequest,
+      ): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/createInvoice')) {
+          topupSeq++;
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          const extId = `cb_topup_251_${topupSeq}`;
+          const payload = String(body.payload || '');
+          payloadByExtId.set(extId, payload);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                invoice_id: extId,
+                status: 'active',
+                amount: String(body.amount),
+                fiat: 'USD',
+                currency_type: 'fiat',
+                bot_invoice_url: `https://t.me/CryptoBot?start=${extId}`,
+                payload,
+              },
+            },
+          };
+        }
+        const parsedUrl = new URL(req.url);
+        const extId = parsedUrl.searchParams.get('invoice_ids') || '';
+        const isPaid = paidTopupInvoices.has(extId);
+        return {
+          status: 200,
+          ok: true,
+          json: {
+            ok: true,
+            result: {
+              items: [
+                {
+                  invoice_id: extId,
+                  status: isPaid ? 'paid' : 'active',
+                  amount: '25.00',
+                  paid_amount: isPaid ? '25.00' : undefined,
+                  fiat: 'USD',
+                  currency_type: 'fiat',
+                  paid_at: '2026-11-21T18:45:00.000Z',
+                  payload: payloadByExtId.get(extId) || '',
+                },
+              ],
+            },
+          },
+        };
+      };
+
+      const gw = new PaymentProviderGateway(transport, TEST_MOCK_CREDS);
+      const bs = new BalanceService(gw);
+
+      // 1. Покупатель создаёт счёт на пополнение $25.00, отменяет его в боте, но затем оплачивает по ссылке в CryptoBot
+      const topUp1 = await bs.createTopUp({
+        telegramId: buyer1.id,
+        provider: 'cryptobot',
+        amountUsdCents: 2500,
+        currency: 'USD',
+      });
+      await bs.cancelPendingTopUp(topUp1.paymentId, buyer1.id);
+
+      const cancelledCheck = await bs.getTopUpById(topUp1.paymentId);
+      assert.equal(cancelledCheck?.paymentStatus, 'cancelled');
+
+      paidTopupInvoices.add(topUp1.externalInvoiceId!);
+
+      // Два параллельных webhook-а о поздней оплате отменённого счёта пополнения
+      const [res1, res2] = await Promise.all([
+        bs.verifyAndProcessTopUp(topUp1.paymentId),
+        bs.verifyAndProcessTopUp(topUp1.paymentId),
+      ]);
+      const primary = [res1, res2].filter((r) => !r.duplicate);
+      const duplicates = [res1, res2].filter((r) => r.duplicate);
+      assert.equal(primary.length, 1);
+      assert.equal(duplicates.length, 1);
+      assert.equal(primary[0].ok, false);
+      assert.equal(primary[0].status, 'refund_required');
+      assert.equal(primary[0].reason, 'LATE_TOPUP_CANCELLED_INVOICE');
+
+      // Баланс НЕ зачислен
+      assert.equal(await bs.getBalanceUsdCents(buyer1.id), 0);
+
+      const reconciledTopUp1 = await bs.getTopUpById(topUp1.paymentId);
+      assert.equal(reconciledTopUp1?.paymentStatus, 'refund_required');
+      assert.equal(reconciledTopUp1?.needsManualReconciliation, true);
+      assert.equal(reconciledTopUp1?.refundRequired, true);
+      assert.equal(
+        reconciledTopUp1?.reconciliationReason,
+        'LATE_TOPUP_CANCELLED_INVOICE',
+      );
+      assert.equal(reconciledTopUp1?.verifiedAmountStr, '25.00');
+      assert.equal(reconciledTopUp1?.verifiedCurrency, 'USD');
+      assert.equal(reconciledTopUp1?.paidAt, '2026-11-21T18:45:00.000Z');
+      assert.ok(reconciledTopUp1?.confirmedAt);
+
+      const allTxs = await firestoreRepo.listDocs<StoreTransaction>('transactions');
+      const topUpRefundTxs = allTxs.filter(
+        (t: StoreTransaction) =>
+          t.type === 'payment_refund_required' &&
+          t.paymentId === topUp1.paymentId,
+      );
+      assert.equal(topUpRefundTxs.length, 1);
+      assert.equal(topUpRefundTxs[0].externalInvoiceId, topUp1.externalInvoiceId);
+      assert.equal(topUpRefundTxs[0].verifiedAmountStr, '25.00');
+
+      // 2. Пополнение от пользователя, который был заблокирован до подтверждения оплаты
+      const topUpBlocked = await bs.createTopUp({
+        telegramId: buyer1.id,
+        provider: 'cryptobot',
+        amountUsdCents: 2500,
+        currency: 'USD',
+      });
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        isBlocked: true,
+      });
+      paidTopupInvoices.add(topUpBlocked.externalInvoiceId!);
+
+      const blockedRes = await bs.verifyAndProcessTopUp(topUpBlocked.paymentId);
+      assert.equal(blockedRes.ok, false);
+      assert.equal(blockedRes.status, 'refund_required');
+      assert.equal(blockedRes.reason, 'TOPUP_USER_BLOCKED');
+      assert.equal(await bs.getBalanceUsdCents(buyer1.id), 0);
+
+      const blockedTopUpDoc = await bs.getTopUpById(topUpBlocked.paymentId);
+      assert.equal(blockedTopUpDoc?.paymentStatus, 'refund_required');
+      assert.equal(blockedTopUpDoc?.reconciliationReason, 'TOPUP_USER_BLOCKED');
+      assert.equal(blockedTopUpDoc?.verifiedAmountStr, '25.00');
+
+      return 'Поздняя оплата отменённого счёта пополнения и оплата счёта заблокированного пользователя переводятся в refund_required без зачисления баланса и с полной фиксацией полученных средств.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {

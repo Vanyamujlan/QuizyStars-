@@ -5,6 +5,7 @@ import {
   BalanceTopUpProvider,
   Order,
   PaymentLockRecord,
+  PaymentReconciliationReason,
   PaymentRecord,
   PaymentRecordStatus,
   Product,
@@ -333,6 +334,7 @@ export class PaymentService {
           ...prevPayment,
           status: 'cancelled',
           failureReason: 'SUPERSEDED_BY_NEW_INVOICE',
+          supersededByPaymentId: paymentId,
           updatedAt: now,
         });
       }
@@ -542,9 +544,23 @@ export class PaymentService {
       };
     }
 
+    if (existingPayment.status === 'refund_required') {
+      const existingOrder = await OrderService.getOrderById(existingPayment.orderId);
+      return {
+        ok: false,
+        duplicate: true,
+        needsFulfillmentRecovery: false,
+        status: 'refund_required',
+        order: existingOrder || undefined,
+        payment: existingPayment,
+        reason: existingPayment.reconciliationReason || 'REFUND_REQUIRED',
+      };
+    }
+
     if (
       existingPayment.status === 'failed' ||
-      existingPayment.status === 'underpaid'
+      existingPayment.status === 'underpaid' ||
+      existingPayment.status === 'refunded'
     ) {
       const ord = await OrderService.getOrderById(existingPayment.orderId);
       return {
@@ -556,24 +572,6 @@ export class PaymentService {
         payment: existingPayment,
         reason: `PAYMENT_ALREADY_${existingPayment.status.toUpperCase()}`,
       };
-    }
-
-    if (
-      existingPayment.status === 'cancelled' ||
-      existingPayment.status === 'expired'
-    ) {
-      const ord = await OrderService.getOrderById(existingPayment.orderId);
-      if (!ord || ord.paymentStatus !== 'pending') {
-        return {
-          ok: false,
-          duplicate: false,
-          needsFulfillmentRecovery: false,
-          status: existingPayment.status,
-          order: ord || undefined,
-          payment: existingPayment,
-          reason: `PAYMENT_ALREADY_${existingPayment.status.toUpperCase()}`,
-        };
-      }
     }
 
     if (
@@ -617,6 +615,18 @@ export class PaymentService {
       verified.status === 'expired' ||
       (verified.status !== 'paid' && isLocallyExpired)
     ) {
+      if (existingPayment.status === 'expired') {
+        const ord = await OrderService.getOrderById(existingPayment.orderId);
+        return {
+          ok: false,
+          duplicate: false,
+          needsFulfillmentRecovery: false,
+          status: 'expired',
+          order: ord || undefined,
+          payment: existingPayment,
+          reason: 'INVOICE_EXPIRED',
+        };
+      }
       const { payment, order } = await this.markOrderPaymentIssue(
         existingPayment.paymentId,
         'expired',
@@ -856,40 +866,152 @@ export class PaymentService {
           };
         }
 
+        if (freshPayment.status === 'refund_required') {
+          return {
+            ok: false,
+            duplicate: true,
+            needsFulfillmentRecovery: false,
+            status: 'refund_required',
+            order: freshOrder,
+            payment: freshPayment,
+            reason: freshPayment.reconciliationReason || 'REFUND_REQUIRED',
+          };
+        }
+
         if (
           existingLock &&
           (existingLock.targetType !== 'order' ||
-            existingLock.targetId !== freshOrder.orderId)
+            existingLock.targetId !== freshOrder.orderId ||
+            existingLock.paymentId !== freshPayment.paymentId)
         ) {
           throw new Error(
             `PAYMENT_LOCK_CONFLICT: внешний инвойс ${externalInvoiceId} уже привязан к ${existingLock.targetType}:${existingLock.targetId}.`,
           );
         }
 
-        if (
+        const isSupersededInvoice =
+          Boolean(
+            freshOrder.activePaymentId &&
+              freshOrder.activePaymentId !== freshPayment.paymentId,
+          ) ||
+          freshPayment.failureReason === 'SUPERSEDED_BY_NEW_INVOICE' ||
+          freshPayment.failureReason === 'PAID_WITH_INTERNAL_BALANCE';
+
+        const isOrderNotPending =
           freshOrder.paymentStatus !== 'pending' ||
-          freshOrder.fulfillmentStatus !== 'pending'
-        ) {
+          freshOrder.fulfillmentStatus !== 'pending';
+
+        if (isOrderNotPending || isSupersededInvoice) {
           const conflictNow = new Date().toISOString();
-          const conflictReason = `ORDER_ALREADY_${freshOrder.paymentStatus.toUpperCase()}`;
-          const closedPayment: PaymentRecord = {
+          let reconciliationReason: PaymentReconciliationReason;
+          if (
+            freshOrder.paymentStatus === 'cancelled' ||
+            freshOrder.fulfillmentStatus === 'cancelled'
+          ) {
+            reconciliationReason = 'LATE_PAYMENT_ORDER_CANCELLED';
+          } else if (
+            freshOrder.paymentStatus === 'refunded' ||
+            freshOrder.fulfillmentStatus === 'refunded'
+          ) {
+            reconciliationReason = 'LATE_PAYMENT_ORDER_REFUNDED';
+          } else if (
+            freshOrder.paymentStatus === 'paid' ||
+            freshOrder.paymentStatus === 'processing' ||
+            freshOrder.paymentStatus === 'completed'
+          ) {
+            reconciliationReason = 'LATE_PAYMENT_ORDER_ALREADY_PAID';
+          } else if (isSupersededInvoice) {
+            reconciliationReason = 'LATE_PAYMENT_SUPERSEDED_INVOICE';
+          } else {
+            reconciliationReason = 'LATE_PAYMENT_ORDER_INCOMPATIBLE_STATE';
+          }
+
+          const supersededBy =
+            freshOrder.activePaymentId &&
+            freshOrder.activePaymentId !== freshPayment.paymentId
+              ? freshOrder.activePaymentId
+              : freshPayment.supersededByPaymentId;
+          const expectedCents =
+            freshPayment.expectedUsdCents ?? freshPayment.totalAmount;
+          const netConflictUsdCents = Math.max(
+            0,
+            expectedCents - providerFeeUsdCents,
+          );
+          const resolvedNetwork = verifiedNet || expectedNet || undefined;
+          const providerShortTitle =
+            PAYMENT_PROVIDER_CATALOG[
+              freshPayment.provider as BalanceTopUpProvider
+            ]?.shortTitle || freshPayment.provider;
+          const netSuffix = resolvedNetwork ? ` [${resolvedNetwork}]` : '';
+          const supersededSuffix = supersededBy
+            ? `, действующий платёж заказа: ${supersededBy}`
+            : '';
+          const reconciliationDetails =
+            `Подтверждена поздняя оплата инвойса ${freshPayment.paymentId} (${providerShortTitle}, ext=${externalInvoiceId}): получено ${verifiedStr} ${verifiedCurr}${netSuffix}, но заказ #${freshOrder.orderId} находится в статусе оплаты "${freshOrder.paymentStatus}" (выдача: "${freshOrder.fulfillmentStatus}"${supersededSuffix}). Требуется возврат средств или ручная финансовая сверка (${reconciliationReason}).`;
+
+          const reconciliationPayment: PaymentRecord = {
             ...freshPayment,
-            status: 'failed',
-            failureReason: conflictReason,
+            providerPaymentId: String(externalInvoiceId),
+            status: 'refund_required',
+            actualAmountStr: verifiedStr,
+            verifiedAmountStr: verifiedStr,
+            verifiedCurrency: verifiedCurr,
+            ...(resolvedNetwork ? { verifiedNetwork: resolvedNetwork } : {}),
+            feeUsdCents: providerFeeUsdCents,
+            netUsdCents: netConflictUsdCents,
+            paidAt: verified.paidAt || conflictNow,
+            confirmedAt: conflictNow,
+            needsManualReconciliation: true,
+            refundRequired: true,
+            reconciliationState: 'refund_required',
+            reconciliationReason,
+            conflictingOrderStatus: freshOrder.paymentStatus,
+            conflictingFulfillmentStatus: freshOrder.fulfillmentStatus,
+            ...(supersededBy ? { supersededByPaymentId: supersededBy } : {}),
+            statusReason: reconciliationDetails,
             updatedAt: conflictNow,
           };
-          tx.set<PaymentRecord>('payments', closedPayment.paymentId, closedPayment);
 
-          const conflictTxId = sanitizeDocId(`tx_ord_conflict_${freshPayment.paymentId}`);
+          const conflictLock: PaymentLockRecord = {
+            lockId,
+            provider: freshPayment.provider,
+            providerPaymentId: String(externalInvoiceId),
+            targetType: 'order',
+            targetId: freshOrder.orderId,
+            paymentId: freshPayment.paymentId,
+            userId: freshOrder.userId,
+            amountUsdCents: expectedCents,
+            claimedAt: conflictNow,
+          };
+
+          tx.set<PaymentLockRecord>('payment_locks', lockId, conflictLock);
+          tx.set<PaymentRecord>(
+            'payments',
+            reconciliationPayment.paymentId,
+            reconciliationPayment,
+          );
+
+          const conflictTxId = sanitizeDocId(
+            `tx_ord_refund_req_${freshPayment.paymentId}`,
+          );
           tx.set<StoreTransaction>('transactions', conflictTxId, {
             transactionId: conflictTxId,
             orderId: freshOrder.orderId,
             userId: freshOrder.userId,
-            type: 'error',
-            amount: freshPayment.expectedUsdCents ?? freshPayment.totalAmount,
-            amountUsdCents: freshPayment.expectedUsdCents ?? freshPayment.totalAmount,
+            paymentId: freshPayment.paymentId,
+            ...(supersededBy ? { supersededByPaymentId: supersededBy } : {}),
+            provider: freshPayment.provider,
+            externalInvoiceId: String(externalInvoiceId),
+            verifiedAmountStr: verifiedStr,
+            verifiedCurrency: verifiedCurr,
+            ...(resolvedNetwork ? { network: resolvedNetwork } : {}),
+            reconciliationReason,
+            confirmedAt: conflictNow,
+            type: 'payment_refund_required',
+            amount: expectedCents,
+            amountUsdCents: expectedCents,
             currency: 'USD',
-            details: `Поступило подтверждение платежа ${freshPayment.paymentId} (ext=${externalInvoiceId}), но заказ #${freshOrder.orderId} уже находится в статусе оплаты "${freshOrder.paymentStatus}" (выдача: "${freshOrder.fulfillmentStatus}"). Платёж переведён в статус failed (${conflictReason}).`,
+            details: reconciliationDetails,
             createdAt: conflictNow,
           });
 
@@ -897,10 +1019,10 @@ export class PaymentService {
             ok: false,
             duplicate: false,
             needsFulfillmentRecovery: false,
-            status: 'failed',
+            status: 'refund_required',
             order: freshOrder,
-            payment: closedPayment,
-            reason: conflictReason,
+            payment: reconciliationPayment,
+            reason: reconciliationReason,
           };
         }
 
@@ -932,11 +1054,15 @@ export class PaymentService {
           ? 'overpaid'
           : 'paid';
         const netUsdCents = Math.max(0, orderCents - providerFeeUsdCents);
+        const resolvedNet = verifiedNet || expectedNet || undefined;
 
         const updatedPayment: PaymentRecord = {
           ...freshPayment,
           status: finalPaymentStatus,
           actualAmountStr: verifiedStr,
+          verifiedAmountStr: verifiedStr,
+          verifiedCurrency: verifiedCurr,
+          ...(resolvedNet ? { verifiedNetwork: resolvedNet } : {}),
           feeUsdCents: providerFeeUsdCents,
           netUsdCents,
           statusReason: isOverpaid
@@ -1064,7 +1190,11 @@ export class PaymentService {
         throw new Error(`Платёж ${paymentId} не найден.`);
       }
       const order = await tx.get<Order>('orders', freshPayment.orderId);
-      if (freshPayment.status === 'paid' || freshPayment.status === 'overpaid') {
+      if (
+        freshPayment.status === 'paid' ||
+        freshPayment.status === 'overpaid' ||
+        freshPayment.status === 'refund_required'
+      ) {
         return { payment: freshPayment, order };
       }
 
@@ -1631,6 +1761,22 @@ export class PaymentService {
       offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
     });
+  }
+
+  public async getReconciliationRequiredPayments(
+    limit = 50,
+  ): Promise<PaymentRecord[]> {
+    const list = await firestoreRepo.queryDocs<PaymentRecord>('payments', {
+      where: [{ field: 'status', op: '==', value: 'refund_required' }],
+      limit,
+    });
+    return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  public static async getReconciliationRequiredPayments(
+    limit = 50,
+  ): Promise<PaymentRecord[]> {
+    return this.defaultInstance.getReconciliationRequiredPayments(limit);
   }
 
   /**
