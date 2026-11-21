@@ -772,7 +772,12 @@ export class FulfillmentService {
     if (this.customAdapterOverride) {
       return this.customAdapterOverride;
     }
-    if (myStarsClient.isConfigured()) {
+    const cfg = getEnvConfig();
+    if (
+      !cfg.invalidFulfillmentProvider &&
+      cfg.fulfillmentProvider === 'mystars' &&
+      myStarsClient.isConfigured()
+    ) {
       return this.myStarsAdapter;
     }
     return this.manualAdapter;

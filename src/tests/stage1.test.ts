@@ -138,6 +138,11 @@ import {
   validateMyStarsQuantity,
   validateMyStarsUsername,
 } from '../services/MyStarsService.ts';
+import {
+  isActiveSupplierConfigured,
+  resolveActiveSupplierProvider,
+  validateRecipientWithActiveSupplier,
+} from '../services/SupplierValidation.ts';
 import type {
   MyStarsPollCheckpoint,
   Order,
@@ -14506,6 +14511,227 @@ async function runFullAuditTestSuite(): Promise<void> {
       }
 
       return 'Legacy-заказы без полей *NotificationState обработаны корректно: уже уведомлённые (*NotifiedAt) не дублируются, неуведомлённые восстановлены ровно 1 раз.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 2.3 — MYSTARS-ONLY CLEANUP & HISTORICAL COMPATIBILITY TESTS
+  // =========================================================================
+
+  await runTest(
+    'S23-01',
+    'Fulfillment',
+    'Stage 2.3: MyStars-only маршрутизация поставщика (mystars / unset / manual / unsupported legacy value) без переключения на Fragment',
+    async () => {
+      const prevProvider = process.env.FULFILLMENT_PROVIDER;
+      const prevMyStarsKey = process.env.MYSTARS_API_KEY;
+      try {
+        FulfillmentService.resetAdapterToDefault();
+
+        // 1. MYSTARS_API_KEY не задан -> безопасный ручной режим при unset и при 'mystars'
+        delete process.env.FULFILLMENT_PROVIDER;
+        delete process.env.MYSTARS_API_KEY;
+        myStarsClient.setCredentialsOverride(null);
+
+        assert.equal(getEnvConfig().fulfillmentProvider, 'mystars');
+        assert.equal(getEnvConfig().invalidFulfillmentProvider, undefined);
+        assert.equal(resolveActiveSupplierProvider(), 'manual');
+        assert.equal(isActiveSupplierConfigured(), false);
+        assert.equal(OrderService.resolveOrderFulfillmentProvider('stars'), 'manual');
+        assert.ok(FulfillmentService.getActiveAdapter() instanceof ManualAdminFulfillmentAdapter);
+
+        // 2. MYSTARS_API_KEY задан + FULFILLMENT_PROVIDER=mystars (или unset) -> единственный автоматический поставщик 'mystars'
+        myStarsClient.setCredentialsOverride({
+          apiBaseUrl: 'https://api.mystars.tg',
+          apiKey: 'ms_live_s23_test_key',
+          paymentCurrency: 'usdt_ton',
+        });
+        process.env.FULFILLMENT_PROVIDER = 'mystars';
+        assert.equal(getEnvConfig().fulfillmentProvider, 'mystars');
+        assert.equal(resolveActiveSupplierProvider(), 'mystars');
+        assert.equal(isActiveSupplierConfigured(), true);
+        assert.equal(OrderService.resolveOrderFulfillmentProvider('stars'), 'mystars');
+        assert.equal(OrderService.resolveOrderFulfillmentProvider('premium'), 'mystars');
+        assert.equal(OrderService.resolveOrderFulfillmentProvider('gifts'), 'manual');
+        assert.ok(FulfillmentService.getActiveAdapter() instanceof MyStarsFulfillmentAdapter);
+
+        // 3. FULFILLMENT_PROVIDER=manual -> принудительный ручной режим даже при настроенном MYSTARS_API_KEY
+        process.env.FULFILLMENT_PROVIDER = 'manual';
+        assert.equal(getEnvConfig().fulfillmentProvider, 'manual');
+        assert.equal(getEnvConfig().invalidFulfillmentProvider, undefined);
+        assert.equal(resolveActiveSupplierProvider(), 'manual');
+        assert.equal(isActiveSupplierConfigured(), false);
+        assert.equal(OrderService.resolveOrderFulfillmentProvider('stars'), 'manual');
+        assert.ok(FulfillmentService.getActiveAdapter() instanceof ManualAdminFulfillmentAdapter);
+
+        // 4. Неподдерживаемое/устаревшее значение FULFILLMENT_PROVIDER (например, legacy 'fragment') ->
+        // фиксируется invalidFulfillmentProvider и включается безопасный ручной fallback, НЕ Fragment!
+        process.env.FULFILLMENT_PROVIDER = 'fragment';
+        const cfgInvalid = getEnvConfig();
+        assert.equal(cfgInvalid.fulfillmentProvider, 'manual');
+        assert.equal(cfgInvalid.invalidFulfillmentProvider, 'fragment');
+        assert.equal(resolveActiveSupplierProvider(), 'manual');
+        assert.equal(isActiveSupplierConfigured(), false);
+        assert.equal(OrderService.resolveOrderFulfillmentProvider('stars'), 'manual');
+        assert.ok(FulfillmentService.getActiveAdapter() instanceof ManualAdminFulfillmentAdapter);
+
+        const statusText = renderPlainTextStatus();
+        assert.ok(
+          statusText.includes('неподдерживаемое значение "fragment"'),
+          'renderPlainTextStatus должен явно сигнализировать о неподдерживаемом FULFILLMENT_PROVIDER',
+        );
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetAdapterToDefault();
+        if (prevProvider === undefined) delete process.env.FULFILLMENT_PROVIDER;
+        else process.env.FULFILLMENT_PROVIDER = prevProvider;
+        if (prevMyStarsKey === undefined) delete process.env.MYSTARS_API_KEY;
+        else process.env.MYSTARS_API_KEY = prevMyStarsKey;
+      }
+
+      return 'MyStars подтверждён единственным автоматическим поставщиком; manual и неподдерживаемые значения FULFILLMENT_PROVIDER безопасно откатываются на manual.';
+    },
+  );
+
+  await runTest(
+    'S23-02',
+    'Database',
+    'Stage 2.3: Совместимость с историческими Firestore-документами заказов (legacy fulfillmentProvider и доп. поля) без ошибок чтения и форматирования',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const nowIso = new Date().toISOString();
+
+      // Имитируем исторический документ заказа из Firestore, сохранивший legacy fulfillmentProvider и старые поля
+      const legacyOrderDoc = {
+        orderId: 'ord_legacy_hist_2302',
+        userId: 'tg_230201',
+        userTelegramId: 230201,
+        username: 'legacy_buyer',
+        recipientUsername: 'legacy_target',
+        productId: 'stars_custom',
+        productName: '100 Telegram Stars',
+        category: 'stars' as const,
+        quantity: 100,
+        totalPriceUsdCents: 200,
+        totalPrice: 200,
+        currency: 'USD' as const,
+        paymentMethod: 'cryptobot' as const,
+        paymentStatus: 'completed' as const,
+        fulfillmentStatus: 'completed' as const,
+        fulfillmentProvider: 'fragment' as const,
+        // Исторические поля, которые могли остаться в старых документах Firestore:
+        fragmentOrderId: 'hist_old_123',
+        fragmentOrderStatus: 'completed',
+        fragmentPriceAmount: '0.42',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      await firestoreRepo.setDoc<Order>(
+        'orders',
+        legacyOrderDoc.orderId,
+        legacyOrderDoc as unknown as Order,
+      );
+
+      const loaded = await OrderService.getOrderById(legacyOrderDoc.orderId);
+      assert.ok(loaded, 'Исторический заказ должен успешно читаться из Firestore');
+      assert.equal(loaded.fulfillmentProvider, 'fragment');
+
+      const renderedCard = formatAdminOrderCard(loaded);
+      assert.ok(renderedCard.includes('ord_legacy_hist_2302'));
+      assert.ok(renderedCard.includes('@legacy_target'));
+      assert.ok(
+        !renderedCard.includes('Fragment ID:'),
+        'Удалённый блок Fragment ID не должен отображаться в карточке заказа',
+      );
+      assert.ok(
+        !renderedCard.includes('Расход Fragment:'),
+        'Удалённый блок Расход Fragment не должен отображаться в карточке заказа',
+      );
+
+      // Новый заказ всегда получает только 'mystars' или 'manual' (никогда не 'fragment')
+      const buyer = { id: 230202, username: 'new_mystars_buyer', first_name: 'NewBuyer' };
+      await UserService.upsertFromTelegram(buyer);
+      const newOrder = await OrderService.createOrder({
+        telegramUser: buyer,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 'new_mystars_buyer',
+      });
+      assert.ok(
+        newOrder.fulfillmentProvider === 'mystars' || newOrder.fulfillmentProvider === 'manual',
+        `Новый заказ обязан иметь provider mystars/manual, получено: ${newOrder.fulfillmentProvider}`,
+      );
+
+      return 'Исторические документы заказов с legacy-полями безопасно читаются и форматируются без ошибок; новые заказы используют только mystars/manual.';
+    },
+  );
+
+  await runTest(
+    'S23-03',
+    'Fulfillment',
+    'Stage 2.3: Валидация получателя перед оплатой вызывает исключительно MyStars при активном поставщике и пропускает внешние вызовы в manual-режиме',
+    async () => {
+      const prevProvider = process.env.FULFILLMENT_PROVIDER;
+      let mystarsLookupCalls = 0;
+
+      try {
+        myStarsClient.setCredentialsOverride({
+          apiBaseUrl: 'https://api.mystars.tg',
+          apiKey: 'ms_live_s23_val_key',
+          paymentCurrency: 'usdt_ton',
+        });
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          if (req.method === 'POST' && req.url.includes('/v1/recipients/check')) {
+            mystarsLookupCalls++;
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                resolved: true,
+                eligible: true,
+                recipient_name: 'Valid User',
+                indeterminate: false,
+              },
+            };
+          }
+          throw new Error(`Unexpected URL in S23-03: ${req.method} ${req.url}`);
+        });
+
+        // При активном MyStars -> выполняется проверка через MyStars
+        process.env.FULFILLMENT_PROVIDER = 'mystars';
+        await validateRecipientWithActiveSupplier({
+          category: 'stars',
+          recipientUsername: 'valid_stars_user',
+        });
+        assert.equal(mystarsLookupCalls, 1, 'При активном MyStars валидация получателя должна вызывать MyStars API');
+
+        // При ручном режиме (или неподдерживаемом FULFILLMENT_PROVIDER) -> внешних вызовов нет
+        process.env.FULFILLMENT_PROVIDER = 'manual';
+        await validateRecipientWithActiveSupplier({
+          category: 'stars',
+          recipientUsername: 'valid_stars_user',
+        });
+        assert.equal(mystarsLookupCalls, 1, 'В ручном режиме внешняя валидация поставщика не должна вызываться');
+
+        process.env.FULFILLMENT_PROVIDER = 'fragment';
+        await validateRecipientWithActiveSupplier({
+          category: 'stars',
+          recipientUsername: 'valid_stars_user',
+        });
+        assert.equal(
+          mystarsLookupCalls,
+          1,
+          'При неподдерживаемом FULFILLMENT_PROVIDER внешняя валидация не должна вызывать ни Fragment, ни MyStars',
+        );
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        if (prevProvider === undefined) delete process.env.FULFILLMENT_PROVIDER;
+        else process.env.FULFILLMENT_PROVIDER = prevProvider;
+      }
+
+      return 'Валидация получателя работает строго через MyStars при активном поставщике и безопасно пропускает внешние вызовы в manual-режиме.';
     },
   );
 

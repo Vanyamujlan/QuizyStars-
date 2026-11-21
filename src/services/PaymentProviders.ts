@@ -320,8 +320,6 @@ export function maskSecret(value: string | undefined | null): string {
 export function redactSecretsFromText(text: string): string {
   if (!text) return text;
   const cfg = getEnvConfig();
-  const runtimeSeed = (process.env.TON_SEED || process.env.FRAGMENT_WALLET_SEED || '').trim();
-  const normalizedSeed = runtimeSeed ? runtimeSeed.split(/\s+/).join(' ') : '';
   const secrets = [
     cfg.cryptobotApiToken,
     cfg.xrocketApiKey,
@@ -329,8 +327,6 @@ export function redactSecretsFromText(text: string): string {
     cfg.webhookSecret,
     cfg.mystarsApiKey,
     cfg.mystarsWebhookSecret,
-    runtimeSeed,
-    normalizedSeed,
     ...runtimeSensitiveSecrets,
   ].filter((s): s is string => Boolean(s && s.trim().length >= 4));
 

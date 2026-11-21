@@ -28,9 +28,14 @@ export type ProductCategory = 'stars' | 'premium' | 'gifts';
 
 export type FulfillmentType = 'manual' | 'provider_adapter' | 'mystars';
 
-export type FulfillmentProviderType = 'manual' | 'mystars' | 'fragment';
+export type ActiveFulfillmentProviderType = 'manual' | 'mystars';
 
-export type FragmentWalletVersion = 'v4r2' | 'v5r1';
+/**
+ * Active automatic fulfillment is MyStars-only (`'mystars' | 'manual'`).
+ * `'fragment'` is kept strictly as a legacy read-only value for historical Firestore order documents
+ * and must never be assigned to new orders or invoke any external Fragment API.
+ */
+export type FulfillmentProviderType = ActiveFulfillmentProviderType | 'fragment';
 
 export type OrderStatus =
   | 'pending'
@@ -239,7 +244,7 @@ export interface Order {
   fulfillmentStatus: OrderStatus;
   telegramPaymentChargeId?: string;
   providerPaymentChargeId?: string;
-  /** Fulfillment provider locked when the order was created ('manual' | 'mystars' | 'fragment') */
+  /** Fulfillment provider stamped on the order ('mystars' | 'manual'; historical orders may carry legacy 'fragment') */
   fulfillmentProvider?: FulfillmentProviderType;
   /** MyStars Stage 4.3/4.4 P&L, wholesale accounting & FaaS v1 order fields */
   grossRevenueUsdCents?: number;
@@ -362,24 +367,6 @@ export interface MyStarsPollCheckpoint {
   updatedAt: string;
   /** Monotonic administrative reset generation; prevents pre-reset in-flight workers from undoing a reset. */
   resetEpoch?: number;
-}
-
-export interface FragmentAuthSessionRecord {
-  key: 'fragment_auth';
-  walletAddress: string;
-  walletAddressFriendly: string;
-  walletType: FragmentWalletVersion;
-  kycMode: false;
-  apiBaseUrl: string;
-  /** AES-256-GCM encrypted auth_key payload: ivB64:tagB64:ciphertextB64 */
-  encryptedAuthKey: string;
-  /** Non-reversible 8-char sha256 prefix for rotation correlation (never a secret) */
-  keyFingerprint: string;
-  issuedAt: string;
-  lastUsedAt: string;
-  idleExpiresAt: string;
-  maxExpiresAt: string;
-  updatedAt: string;
 }
 
 export interface PaymentRecord {

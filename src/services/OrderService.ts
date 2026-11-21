@@ -1,7 +1,6 @@
-import { getEnvConfig } from '../config/env.ts';
 import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
-  FulfillmentProviderType,
+  ActiveFulfillmentProviderType,
   Order,
   OrderStatus,
   PaymentRecord,
@@ -11,8 +10,11 @@ import {
   TransactionType,
 } from '../types.ts';
 import { formatUsdCents } from './Money.ts';
-import { myStarsClient } from './MyStarsService.ts';
 import { ProductService } from './ProductService.ts';
+import {
+  resolveActiveSupplierProvider,
+  validateRecipientWithActiveSupplier,
+} from './SupplierValidation.ts';
 import { UserService } from './UserService.ts';
 
 const TELEGRAM_USERNAME_REGEX = /^[a-zA-Z0-9_]{5,32}$/;
@@ -77,22 +79,15 @@ export function canUseTelegramUsernameAsRecipient(raw?: string): string | null {
 export class OrderService {
   /**
    * Resolves which fulfillment provider should be stamped on newly created orders.
-   * Preserves existing MyStars / Manual default when FULFILLMENT_PROVIDER is unset.
+   * Automatic fulfillment is MyStars-only; falls back to manual when MyStars is not active or for gifts.
    */
   public static resolveOrderFulfillmentProvider(
     category: ProductCategory,
-  ): FulfillmentProviderType {
+  ): ActiveFulfillmentProviderType {
     if (category === 'gifts') {
       return 'manual';
     }
-    const cfg = getEnvConfig();
-    if (cfg.fulfillmentProvider === 'fragment') {
-      return 'fragment';
-    }
-    if (myStarsClient.isConfigured()) {
-      return 'mystars';
-    }
-    return 'manual';
+    return resolveActiveSupplierProvider();
   }
 
   /**
@@ -149,13 +144,12 @@ export class OrderService {
 
     if (
       normalizedRecipient &&
-      (product.category === 'stars' || product.category === 'premium') &&
-      assignedFulfillmentProvider !== 'fragment'
+      (product.category === 'stars' || product.category === 'premium')
     ) {
-      await myStarsClient.validateRecipientBeforeCheckout({
+      await validateRecipientWithActiveSupplier({
         category: product.category,
         recipientUsername: normalizedRecipient,
-        durationMonths: resolvedDurationMonths,
+        durationMonths: resolvedDurationMonths as 3 | 6 | 12 | undefined,
       });
     }
 
@@ -185,9 +179,7 @@ export class OrderService {
       fulfillmentStatus: 'pending',
       fulfillmentProvider: assignedFulfillmentProvider,
       grossRevenueUsdCents: totalPriceUsdCents,
-      ...(assignedFulfillmentProvider !== 'fragment'
-        ? { mystarsCurrency: 'usdt_ton' as const }
-        : {}),
+      mystarsCurrency: 'usdt_ton' as const,
       fulfillmentAttempts: 0,
       fulfillmentIdempotencyKey: `fulfill_${orderId}`,
       createdAt: now,
@@ -221,10 +213,9 @@ export class OrderService {
     const preCheckOrder = await firestoreRepo.getDoc<Order>('orders', orderId);
     if (
       preCheckOrder &&
-      preCheckOrder.fulfillmentProvider !== 'fragment' &&
       (preCheckOrder.category === 'stars' || preCheckOrder.category === 'premium')
     ) {
-      await myStarsClient.validateRecipientBeforeCheckout({
+      await validateRecipientWithActiveSupplier({
         category: preCheckOrder.category,
         recipientUsername: normalizedRecipient,
         durationMonths: preCheckOrder.durationMonths,
