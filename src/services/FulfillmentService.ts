@@ -111,6 +111,7 @@ export class FulfillmentService {
   public static checkpointBackoffBaseMs = 2000;
   public static checkpointTransactionMaxAttempts = 4;
   public static checkpointConflictRetryDelayMs = 25;
+  public static notificationRecoveryBatchLimit = 50;
   public static workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
@@ -126,6 +127,15 @@ export class FulfillmentService {
   private static checkpointLastError: string | null = null;
   private static checkpointConsecutiveFailures = 0;
   private static checkpointRetryAfterMs = 0;
+  private static buyerPendingCursorOrderId: string | null = null;
+  private static adminPendingCursorOrderId: string | null = null;
+  private static adminPartialCursorOrderId: string | null = null;
+
+  public static resetNotificationRecoveryState(): void {
+    this.buyerPendingCursorOrderId = null;
+    this.adminPendingCursorOrderId = null;
+    this.adminPartialCursorOrderId = null;
+  }
 
   /**
    * Normalizes a Firestore Timestamp (or serialized plain-object / ISO / epoch representation)
@@ -292,6 +302,7 @@ export class FulfillmentService {
     this.checkpointLastError = null;
     this.checkpointConsecutiveFailures = 0;
     this.checkpointRetryAfterMs = 0;
+    this.resetNotificationRecoveryState();
   }
 
   private static recordCheckpointFailure(
@@ -797,6 +808,7 @@ export class FulfillmentService {
     order: Order,
     bot: Telegraf | null | undefined,
     forceResend = false,
+    leaseOwnerOverride?: string,
   ): Promise<Order> {
     if (
       !forceResend &&
@@ -814,7 +826,7 @@ export class FulfillmentService {
       order.adminNotificationState?.eventId ||
       `evt_admin_${order.orderId}_${order.fulfillmentStatus}`;
     const operationId = `op_admin_notify_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-    const leaseOwner = this.workerInstanceId;
+    const leaseOwner = leaseOwnerOverride || this.workerInstanceId;
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
@@ -898,6 +910,7 @@ export class FulfillmentService {
           order: Order;
           targetAdminIds: number[];
           existingDeliveries: Record<string, AdminRecipientDeliveryRecord>;
+          wasUncertainBeforeClaim: boolean;
         };
 
     const claim = await firestoreRepo.runTransaction<AdminNotifyClaim>(async (tx) => {
@@ -1010,6 +1023,7 @@ export class FulfillmentService {
           ? uniqueAdminIds
           : undeliveredAdminIds;
 
+      const wasUncertainBeforeClaim = state?.status === 'delivery_uncertain';
       const claimingState: NotificationDeliveryState = {
         ...state,
         status: 'sending',
@@ -1032,6 +1046,7 @@ export class FulfillmentService {
         order: claimedOrder,
         targetAdminIds,
         existingDeliveries,
+        wasUncertainBeforeClaim,
       };
     });
 
@@ -1073,10 +1088,22 @@ export class FulfillmentService {
           lastError: undefined,
           operationId,
         };
+      } else if (sendResult.ambiguous) {
+        updatedDeliveries[key] = {
+          adminTelegramId: adminId,
+          status: 'delivery_uncertain',
+          attemptCount: (prev?.attemptCount ?? 0) + 1,
+          sentAt: prev?.sentAt,
+          lastAttemptAt: attemptIso,
+          lastError:
+            sendResult.error ||
+            'Неопределённый результат доставки в Telegram (таймаут/обрыв сети)',
+          operationId,
+        };
       } else {
         updatedDeliveries[key] = {
           adminTelegramId: adminId,
-          status: 'failed',
+          status: prev?.status === 'delivery_uncertain' ? 'delivery_uncertain' : 'failed',
           attemptCount: (prev?.attemptCount ?? 0) + 1,
           sentAt: prev?.sentAt,
           lastAttemptAt: attemptIso,
@@ -1090,16 +1117,19 @@ export class FulfillmentService {
     return firestoreRepo.runTransaction<Order>(async (tx) => {
       const latest = (await tx.get<Order>('orders', order.orderId)) || claim.order;
       const latestState = latest.adminNotificationState;
+      // Strict stale-worker fencing: never overwrite if another worker/admin already
+      // moved state out of `sending`, took over with a newer operationId, or owns the lease.
       if (
-        latestState &&
-        latestState.operationId &&
-        latestState.operationId !== operationId
+        !latestState ||
+        latestState.status !== 'sending' ||
+        latestState.operationId !== operationId ||
+        latestState.leaseOwner !== leaseOwner
       ) {
         return latest;
       }
 
       const mergedDeliveries: Record<string, AdminRecipientDeliveryRecord> = {
-        ...(latestState?.recipientDeliveries || {}),
+        ...(latestState.recipientDeliveries || {}),
         ...updatedDeliveries,
       };
       const deliveredIds = uniqueAdminIds.filter(
@@ -1108,15 +1138,18 @@ export class FulfillmentService {
       const undeliveredIds = uniqueAdminIds.filter(
         (id) => mergedDeliveries[String(id)]?.status !== 'sent',
       );
+      const uncertainIds = undeliveredIds.filter(
+        (id) => mergedDeliveries[String(id)]?.status === 'delivery_uncertain',
+      );
 
       if (undeliveredIds.length === 0) {
         const sentState: NotificationDeliveryState = {
           status: 'sent',
-          eventId: latestState?.eventId || eventId,
+          eventId: latestState.eventId || eventId,
           operationId,
           leaseOwner,
-          leaseUntil: latestState?.leaseUntil,
-          attemptCount: latestState?.attemptCount ?? 1,
+          leaseUntil: latestState.leaseUntil,
+          attemptCount: latestState.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
           lastError: undefined,
@@ -1132,14 +1165,40 @@ export class FulfillmentService {
         return updated;
       }
 
-      if (deliveredIds.length > 0) {
-        const partialState: NotificationDeliveryState = {
-          status: 'partial_sent',
-          eventId: latestState?.eventId || eventId,
+      if (uncertainIds.length > 0 || claim.wasUncertainBeforeClaim) {
+        const uncertainState: NotificationDeliveryState = {
+          status: 'delivery_uncertain',
+          eventId: latestState.eventId || eventId,
           operationId,
           leaseOwner,
           leaseUntil: undefined,
-          attemptCount: latestState?.attemptCount ?? 1,
+          attemptCount: latestState.attemptCount ?? 1,
+          sentAt: undefined,
+          uncertainSince: latestState.uncertainSince || finIso,
+          deliveryUncertainAfterCrash: false,
+          lastError:
+            uncertainIds.length > 0
+              ? `Неопределённый результат доставки администраторам (${uncertainIds.join(', ')}); автоповтор заблокирован во избежание дублей.`
+              : `Повторная ручная отправка не удалась; сохраняется delivery_uncertain для (${undeliveredIds.join(', ')}).`,
+          recipientDeliveries: mergedDeliveries,
+        };
+        const updated: Order = {
+          ...latest,
+          adminNotificationState: uncertainState,
+          updatedAt: finIso,
+        };
+        tx.set<Order>('orders', updated.orderId, updated);
+        return updated;
+      }
+
+      if (deliveredIds.length > 0) {
+        const partialState: NotificationDeliveryState = {
+          status: 'partial_sent',
+          eventId: latestState.eventId || eventId,
+          operationId,
+          leaseOwner,
+          leaseUntil: undefined,
+          attemptCount: latestState.attemptCount ?? 1,
           sentAt: undefined,
           deliveryUncertainAfterCrash: false,
           lastError: `Частичная доставка администраторам (${deliveredIds.length}/${uniqueAdminIds.length}); не доставлено: ${undeliveredIds.join(', ')}`,
@@ -1156,11 +1215,11 @@ export class FulfillmentService {
 
       const pendingState: NotificationDeliveryState = {
         status: 'pending',
-        eventId: latestState?.eventId || eventId,
+        eventId: latestState.eventId || eventId,
         operationId,
         leaseOwner,
         leaseUntil: undefined,
-        attemptCount: latestState?.attemptCount ?? 1,
+        attemptCount: latestState.attemptCount ?? 1,
         sentAt: undefined,
         deliveryUncertainAfterCrash: false,
         lastError: `Не удалось доставить уведомление ни одному администратору (${undeliveredIds.join(', ')})`,
@@ -1192,6 +1251,7 @@ export class FulfillmentService {
     order: Order,
     bot: Telegraf | null | undefined,
     forceResend = false,
+    leaseOwnerOverride?: string,
   ): Promise<Order> {
     if (
       !forceResend &&
@@ -1209,7 +1269,7 @@ export class FulfillmentService {
       order.buyerNotificationState?.eventId ||
       `evt_buyer_completed_${order.orderId}`;
     const operationId = `op_buyer_notify_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-    const leaseOwner = this.workerInstanceId;
+    const leaseOwner = leaseOwnerOverride || this.workerInstanceId;
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
@@ -1218,7 +1278,7 @@ export class FulfillmentService {
       | { action: 'delivery_uncertain'; order: Order }
       | { action: 'in_flight'; order: Order }
       | { action: 'recovered_uncertain'; order: Order }
-      | { action: 'claimed'; order: Order };
+      | { action: 'claimed'; order: Order; wasUncertainBeforeClaim: boolean };
 
     const claim = await firestoreRepo.runTransaction<BuyerNotifyClaim>(async (tx) => {
       const current = (await tx.get<Order>('orders', order.orderId)) || order;
@@ -1257,6 +1317,7 @@ export class FulfillmentService {
         }
       }
 
+      const wasUncertainBeforeClaim = state?.status === 'delivery_uncertain';
       const claimingState: NotificationDeliveryState = {
         status: 'sending',
         eventId: state?.eventId || eventId,
@@ -1272,7 +1333,11 @@ export class FulfillmentService {
         updatedAt: nowIso,
       };
       tx.set<Order>('orders', claimedOrder.orderId, claimedOrder);
-      return { action: 'claimed', order: claimedOrder };
+      return {
+        action: 'claimed',
+        order: claimedOrder,
+        wasUncertainBeforeClaim,
+      };
     });
 
     if (claim.action !== 'claimed') {
@@ -1295,10 +1360,13 @@ export class FulfillmentService {
     return firestoreRepo.runTransaction<Order>(async (tx) => {
       const latest = (await tx.get<Order>('orders', order.orderId)) || claim.order;
       const latestState = latest.buyerNotificationState;
+      // Strict stale-worker fencing: never overwrite if another worker/admin already
+      // moved state out of `sending`, took over with a newer operationId, or owns the lease.
       if (
-        latestState &&
-        latestState.operationId &&
-        latestState.operationId !== operationId
+        !latestState ||
+        latestState.status !== 'sending' ||
+        latestState.operationId !== operationId ||
+        latestState.leaseOwner !== leaseOwner
       ) {
         return latest;
       }
@@ -1306,11 +1374,11 @@ export class FulfillmentService {
       if (sendResult.ok) {
         const sentState: NotificationDeliveryState = {
           status: 'sent',
-          eventId: latestState?.eventId || eventId,
+          eventId: latestState.eventId || eventId,
           operationId,
           leaseOwner,
-          leaseUntil: latestState?.leaseUntil,
-          attemptCount: latestState?.attemptCount ?? 1,
+          leaseUntil: latestState.leaseUntil,
+          attemptCount: latestState.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
           lastError: undefined,
@@ -1325,13 +1393,37 @@ export class FulfillmentService {
         return updated;
       }
 
+      if (sendResult.ambiguous || claim.wasUncertainBeforeClaim) {
+        const uncertainState: NotificationDeliveryState = {
+          status: 'delivery_uncertain',
+          eventId: latestState.eventId || eventId,
+          operationId,
+          leaseOwner,
+          leaseUntil: undefined,
+          attemptCount: latestState.attemptCount ?? 1,
+          sentAt: undefined,
+          uncertainSince: latestState.uncertainSince || finIso,
+          deliveryUncertainAfterCrash: false,
+          lastError:
+            sendResult.error ||
+            'Неопределённый результат доставки покупателю (таймаут/обрыв сети Telegram API)',
+        };
+        const updated: Order = {
+          ...latest,
+          buyerNotificationState: uncertainState,
+          updatedAt: finIso,
+        };
+        tx.set<Order>('orders', updated.orderId, updated);
+        return updated;
+      }
+
       const pendingState: NotificationDeliveryState = {
         status: 'pending',
-        eventId: latestState?.eventId || eventId,
+        eventId: latestState.eventId || eventId,
         operationId,
         leaseOwner,
         leaseUntil: undefined,
-        attemptCount: latestState?.attemptCount ?? 1,
+        attemptCount: latestState.attemptCount ?? 1,
         sentAt: undefined,
         deliveryUncertainAfterCrash: false,
         lastError:
@@ -1416,6 +1508,7 @@ export class FulfillmentService {
         throw new Error(`Заказ #${params.orderId} не найден.`);
       }
 
+      const ackOpId = `op_admin_ack_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const updated: Order = { ...current, updatedAt: nowIso };
       if (
         (params.target === 'buyer' || params.target === 'both') &&
@@ -1425,6 +1518,7 @@ export class FulfillmentService {
         updated.buyerNotificationState = {
           ...current.buyerNotificationState,
           status: 'sent',
+          operationId: ackOpId,
           sentAt: current.buyerNotificationState.sentAt || nowIso,
           acknowledgedByAdminId: params.adminTelegramId,
           acknowledgedAt: nowIso,
@@ -1438,6 +1532,7 @@ export class FulfillmentService {
         updated.adminNotificationState = {
           ...current.adminNotificationState,
           status: 'sent',
+          operationId: ackOpId,
           sentAt: current.adminNotificationState.sentAt || nowIso,
           acknowledgedByAdminId: params.adminTelegramId,
           acknowledgedAt: nowIso,
@@ -1466,20 +1561,105 @@ export class FulfillmentService {
     };
   }
 
+  /**
+   * Classifies whether a Telegram sendMessage failure has ambiguous delivery semantics
+   * (request may have been accepted and delivered by Telegram before timeout / socket drop).
+   * Ambiguous errors MUST NOT be auto-retried and MUST transition to `delivery_uncertain`.
+   */
+  private static isAmbiguousTelegramDeliveryError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') {
+      const text = String(error ?? '').toLowerCase();
+      return (
+        text.includes('timeout') ||
+        text.includes('timed out') ||
+        text.includes('socket hang up') ||
+        text.includes('econnreset') ||
+        text.includes('504')
+      );
+    }
+
+    const errRecord = error as {
+      name?: unknown;
+      code?: unknown;
+      message?: unknown;
+      response?: { error_code?: unknown };
+      cause?: { code?: unknown; name?: unknown; message?: unknown };
+    };
+
+    const httpCode = Number(errRecord.response?.error_code);
+    if (httpCode === 504) {
+      return true;
+    }
+    // Definite Telegram Bot API rejections (4xx, 500, 502, 503) are non-ambiguous
+    if (Number.isFinite(httpCode) && httpCode >= 400 && httpCode !== 504) {
+      return false;
+    }
+
+    const ambiguousCodes = new Set([
+      'ETIMEDOUT',
+      'ESOCKETTIMEDOUT',
+      'ECONNRESET',
+      'EPIPE',
+      'ECONNABORTED',
+      'UND_ERR_SOCKET',
+      'UND_ERR_HEADERS_TIMEOUT',
+      'UND_ERR_BODY_TIMEOUT',
+      'UND_ERR_ABORTED',
+      'ABORT_ERR',
+    ]);
+    const code = typeof errRecord.code === 'string' ? errRecord.code.toUpperCase() : '';
+    const causeCode =
+      typeof errRecord.cause?.code === 'string' ? errRecord.cause.code.toUpperCase() : '';
+    if (ambiguousCodes.has(code) || ambiguousCodes.has(causeCode)) {
+      return true;
+    }
+
+    const name = typeof errRecord.name === 'string' ? errRecord.name : '';
+    const causeName = typeof errRecord.cause?.name === 'string' ? errRecord.cause.name : '';
+    if (
+      name === 'AbortError' ||
+      name === 'TimeoutError' ||
+      causeName === 'AbortError' ||
+      causeName === 'TimeoutError'
+    ) {
+      return true;
+    }
+
+    const msg = `${String(errRecord.message ?? '')} ${String(errRecord.cause?.message ?? '')}`.toLowerCase();
+    return (
+      msg.includes('etimedout') ||
+      msg.includes('esockettimedout') ||
+      msg.includes('timed out') ||
+      msg.includes('timeout') ||
+      msg.includes('socket hang up') ||
+      msg.includes('econnreset') ||
+      msg.includes('epipe') ||
+      msg.includes('premature close') ||
+      msg.includes('request aborted') ||
+      msg.includes('504 gateway')
+    );
+  }
+
   private static async sendTelegramMessageWithResult(
     bot: Telegraf,
     chatId: number | string,
     htmlText: string,
     extra: Record<string, unknown>,
     maxAttempts = 2,
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; error?: string; ambiguous?: boolean }> {
     let lastError: unknown;
+    let ambiguous = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         await bot.telegram.sendMessage(chatId, htmlText, extra);
         return { ok: true };
       } catch (error) {
         lastError = error;
+        if (this.isAmbiguousTelegramDeliveryError(error)) {
+          // Stop immediately: Telegram may already have delivered the message before timeout/drop.
+          ambiguous = true;
+          break;
+        }
         if (attempt < maxAttempts) {
           await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
         }
@@ -1490,10 +1670,10 @@ export class FulfillmentService {
       lastError instanceof Error ? lastError.message : String(lastError),
     );
     console.warn(
-      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}:`,
+      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}${ambiguous ? ' [ambiguous/delivery_uncertain]' : ''}:`,
       errMsg,
     );
-    return { ok: false, error: errMsg.slice(0, 300) };
+    return { ok: false, ambiguous, error: errMsg.slice(0, 300) };
   }
 
   private static async sendTelegramMessageWithRetry(
@@ -2134,6 +2314,8 @@ export class FulfillmentService {
    * - Recovers pending / expired-lease / crash-interrupted buyer notifications for `completed` orders.
    * - Recovers pending / partial_sent / no_recipients (once ADMIN_IDS configured) / expired-lease
    *   admin notifications across `processing`, `failed`, and `completed` orders without starvation.
+   * - Uses separated `sending` vs actionable queries and rotating `__name__` cursors (limit=50 per pass)
+   *   so active leases or persistently failing orders (e.g. blocked bots) never starve the rest of the queue.
    * - Respects active `sending` leases and never resends `sent` or `delivery_uncertain` notifications.
    */
   private static async recoverPendingNotifications(
@@ -2141,41 +2323,91 @@ export class FulfillmentService {
     nowMs: number,
     skipBuyerOrderIds: Set<string>,
     skipAdminOrderIds: Set<string>,
+    leaseOwnerOverride?: string,
   ): Promise<Order[]> {
     if (!bot) {
       return [];
     }
 
     const progressed: Order[] = [];
+    const batchLimit = Math.max(1, this.notificationRecoveryBatchLimit);
+    const useSharedCursor = !leaseOwnerOverride;
 
     // 1. Buyer notifications for `completed` orders:
-    //    (a) Direct single-field index query on `buyerNotificationState.status` (zero starvation even with >50k completed orders)
-    //    (b) Recent `completed` orders (uses existing composite index `fulfillmentStatus ASC, createdAt DESC`)
-    //        to catch crash-before-notify orders where `buyerNotificationState` and `buyerNotifiedAt` are both missing.
-    const buyerCandidateMap = new Map<string, Order>();
-    const [pendingBuyerStateOrders, recentCompletedOrders] = await Promise.all([
+    //    (a) Actionable `pending` via single-field index + rotating documentId cursor (oldest-first, zero starvation)
+    //    (b) In-flight `sending` via separate single-field index query (active leases never starve `pending`)
+    //    (c) Recent `completed` orders (uses existing composite index `fulfillmentStatus ASC, createdAt DESC`)
+    //        to catch crash-before-notify / legacy orders where `buyerNotificationState` and `buyerNotifiedAt` are missing.
+    let pendingBuyerOrders = await firestoreRepo.queryDocs<Order>('orders', {
+      where: [
+        {
+          field: 'buyerNotificationState.status',
+          op: '==',
+          value: 'pending',
+        },
+      ],
+      startAfter: useSharedCursor
+        ? (this.buyerPendingCursorOrderId ?? undefined)
+        : undefined,
+      limit: batchLimit,
+    });
+
+    if (useSharedCursor) {
+      if (pendingBuyerOrders.length === 0 && this.buyerPendingCursorOrderId) {
+        // Reached the end of the pending queue; wrap cleanly to head in the same pass
+        this.buyerPendingCursorOrderId = null;
+        pendingBuyerOrders = await firestoreRepo.queryDocs<Order>('orders', {
+          where: [
+            {
+              field: 'buyerNotificationState.status',
+              op: '==',
+              value: 'pending',
+            },
+          ],
+          limit: batchLimit,
+        });
+      }
+      if (pendingBuyerOrders.length >= batchLimit) {
+        this.buyerPendingCursorOrderId =
+          pendingBuyerOrders[pendingBuyerOrders.length - 1].orderId;
+      } else {
+        this.buyerPendingCursorOrderId = null;
+      }
+    }
+
+    const [sendingBuyerOrders, recentCompletedOrders] = await Promise.all([
       firestoreRepo.queryDocs<Order>('orders', {
         where: [
           {
             field: 'buyerNotificationState.status',
-            op: 'in',
-            value: ['pending', 'sending'],
+            op: '==',
+            value: 'sending',
           },
         ],
-        limit: 50,
+        limit: batchLimit,
       }),
       firestoreRepo.queryDocs<Order>('orders', {
         where: [{ field: 'fulfillmentStatus', op: '==', value: 'completed' }],
         orderBy: { field: 'createdAt', direction: 'desc' },
-        limit: 50,
+        limit: batchLimit,
       }),
     ]);
 
-    for (const ord of pendingBuyerStateOrders) {
+    const buyerCandidateMap = new Map<string, Order>();
+    for (const ord of pendingBuyerOrders) {
       buyerCandidateMap.set(ord.orderId, ord);
     }
-    for (const ord of recentCompletedOrders) {
+    for (const ord of sendingBuyerOrders) {
       if (!buyerCandidateMap.has(ord.orderId)) {
+        buyerCandidateMap.set(ord.orderId, ord);
+      }
+    }
+    for (const ord of recentCompletedOrders) {
+      if (
+        !ord.buyerNotificationState &&
+        !ord.buyerNotifiedAt &&
+        !buyerCandidateMap.has(ord.orderId)
+      ) {
         buyerCandidateMap.set(ord.orderId, ord);
       }
     }
@@ -2189,7 +2421,12 @@ export class FulfillmentService {
       }
       skipBuyerOrderIds.add(ord.orderId);
       try {
-        const updated = await this.ensureBuyerNotified(ord, bot);
+        const updated = await this.ensureBuyerNotified(
+          ord,
+          bot,
+          false,
+          leaseOwnerOverride,
+        );
         if (this.didBuyerNotificationProgress(ord, updated)) {
           progressed.push(updated);
         }
@@ -2203,29 +2440,128 @@ export class FulfillmentService {
       }
     }
 
-    // 2. Admin notifications across orders with explicit unfinished `adminNotificationState`
-    //    (anti-starvation beyond the first 50 processing/failed orders, plus auto-completed orders
-    //    whose admin notification failed or remained in `no_recipients` until ADMIN_IDS was configured).
-    const adminStatuses: NotificationDeliveryStatus[] =
-      getEnvConfig().adminIds.length > 0
-        ? ['pending', 'partial_sent', 'no_recipients', 'sending']
-        : ['pending', 'partial_sent', 'sending'];
+    // 2. Admin notifications across orders with explicit unfinished `adminNotificationState`:
+    //    Uses pure single-field equality queries (`==` + optional `__name__` cursor) so Cloud
+    //    Firestore satisfies every query via built-in automatic single-field indexes without
+    //    requiring composite indexes, while preventing starvation across >50 pending/partial/sending orders.
+    let pendingAdminOrders = await firestoreRepo.queryDocs<Order>('orders', {
+      where: [
+        {
+          field: 'adminNotificationState.status',
+          op: '==',
+          value: 'pending',
+        },
+      ],
+      startAfter: useSharedCursor
+        ? (this.adminPendingCursorOrderId ?? undefined)
+        : undefined,
+      limit: batchLimit,
+    });
 
-    const pendingAdminStateOrders = await firestoreRepo.queryDocs<Order>(
-      'orders',
-      {
+    if (useSharedCursor) {
+      if (pendingAdminOrders.length === 0 && this.adminPendingCursorOrderId) {
+        this.adminPendingCursorOrderId = null;
+        pendingAdminOrders = await firestoreRepo.queryDocs<Order>('orders', {
+          where: [
+            {
+              field: 'adminNotificationState.status',
+              op: '==',
+              value: 'pending',
+            },
+          ],
+          limit: batchLimit,
+        });
+      }
+      if (pendingAdminOrders.length >= batchLimit) {
+        this.adminPendingCursorOrderId =
+          pendingAdminOrders[pendingAdminOrders.length - 1].orderId;
+      } else {
+        this.adminPendingCursorOrderId = null;
+      }
+    }
+
+    let partialAdminOrders = await firestoreRepo.queryDocs<Order>('orders', {
+      where: [
+        {
+          field: 'adminNotificationState.status',
+          op: '==',
+          value: 'partial_sent',
+        },
+      ],
+      startAfter: useSharedCursor
+        ? (this.adminPartialCursorOrderId ?? undefined)
+        : undefined,
+      limit: batchLimit,
+    });
+
+    if (useSharedCursor) {
+      if (partialAdminOrders.length === 0 && this.adminPartialCursorOrderId) {
+        this.adminPartialCursorOrderId = null;
+        partialAdminOrders = await firestoreRepo.queryDocs<Order>('orders', {
+          where: [
+            {
+              field: 'adminNotificationState.status',
+              op: '==',
+              value: 'partial_sent',
+            },
+          ],
+          limit: batchLimit,
+        });
+      }
+      if (partialAdminOrders.length >= batchLimit) {
+        this.adminPartialCursorOrderId =
+          partialAdminOrders[partialAdminOrders.length - 1].orderId;
+      } else {
+        this.adminPartialCursorOrderId = null;
+      }
+    }
+
+    const [noRecipientAdminOrders, sendingAdminOrders] = await Promise.all([
+      getEnvConfig().adminIds.length > 0
+        ? firestoreRepo.queryDocs<Order>('orders', {
+            where: [
+              {
+                field: 'adminNotificationState.status',
+                op: '==',
+                value: 'no_recipients',
+              },
+            ],
+            limit: batchLimit,
+          })
+        : Promise.resolve<Order[]>([]),
+      firestoreRepo.queryDocs<Order>('orders', {
         where: [
           {
             field: 'adminNotificationState.status',
-            op: 'in',
-            value: adminStatuses,
+            op: '==',
+            value: 'sending',
           },
         ],
-        limit: 50,
-      },
-    );
+        limit: batchLimit,
+      }),
+    ]);
 
-    for (const ord of pendingAdminStateOrders) {
+    const adminCandidateMap = new Map<string, Order>();
+    for (const ord of pendingAdminOrders) {
+      adminCandidateMap.set(ord.orderId, ord);
+    }
+    for (const ord of partialAdminOrders) {
+      if (!adminCandidateMap.has(ord.orderId)) {
+        adminCandidateMap.set(ord.orderId, ord);
+      }
+    }
+    for (const ord of noRecipientAdminOrders) {
+      if (!adminCandidateMap.has(ord.orderId)) {
+        adminCandidateMap.set(ord.orderId, ord);
+      }
+    }
+    for (const ord of sendingAdminOrders) {
+      if (!adminCandidateMap.has(ord.orderId)) {
+        adminCandidateMap.set(ord.orderId, ord);
+      }
+    }
+
+    for (const ord of adminCandidateMap.values()) {
       if (
         (ord.fulfillmentStatus !== 'processing' &&
           ord.fulfillmentStatus !== 'failed' &&
@@ -2237,7 +2573,12 @@ export class FulfillmentService {
       }
       skipAdminOrderIds.add(ord.orderId);
       try {
-        const updated = await this.ensureAdminNotified(ord, bot);
+        const updated = await this.ensureAdminNotified(
+          ord,
+          bot,
+          false,
+          leaseOwnerOverride,
+        );
         if (this.didAdminNotificationProgress(ord, updated)) {
           progressed.push(updated);
         }
@@ -2260,19 +2601,25 @@ export class FulfillmentService {
    * - Retries eligible orders in 'failed' whose backoff delay has elapsed and attempts < MAX_FULFILLMENT_ATTEMPTS
    * - Recovers stale 'processing' orders or retries missing admin/buyer notifications
    * - Recovers unfinished buyer notifications for 'completed' orders and admin notifications across orders
-   * Guarded by `isRecoveryPassRunning` mutex so two recovery passes never overlap.
+   * Guarded by `isRecoveryPassRunning` mutex so two recovery passes never overlap within the same process.
    */
   public static async recoverPendingFulfillments(
     bot: Telegraf | null | undefined,
+    options?: { bypassLocalMutex?: boolean; workerId?: string },
   ): Promise<Order[]> {
-    if (this.isRecoveryPassRunning) {
+    const bypassLocalMutex = Boolean(options?.bypassLocalMutex);
+    const leaseOwnerOverride = options?.workerId;
+
+    if (!bypassLocalMutex && this.isRecoveryPassRunning) {
       return [];
     }
     if (!firestoreRepo.isProductionStorageHealthy()) {
       return [];
     }
 
-    this.isRecoveryPassRunning = true;
+    if (!bypassLocalMutex) {
+      this.isRecoveryPassRunning = true;
+    }
     const recovered: Order[] = [];
     const adminNotifyAttemptedInPass = new Set<string>();
     const buyerNotifyAttemptedInPass = new Set<string>();
@@ -2338,7 +2685,12 @@ export class FulfillmentService {
         } else if (this.needsAdminNotificationRecovery(ord, nowMs)) {
           adminNotifyAttemptedInPass.add(ord.orderId);
           try {
-            const notified = await this.ensureAdminNotified(ord, bot);
+            const notified = await this.ensureAdminNotified(
+              ord,
+              bot,
+              false,
+              leaseOwnerOverride,
+            );
             if (this.didAdminNotificationProgress(ord, notified)) {
               recovered.push(notified);
             }
@@ -2398,7 +2750,12 @@ export class FulfillmentService {
         ) {
           adminNotifyAttemptedInPass.add(ord.orderId);
           try {
-            const notified = await this.ensureAdminNotified(ord, bot);
+            const notified = await this.ensureAdminNotified(
+              ord,
+              bot,
+              false,
+              leaseOwnerOverride,
+            );
             if (this.didAdminNotificationProgress(ord, notified)) {
               recovered.push(notified);
             }
@@ -2438,6 +2795,7 @@ export class FulfillmentService {
           Date.now(),
           buyerNotifyAttemptedInPass,
           adminNotifyAttemptedInPass,
+          leaseOwnerOverride,
         );
         for (const notifiedOrder of notificationRecovered) {
           recovered.push(notifiedOrder);
@@ -2488,7 +2846,9 @@ export class FulfillmentService {
 
       return recovered;
     } finally {
-      this.isRecoveryPassRunning = false;
+      if (!bypassLocalMutex) {
+        this.isRecoveryPassRunning = false;
+      }
     }
   }
 

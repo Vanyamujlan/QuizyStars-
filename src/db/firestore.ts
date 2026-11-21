@@ -7,6 +7,7 @@ import {
 import {
   getFirestore as getAdminFirestore,
   Firestore as AdminFirestore,
+  FieldPath,
   Query as AdminQuery,
   WhereFilterOp,
 } from 'firebase-admin/firestore';
@@ -255,53 +256,74 @@ function applyInMemorySortAndCursorPagination<T>(
       }
       return getDocumentPrimaryKey(recA).localeCompare(getDocumentPrimaryKey(recB)) * factor;
     });
+  } else {
+    // Match Cloud Firestore's default implicit `__name__` ascending document ID ordering
+    result.sort((a, b) =>
+      getDocumentPrimaryKey(a as Record<string, unknown>).localeCompare(
+        getDocumentPrimaryKey(b as Record<string, unknown>),
+      ),
+    );
   }
 
   // Cursor pagination (startAfter) with deterministic tie-breaker on document primary key
-  if (options?.startAfter !== undefined && options.startAfter !== null && orderField) {
+  if (options?.startAfter !== undefined && options.startAfter !== null) {
     const cursorVal = options.startAfter;
-    const cursorIndex = result.findIndex((item) => {
-      const rec = item as Record<string, unknown>;
-      const pk = getDocumentPrimaryKey(rec);
-      const fieldVal = getNestedFieldValue(rec, orderField);
-      if (typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal && 'value' in cursorVal) {
-        const typedCursor = cursorVal as { value: unknown; id: string };
-        return fieldVal === typedCursor.value && pk === typedCursor.id;
-      }
-      return fieldVal === cursorVal || pk === cursorVal;
-    });
+    if (orderField) {
+      const cursorIndex = result.findIndex((item) => {
+        const rec = item as Record<string, unknown>;
+        const pk = getDocumentPrimaryKey(rec);
+        const fieldVal = getNestedFieldValue(rec, orderField);
+        if (typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal && 'value' in cursorVal) {
+          const typedCursor = cursorVal as { value: unknown; id: string };
+          return fieldVal === typedCursor.value && pk === typedCursor.id;
+        }
+        return fieldVal === cursorVal || pk === cursorVal;
+      });
 
-    if (cursorIndex >= 0) {
-      result = result.slice(cursorIndex + 1);
+      if (cursorIndex >= 0) {
+        result = result.slice(cursorIndex + 1);
+      } else {
+        // Value comparison fallback if exact item was deleted
+        const compareVal =
+          typeof cursorVal === 'object' && cursorVal !== null && 'value' in cursorVal
+            ? (cursorVal as { value: unknown }).value
+            : cursorVal;
+        const compareId =
+          typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal
+            ? String((cursorVal as { id: unknown }).id)
+            : null;
+        result = result.filter((item) => {
+          const rec = item as Record<string, unknown>;
+          const fieldVal = getNestedFieldValue(rec, orderField);
+          if (typeof fieldVal === 'number' && typeof compareVal === 'number') {
+            if (fieldVal !== compareVal) {
+              return direction === 'desc' ? fieldVal < compareVal : fieldVal > compareVal;
+            }
+          } else {
+            const cmp = String(fieldVal ?? '').localeCompare(String(compareVal ?? ''));
+            if (cmp !== 0) {
+              return direction === 'desc' ? cmp < 0 : cmp > 0;
+            }
+          }
+          if (compareId) {
+            const pkCmp = getDocumentPrimaryKey(rec).localeCompare(compareId);
+            return direction === 'desc' ? pkCmp < 0 : pkCmp > 0;
+          }
+          return false;
+        });
+      }
     } else {
-      // Value comparison fallback if exact item was deleted
-      const compareVal =
-        typeof cursorVal === 'object' && cursorVal !== null && 'value' in cursorVal
-          ? (cursorVal as { value: unknown }).value
-          : cursorVal;
+      // Document ID (`__name__`) cursor pagination when no explicit orderBy is specified
       const compareId =
         typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal
           ? String((cursorVal as { id: unknown }).id)
-          : null;
-      result = result.filter((item) => {
-        const rec = item as Record<string, unknown>;
-        const fieldVal = rec[orderField];
-        if (typeof fieldVal === 'number' && typeof compareVal === 'number') {
-          if (fieldVal !== compareVal) {
-            return direction === 'desc' ? fieldVal < compareVal : fieldVal > compareVal;
-          }
-        } else {
-          const cmp = String(fieldVal ?? '').localeCompare(String(compareVal ?? ''));
-          if (cmp !== 0) {
-            return direction === 'desc' ? cmp < 0 : cmp > 0;
-          }
-        }
-        if (compareId) {
-          const pkCmp = getDocumentPrimaryKey(rec).localeCompare(compareId);
-          return direction === 'desc' ? pkCmp < 0 : pkCmp > 0;
-        }
-        return false;
-      });
+          : String(cursorVal);
+      result = result.filter(
+        (item) =>
+          getDocumentPrimaryKey(item as Record<string, unknown>).localeCompare(
+            compareId,
+          ) > 0,
+      );
     }
   } else if (options?.offset && options.offset > 0) {
     result = result.slice(options.offset);
@@ -983,6 +1005,10 @@ export class FirestoreRepository {
             options.orderBy.field,
             options.orderBy.direction || 'asc',
           );
+        } else if (options?.startAfter !== undefined && options.startAfter !== null) {
+          // Explicit documentId ordering ensures startAfter(cursorId) works even if cursor doc was deleted
+          // and uses Firestore's built-in automatic single-field index without requiring composite indexes.
+          query = query.orderBy(FieldPath.documentId(), 'asc');
         }
         if (options?.startAfter !== undefined && options.startAfter !== null) {
           let appliedSnapshotCursor = false;
@@ -1018,7 +1044,11 @@ export class FirestoreRepository {
               options.startAfter !== null &&
               'value' in options.startAfter
                 ? (options.startAfter as { value: unknown }).value
-                : options.startAfter;
+                : typeof options.startAfter === 'object' &&
+                    options.startAfter !== null &&
+                    'id' in options.startAfter
+                  ? (options.startAfter as { id: unknown }).id
+                  : options.startAfter;
             query = query.startAfter(cursorVal);
           }
         } else if (options?.offset && options.offset > 0) {

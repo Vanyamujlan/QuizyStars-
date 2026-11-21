@@ -339,6 +339,10 @@ async function runTest(
   name: string,
   fn: () => Promise<string>,
 ): Promise<void> {
+  const filterRaw = process.env.TEST_FILTER?.trim();
+  if (filterRaw && !new RegExp(filterRaw).test(id)) {
+    return;
+  }
   try {
     const details = await fn();
     testResults.push({
@@ -12964,6 +12968,1544 @@ async function runFullAuditTestSuite(): Promise<void> {
       }
 
       return 'При сбое Telegram API уведомления остаются pending с lastError и сброшенным leaseUntil, а после восстановления API успешно доставляются на следующем проходе.';
+    },
+  );
+
+  // ===========================================================================
+  // 15. STAGE 2.2: NOTIFICATION RECOVERY AUDIT & HARDENING TESTS (S22-01..S22-10)
+  // ===========================================================================
+
+  await runTest(
+    'S22-01',
+    'Fulfillment',
+    'Stage 2.2: Неопределённый timeout/обрыв сети Telegram API (ETIMEDOUT/504) не повторяется автоматически и сразу переводит buyer/admin в delivery_uncertain',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9001001,9001002';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_01_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const buyer = { id: 220101, username: 's22_timeout_buyer', first_name: 'TimeoutBuyer' };
+        await UserService.upsertFromTelegram(buyer);
+        const nowIso = new Date().toISOString();
+
+        const buyerOrder = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_timeout_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', buyerOrder.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'pending',
+            eventId: `evt_buyer_completed_${buyerOrder.orderId}`,
+            operationId: 'op_s22_01_buyer_init',
+            leaseOwner: 'worker_init',
+            attemptCount: 0,
+          },
+        });
+
+        const adminOrder = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_timeout_buyer',
+          productId: 'stars_custom',
+          quantity: 200,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', adminOrder.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: nowIso,
+          mystarsOrderId: 'ms_s22_01_admin_timeout',
+          externalExecutionReference: 'mystars:ms_s22_01_admin_timeout',
+          adminNotifiedAt: undefined,
+          adminNotificationState: {
+            status: 'pending',
+            eventId: `evt_admin_fulfillment_${adminOrder.orderId}`,
+            operationId: 'op_s22_01_admin_init',
+            leaseOwner: 'worker_init',
+            attemptCount: 0,
+          },
+        });
+
+        const attemptsByChat = new Map<number, number>();
+        const timeoutBot = {
+          telegram: {
+            sendMessage: async (chatId: number | string) => {
+              const id = Number(chatId);
+              attemptsByChat.set(id, (attemptsByChat.get(id) ?? 0) + 1);
+              if (id === buyer.id) {
+                const err = new Error('request timed out after 10000ms') as Error & { code?: string };
+                err.code = 'ETIMEDOUT';
+                throw err;
+              }
+              if (id === 9001001) {
+                return { message_id: 7001 };
+              }
+              if (id === 9001002) {
+                throw new Error('504: Gateway Timeout (socket hang up)');
+              }
+              return { message_id: 7000 };
+            },
+          },
+        } as unknown as Telegraf;
+
+        await FulfillmentService.recoverPendingFulfillments(timeoutBot);
+
+        // Покупатель: ровно 1 попытка (БЕЗ внутреннего retry!), статус delivery_uncertain, buyerNotifiedAt не выставлен
+        assert.equal(attemptsByChat.get(buyer.id), 1, 'При ETIMEDOUT не должно быть внутреннего ретрая sendMessage');
+        const buyerAfter = await OrderService.getOrderById(buyerOrder.orderId);
+        assert.equal(buyerAfter?.buyerNotificationState?.status, 'delivery_uncertain');
+        assert.equal(buyerAfter?.buyerNotifiedAt, undefined);
+        assert.equal(buyerAfter?.buyerNotificationState?.leaseUntil, undefined);
+        assert.ok(buyerAfter?.buyerNotificationState?.lastError?.includes('timed out'));
+
+        // Админы: 9001001 получил (sent), 9001002 поймал 504 (ровно 1 попытка -> delivery_uncertain)
+        assert.equal(attemptsByChat.get(9001001), 1);
+        assert.equal(attemptsByChat.get(9001002), 1, 'При 504/socket hang up не должно быть внутреннего ретрая');
+        const adminAfter = await OrderService.getOrderById(adminOrder.orderId);
+        assert.equal(adminAfter?.adminNotificationState?.status, 'delivery_uncertain');
+        assert.equal(adminAfter?.adminNotifiedAt, undefined);
+        assert.equal(adminAfter?.adminNotificationState?.recipientDeliveries?.['9001001']?.status, 'sent');
+        assert.equal(
+          adminAfter?.adminNotificationState?.recipientDeliveries?.['9001002']?.status,
+          'delivery_uncertain',
+        );
+
+        // Повторный автоматический проход НЕ трогает delivery_uncertain и отправляет 0 сообщений
+        const healthyMessages: Array<{ chatId: number | string; text: string }> = [];
+        await FulfillmentService.recoverPendingFulfillments(createMockBot(healthyMessages));
+        assert.equal(healthyMessages.length, 0, 'Автоматический recovery не должен повторно отправлять delivery_uncertain');
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'ETIMEDOUT и 504/socket hang up остановились на 1 попытке и перевели buyer/admin в delivery_uncertain без автодублей (сохранив sent для уже доставленного админа).';
+    },
+  );
+
+  await runTest(
+    'S22-02',
+    'Fulfillment',
+    'Stage 2.2: Сбой после отправки до записи sent -> delivery_uncertain -> безопасное ручное подтверждение (acknowledge) и ручная переотправка (forceResend, включая сбой без деградации в pending)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9002001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_02_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const buyer = { id: 220201, username: 's22_crash_buyer', first_name: 'CrashBuyer' };
+        await UserService.upsertFromTelegram(buyer);
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const expiredLease = Timestamp.fromMillis(nowMs - 45_000);
+
+        // Заказ 1: краш во время sending buyer notification -> затем ручной forceResend (сначала 502, потом успех)
+        const orderResend = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_crash_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', orderResend.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'sending',
+            eventId: `evt_buyer_completed_${orderResend.orderId}`,
+            operationId: 'op_crashed_before_commit_1',
+            leaseOwner: 'dead_worker_1',
+            leaseUntil: expiredLease,
+            attemptCount: 1,
+          },
+        });
+
+        // Заказ 2: краш во время sending admin notification -> затем ручной acknowledge без повторной отправки
+        const orderAck = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_crash_buyer',
+          productId: 'stars_custom',
+          quantity: 150,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', orderAck.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: nowIso,
+          mystarsOrderId: 'ms_s22_02_ack',
+          externalExecutionReference: 'mystars:ms_s22_02_ack',
+          adminNotifiedAt: undefined,
+          adminNotificationState: {
+            status: 'sending',
+            eventId: `evt_admin_fulfillment_${orderAck.orderId}`,
+            operationId: 'op_crashed_before_commit_2',
+            leaseOwner: 'dead_worker_2',
+            leaseUntil: expiredLease,
+            attemptCount: 1,
+          },
+        });
+
+        const messages: Array<{ chatId: number | string; text: string }> = [];
+        const bot = createMockBot(messages);
+
+        // 1. Автоматическое восстановление переводит оба протухших lease в delivery_uncertain без отправки дублей
+        await FulfillmentService.recoverPendingFulfillments(bot);
+        assert.equal(messages.length, 0);
+
+        const resendUncertain = await OrderService.getOrderById(orderResend.orderId);
+        assert.equal(resendUncertain?.buyerNotificationState?.status, 'delivery_uncertain');
+        assert.equal(resendUncertain?.buyerNotificationState?.deliveryUncertainAfterCrash, true);
+
+        const ackUncertain = await OrderService.getOrderById(orderAck.orderId);
+        assert.equal(ackUncertain?.adminNotificationState?.status, 'delivery_uncertain');
+        assert.equal(ackUncertain?.adminNotificationState?.deliveryUncertainAfterCrash, true);
+
+        // 2. Ручной forceResend падает с 502 -> статус ДОЛЖЕН остаться delivery_uncertain (не деградировать в pending!)
+        const failingBot = createMockBot([], true);
+        const failedResend = await FulfillmentService.forceResendOrderNotification({
+          orderId: orderResend.orderId,
+          target: 'buyer',
+          bot: failingBot,
+        });
+        assert.equal(failedResend.sentBuyer, false);
+        assert.equal(
+          failedResend.order?.buyerNotificationState?.status,
+          'delivery_uncertain',
+          'Сбой ручного forceResend на delivery_uncertain не должен переводить заказ обратно в автоповторяемый pending',
+        );
+
+        // Автоматический проход после неуспешного forceResend всё ещё отправляет 0 сообщений
+        await FulfillmentService.recoverPendingFulfillments(bot);
+        assert.equal(messages.length, 0);
+
+        // 3. Ручной forceResend при работающем Telegram -> доставляет ровно 1 сообщение и переводит в sent
+        const okResend = await FulfillmentService.forceResendOrderNotification({
+          orderId: orderResend.orderId,
+          target: 'buyer',
+          bot,
+        });
+        assert.equal(okResend.sentBuyer, true);
+        assert.equal(okResend.order?.buyerNotificationState?.status, 'sent');
+        assert.ok(okResend.order?.buyerNotifiedAt);
+        assert.equal(messages.filter((m) => m.chatId === buyer.id).length, 1);
+
+        // 4. Ручное подтверждение acknowledgeUncertainNotification -> переводит в sent без отправки Telegram
+        const ackOrder = await FulfillmentService.acknowledgeUncertainNotification({
+          orderId: orderAck.orderId,
+          target: 'admin',
+          adminTelegramId: 9002001,
+        });
+        assert.equal(ackOrder.adminNotificationState?.status, 'sent');
+        assert.equal(ackOrder.adminNotificationState?.acknowledgedByAdminId, 9002001);
+        assert.ok(ackOrder.adminNotifiedAt);
+        assert.equal(messages.filter((m) => m.chatId === 9002001).length, 0);
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Истёкшие sending-lease перешли в delivery_uncertain; сбой forceResend сохранил delivery_uncertain без автоповторов; успешный forceResend и acknowledge корректно финализировали статусы.';
+    },
+  );
+
+  await runTest(
+    'S22-03',
+    'Fulfillment',
+    'Stage 2.2: Два параллельных recovery-воркера (bypassLocalMutex + разные workerId) конкурируют за один заказ -> атомарный lease допускает ровно 1 отправку',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9003001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_03_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const buyer = { id: 220301, username: 's22_race_buyer', first_name: 'RaceBuyer' };
+        await UserService.upsertFromTelegram(buyer);
+        const nowIso = new Date().toISOString();
+
+        const buyerOrder = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_race_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', buyerOrder.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'pending',
+            eventId: `evt_buyer_completed_${buyerOrder.orderId}`,
+            operationId: 'op_s22_03_buyer',
+            leaseOwner: 'old_worker',
+            attemptCount: 1,
+          },
+        });
+
+        const adminOrder = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_race_buyer',
+          productId: 'stars_custom',
+          quantity: 200,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', adminOrder.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: nowIso,
+          mystarsOrderId: 'ms_s22_03_parallel',
+          externalExecutionReference: 'mystars:ms_s22_03_parallel',
+          adminNotifiedAt: undefined,
+          adminNotificationState: {
+            status: 'pending',
+            eventId: `evt_admin_fulfillment_${adminOrder.orderId}`,
+            operationId: 'op_s22_03_admin',
+            leaseOwner: 'old_worker',
+            attemptCount: 1,
+          },
+        });
+
+        const sentLog: Array<{ chatId: number; text: string }> = [];
+        const slowBot = {
+          telegram: {
+            sendMessage: async (chatId: number | string, text: string) => {
+              await new Promise((r) => setTimeout(r, 40));
+              sentLog.push({ chatId: Number(chatId), text });
+              return { message_id: 8000 + sentLog.length };
+            },
+          },
+        } as unknown as Telegraf;
+
+        // Имитация двух независимых подов/воркеров (обход локального mutex + разные workerId)
+        await Promise.all([
+          FulfillmentService.recoverPendingFulfillments(slowBot, {
+            bypassLocalMutex: true,
+            workerId: 'pod_worker_A',
+          }),
+          FulfillmentService.recoverPendingFulfillments(slowBot, {
+            bypassLocalMutex: true,
+            workerId: 'pod_worker_B',
+          }),
+        ]);
+
+        assert.equal(
+          sentLog.filter((m) => m.chatId === buyer.id).length,
+          1,
+          'Два параллельных воркера должны отправить ровно 1 уведомление покупателю',
+        );
+        assert.equal(
+          sentLog.filter((m) => m.chatId === 9003001).length,
+          1,
+          'Два параллельных воркера должны отправить ровно 1 уведомление админу',
+        );
+
+        const finalBuyer = await OrderService.getOrderById(buyerOrder.orderId);
+        const finalAdmin = await OrderService.getOrderById(adminOrder.orderId);
+        assert.equal(finalBuyer?.buyerNotificationState?.status, 'sent');
+        assert.ok(finalBuyer?.buyerNotifiedAt);
+        assert.equal(finalAdmin?.adminNotificationState?.status, 'sent');
+        assert.ok(finalAdmin?.adminNotifiedAt);
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Два параллельных воркера с разными workerId и bypassLocalMutex доставили ровно по 1 сообщению покупателю и админу благодаря атомарному Firestore lease.';
+    },
+  );
+
+  await runTest(
+    'S22-04',
+    'Fulfillment',
+    'Stage 2.2: Одновременный запуск ручного forceResend и автоматического recoverPendingFulfillments не вызывает дублей благодаря активному lease',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9004001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_04_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const buyer = { id: 220401, username: 's22_manual_race', first_name: 'ManualRace' };
+        await UserService.upsertFromTelegram(buyer);
+        const nowIso = new Date().toISOString();
+
+        // Сценарий A: авто-recovery захватывает lease, а в это время админ жмёт forceResend
+        const orderA = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_manual_race',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', orderA.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'pending',
+            eventId: `evt_buyer_completed_${orderA.orderId}`,
+            operationId: 'op_s22_04_a',
+            leaseOwner: 'worker_init',
+            attemptCount: 1,
+          },
+        });
+
+        let releaseSendA!: () => void;
+        let sendAStarted!: () => void;
+        const sendAStartedPromise = new Promise<void>((r) => {
+          sendAStarted = r;
+        });
+        const sendAGate = new Promise<void>((r) => {
+          releaseSendA = r;
+        });
+
+        const sentA: number[] = [];
+        const gatedBotA = {
+          telegram: {
+            sendMessage: async (chatId: number | string) => {
+              sendAStarted();
+              await sendAGate;
+              sentA.push(Number(chatId));
+              return { message_id: 8401 };
+            },
+          },
+        } as unknown as Telegraf;
+
+        const recoveryPromiseA = FulfillmentService.recoverPendingFulfillments(gatedBotA, {
+          bypassLocalMutex: true,
+          workerId: 'auto_worker_A',
+        });
+        await sendAStartedPromise;
+
+        // Пока авто-recovery держит sending-lease, ручной forceResend должен увидеть skippedInFlight=true
+        const manualDuringAuto = await FulfillmentService.forceResendOrderNotification({
+          orderId: orderA.orderId,
+          target: 'buyer',
+          bot: gatedBotA,
+        });
+        assert.equal(manualDuringAuto.skippedInFlight, true);
+        assert.equal(manualDuringAuto.sentBuyer, false);
+
+        releaseSendA();
+        await recoveryPromiseA;
+        assert.equal(sentA.length, 1, 'Сценарий A: должно уйти ровно 1 сообщение');
+
+        // Сценарий B: ручной forceResend захватывает lease, а в это время запускается авто-recovery
+        const orderB = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_manual_race',
+          productId: 'stars_custom',
+          quantity: 150,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', orderB.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'pending',
+            eventId: `evt_buyer_completed_${orderB.orderId}`,
+            operationId: 'op_s22_04_b',
+            leaseOwner: 'worker_init',
+            attemptCount: 1,
+          },
+        });
+
+        let releaseSendB!: () => void;
+        let sendBStarted!: () => void;
+        const sendBStartedPromise = new Promise<void>((r) => {
+          sendBStarted = r;
+        });
+        const sendBGate = new Promise<void>((r) => {
+          releaseSendB = r;
+        });
+
+        const sentB: number[] = [];
+        const gatedBotB = {
+          telegram: {
+            sendMessage: async (chatId: number | string) => {
+              sendBStarted();
+              await sendBGate;
+              sentB.push(Number(chatId));
+              return { message_id: 8402 };
+            },
+          },
+        } as unknown as Telegraf;
+
+        const manualPromiseB = FulfillmentService.forceResendOrderNotification({
+          orderId: orderB.orderId,
+          target: 'buyer',
+          bot: gatedBotB,
+        });
+        await sendBStartedPromise;
+
+        // Авто-recovery в момент активного ручного lease должен пропустить заказ
+        await FulfillmentService.recoverPendingFulfillments(gatedBotB, {
+          bypassLocalMutex: true,
+          workerId: 'auto_worker_B',
+        });
+
+        releaseSendB();
+        const manualResB = await manualPromiseB;
+        assert.equal(manualResB.sentBuyer, true);
+        assert.equal(sentB.length, 1, 'Сценарий B: должно уйти ровно 1 сообщение');
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'В обоих направлениях гонки (auto vs manual и manual vs auto) активный sending-lease гарантировал ровно 1 доставку без дублей.';
+    },
+  );
+
+  await runTest(
+    'S22-05',
+    'Fulfillment',
+    'Stage 2.2: Устаревший медленный воркер после истечения lease / delivery_uncertain / acknowledge / нового forceResend НЕ может перезаписать более новое состояние',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9005001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_05_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const buyer = { id: 220501, username: 's22_stale_buyer', first_name: 'StaleBuyer' };
+        await UserService.upsertFromTelegram(buyer);
+        const nowIso = new Date().toISOString();
+
+        // Подсценарий A (Buyer): медленный Worker A подвисает на Telegram -> lease протухает -> Worker B переводит в delivery_uncertain ->
+        // затем админ подтверждает acknowledge -> Worker A наконец падает с 502 и НЕ должен перетереть acknowledged 'sent'!
+        const orderBuyer = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_stale_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', orderBuyer.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'pending',
+            eventId: `evt_buyer_completed_${orderBuyer.orderId}`,
+            operationId: 'op_init_stale_buyer',
+            leaseOwner: 'worker_init',
+            attemptCount: 0,
+          },
+        });
+
+        let releaseStaleBuyer!: () => void;
+        let staleBuyerStarted!: () => void;
+        const staleBuyerStartedP = new Promise<void>((r) => {
+          staleBuyerStarted = r;
+        });
+        const staleBuyerGate = new Promise<void>((r) => {
+          releaseStaleBuyer = r;
+        });
+
+        const slowFailingBuyerBot = {
+          telegram: {
+            sendMessage: async () => {
+              staleBuyerStarted();
+              await staleBuyerGate;
+              throw new Error('502: Bad Gateway after long hang');
+            },
+          },
+        } as unknown as Telegraf;
+
+        const staleWorkerA = FulfillmentService.ensureBuyerNotified(
+          (await OrderService.getOrderById(orderBuyer.orderId))!,
+          slowFailingBuyerBot,
+          false,
+          'stale_worker_A',
+        );
+        await staleBuyerStartedP;
+
+        // Имитируем истечение lease у зависшего Worker A
+        const midBuyer = (await OrderService.getOrderById(orderBuyer.orderId))!;
+        assert.equal(midBuyer.buyerNotificationState?.status, 'sending');
+        await firestoreRepo.updateDoc<Order>('orders', orderBuyer.orderId, {
+          buyerNotificationState: {
+            ...midBuyer.buyerNotificationState!,
+            leaseUntil: Timestamp.fromMillis(Date.now() - 10_000),
+          },
+        });
+
+        // Worker B обнаруживает протухший lease и переводит в delivery_uncertain
+        await FulfillmentService.recoverPendingFulfillments(createMockBot([]), {
+          bypassLocalMutex: true,
+          workerId: 'recovery_worker_B',
+        });
+        const afterUncertain = await OrderService.getOrderById(orderBuyer.orderId);
+        assert.equal(afterUncertain?.buyerNotificationState?.status, 'delivery_uncertain');
+
+        // Админ подтверждает доставку через acknowledge -> статус sent
+        const acked = await FulfillmentService.acknowledgeUncertainNotification({
+          orderId: orderBuyer.orderId,
+          target: 'buyer',
+          adminTelegramId: 9005001,
+        });
+        assert.equal(acked.buyerNotificationState?.status, 'sent');
+
+        // Теперь просыпается старый Worker A и завершается с ошибкой -> НЕ имеет права перезаписать sent!
+        releaseStaleBuyer();
+        await staleWorkerA;
+
+        const buyerFinal = await OrderService.getOrderById(orderBuyer.orderId);
+        assert.equal(
+          buyerFinal?.buyerNotificationState?.status,
+          'sent',
+          'Устаревший Worker A не должен перезаписывать acknowledged sent обратно в pending!',
+        );
+        assert.equal(buyerFinal?.buyerNotificationState?.acknowledgedByAdminId, 9005001);
+        assert.ok(buyerFinal?.buyerNotifiedAt);
+
+        // Подсценарий B (Buyer): проснувшийся Worker A после delivery_uncertain (до acknowledge) НЕ может перезаписать delivery_uncertain обратно в pending!
+        const orderUncertainFence = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_stale_buyer',
+          productId: 'stars_custom',
+          quantity: 120,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', orderUncertainFence.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'pending',
+            eventId: `evt_buyer_completed_${orderUncertainFence.orderId}`,
+            operationId: 'op_init_fence_2',
+            leaseOwner: 'worker_init',
+            attemptCount: 0,
+          },
+        });
+
+        let releaseFence2!: () => void;
+        let fence2Started!: () => void;
+        const fence2StartedP = new Promise<void>((r) => {
+          fence2Started = r;
+        });
+        const fence2Gate = new Promise<void>((r) => {
+          releaseFence2 = r;
+        });
+        const slowBot2 = {
+          telegram: {
+            sendMessage: async () => {
+              fence2Started();
+              await fence2Gate;
+              throw new Error('502: Late failure from zombie worker');
+            },
+          },
+        } as unknown as Telegraf;
+
+        const zombieWorker = FulfillmentService.ensureBuyerNotified(
+          (await OrderService.getOrderById(orderUncertainFence.orderId))!,
+          slowBot2,
+          false,
+          'zombie_worker_A',
+        );
+        await fence2StartedP;
+
+        const midFence2 = (await OrderService.getOrderById(orderUncertainFence.orderId))!;
+        await firestoreRepo.updateDoc<Order>('orders', orderUncertainFence.orderId, {
+          buyerNotificationState: {
+            ...midFence2.buyerNotificationState!,
+            leaseUntil: Timestamp.fromMillis(Date.now() - 10_000),
+          },
+        });
+
+        await FulfillmentService.recoverPendingFulfillments(createMockBot([]), {
+          bypassLocalMutex: true,
+          workerId: 'recovery_worker_B2',
+        });
+
+        releaseFence2();
+        await zombieWorker;
+
+        const fence2Final = await OrderService.getOrderById(orderUncertainFence.orderId);
+        assert.equal(
+          fence2Final?.buyerNotificationState?.status,
+          'delivery_uncertain',
+          'Zombie Worker A не должен откатывать delivery_uncertain в pending!',
+        );
+
+        // Подсценарий C (Admin): медленный Worker A завис -> lease истёк -> delivery_uncertain -> админ сделал forceResend (sent) -> Worker A падает -> sent сохранён!
+        const orderAdminFence = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_stale_buyer',
+          productId: 'stars_custom',
+          quantity: 150,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', orderAdminFence.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: nowIso,
+          mystarsOrderId: 'ms_s22_05_admin_fence',
+          externalExecutionReference: 'mystars:ms_s22_05_admin_fence',
+          adminNotifiedAt: undefined,
+          adminNotificationState: {
+            status: 'pending',
+            eventId: `evt_admin_fulfillment_${orderAdminFence.orderId}`,
+            operationId: 'op_init_admin_fence',
+            leaseOwner: 'worker_init',
+            attemptCount: 0,
+          },
+        });
+
+        let releaseAdminZombie!: () => void;
+        let adminZombieStarted!: () => void;
+        const adminZombieStartedP = new Promise<void>((r) => {
+          adminZombieStarted = r;
+        });
+        const adminZombieGate = new Promise<void>((r) => {
+          releaseAdminZombie = r;
+        });
+        const slowAdminBot = {
+          telegram: {
+            sendMessage: async () => {
+              adminZombieStarted();
+              await adminZombieGate;
+              throw new Error('502: Late admin zombie failure');
+            },
+          },
+        } as unknown as Telegraf;
+
+        const adminZombie = FulfillmentService.ensureAdminNotified(
+          (await OrderService.getOrderById(orderAdminFence.orderId))!,
+          slowAdminBot,
+          false,
+          'admin_zombie_A',
+        );
+        await adminZombieStartedP;
+
+        const midAdmin = (await OrderService.getOrderById(orderAdminFence.orderId))!;
+        await firestoreRepo.updateDoc<Order>('orders', orderAdminFence.orderId, {
+          adminNotificationState: {
+            ...midAdmin.adminNotificationState!,
+            leaseUntil: Timestamp.fromMillis(Date.now() - 10_000),
+          },
+        });
+
+        await FulfillmentService.recoverPendingFulfillments(createMockBot([]), {
+          bypassLocalMutex: true,
+          workerId: 'recovery_worker_admin_B',
+        });
+
+        const adminMsgs: Array<{ chatId: number | string; text: string }> = [];
+        const manualAdminResend = await FulfillmentService.forceResendOrderNotification({
+          orderId: orderAdminFence.orderId,
+          target: 'admin',
+          bot: createMockBot(adminMsgs),
+        });
+        assert.equal(manualAdminResend.sentAdmin, true);
+
+        releaseAdminZombie();
+        await adminZombie;
+
+        const finalAdminFence = await OrderService.getOrderById(orderAdminFence.orderId);
+        assert.equal(
+          finalAdminFence?.adminNotificationState?.status,
+          'sent',
+          'Zombie Worker A не должен перезаписывать более новый admin sent от forceResend!',
+        );
+        assert.ok(finalAdminFence?.adminNotifiedAt);
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Строгий fencing (status===sending && operationId && leaseOwner) заблокировал все попытки устаревших воркеров перезаписать delivery_uncertain, acknowledged sent и forceResend sent.';
+    },
+  );
+
+  await runTest(
+    'S22-06',
+    'Fulfillment',
+    'Stage 2.2: Очередь >100 незавершённых уведомлений (120 buyer, 50 активных sending, 50 падающих 403 перед 60 здоровыми, 110 admin) обрабатывается без голодания (starvation)',
+    async () => {
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9006001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_06_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        // --- Подсценарий A: 50 активных sending-lease НЕ блокируют 15 pending заказов ---
+        firestoreRepo.enableIsolatedTestMode(true);
+        FulfillmentService.resetNotificationRecoveryState();
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const activeLease = Timestamp.fromMillis(nowMs + 60_000);
+
+        for (let i = 1; i <= 50; i++) {
+          const orderId = `ord_a_sending_${String(i).padStart(3, '0')}`;
+          await firestoreRepo.setDoc<Order>('orders', orderId, {
+            orderId,
+            userId: `tg_${220600 + i}`,
+            userTelegramId: 220600 + i,
+            recipientUsername: `u_${i}`,
+            productId: 'stars_custom',
+            productName: '50 Stars',
+            category: 'stars',
+            quantity: 50,
+            totalPriceUsdCents: 100,
+            totalPrice: 1,
+            currency: 'USD',
+            paymentStatus: 'completed',
+            fulfillmentStatus: 'completed',
+            completedAt: nowIso,
+            adminNotifiedAt: nowIso,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            buyerNotificationState: {
+              status: 'sending',
+              eventId: `evt_b_${orderId}`,
+              operationId: `op_${orderId}`,
+              leaseOwner: 'active_other_pod',
+              leaseUntil: activeLease,
+              attemptCount: 1,
+            },
+          });
+        }
+        for (let i = 1; i <= 15; i++) {
+          const orderId = `ord_z_pending_${String(i).padStart(3, '0')}`;
+          await firestoreRepo.setDoc<Order>('orders', orderId, {
+            orderId,
+            userId: `tg_${220700 + i}`,
+            userTelegramId: 220700 + i,
+            recipientUsername: `p_${i}`,
+            productId: 'stars_custom',
+            productName: '50 Stars',
+            category: 'stars',
+            quantity: 50,
+            totalPriceUsdCents: 100,
+            totalPrice: 1,
+            currency: 'USD',
+            paymentStatus: 'completed',
+            fulfillmentStatus: 'completed',
+            completedAt: nowIso,
+            adminNotifiedAt: nowIso,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            buyerNotificationState: {
+              status: 'pending',
+              eventId: `evt_b_${orderId}`,
+              operationId: `op_${orderId}`,
+              leaseOwner: 'prev_worker',
+              attemptCount: 1,
+            },
+          });
+        }
+
+        const msgsA: Array<{ chatId: number | string; text: string }> = [];
+        await FulfillmentService.recoverPendingFulfillments(createMockBot(msgsA));
+        assert.equal(
+          msgsA.length,
+          15,
+          '50 активных sending-lease не должны вытеснять 15 pending-уведомлений из прохода',
+        );
+
+        // --- Подсценарий B: 120 pending buyer-уведомлений дренируются за 3 прохода (50 + 50 + 20) ---
+        firestoreRepo.enableIsolatedTestMode(true);
+        FulfillmentService.resetNotificationRecoveryState();
+        for (let i = 1; i <= 120; i++) {
+          const orderId = `ord_b_${String(i).padStart(3, '0')}`;
+          await firestoreRepo.setDoc<Order>('orders', orderId, {
+            orderId,
+            userId: `tg_${221000 + i}`,
+            userTelegramId: 221000 + i,
+            recipientUsername: `b_${i}`,
+            productId: 'stars_custom',
+            productName: '50 Stars',
+            category: 'stars',
+            quantity: 50,
+            totalPriceUsdCents: 100,
+            totalPrice: 1,
+            currency: 'USD',
+            paymentStatus: 'completed',
+            fulfillmentStatus: 'completed',
+            completedAt: nowIso,
+            adminNotifiedAt: nowIso,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            buyerNotificationState: {
+              status: 'pending',
+              eventId: `evt_b_${orderId}`,
+              operationId: `op_${orderId}`,
+              leaseOwner: 'prev_worker',
+              attemptCount: 1,
+            },
+          });
+        }
+
+        const msgsB: Array<{ chatId: number | string; text: string }> = [];
+        const botB = createMockBot(msgsB);
+        await FulfillmentService.recoverPendingFulfillments(botB);
+        assert.equal(msgsB.length, 50, 'Проход 1 должен обработать батч 50 из 120');
+        await FulfillmentService.recoverPendingFulfillments(botB);
+        assert.equal(msgsB.length, 100, 'Проход 2 должен обработать следующие 50 (итого 100)');
+        await FulfillmentService.recoverPendingFulfillments(botB);
+        assert.equal(msgsB.length, 120, 'Проход 3 должен завершить оставшиеся 20 (итого 120)');
+        await FulfillmentService.recoverPendingFulfillments(botB);
+        assert.equal(msgsB.length, 120, 'Проход 4 не должен отправлять дубликаты');
+        const uniqueBuyersB = new Set(msgsB.map((m) => Number(m.chatId)));
+        assert.equal(uniqueBuyersB.size, 120, 'Каждый из 120 покупателей должен получить ровно 1 сообщение');
+
+        // --- Подсценарий C: 50 постоянно падающих (403 blocked) заказов в начале очереди НЕ блокируют 60 здоровых позади ---
+        firestoreRepo.enableIsolatedTestMode(true);
+        FulfillmentService.resetNotificationRecoveryState();
+        for (let i = 1; i <= 110; i++) {
+          const orderId = `ord_c_${String(i).padStart(3, '0')}`;
+          await firestoreRepo.setDoc<Order>('orders', orderId, {
+            orderId,
+            userId: `tg_${222000 + i}`,
+            userTelegramId: 222000 + i,
+            recipientUsername: `c_${i}`,
+            productId: 'stars_custom',
+            productName: '50 Stars',
+            category: 'stars',
+            quantity: 50,
+            totalPriceUsdCents: 100,
+            totalPrice: 1,
+            currency: 'USD',
+            paymentStatus: 'completed',
+            fulfillmentStatus: 'completed',
+            completedAt: nowIso,
+            adminNotifiedAt: nowIso,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            buyerNotificationState: {
+              status: 'pending',
+              eventId: `evt_b_${orderId}`,
+              operationId: `op_${orderId}`,
+              leaseOwner: 'prev_worker',
+              attemptCount: 1,
+            },
+          });
+        }
+
+        const deliveredC = new Set<number>();
+        const blockedHeadBot = {
+          telegram: {
+            sendMessage: async (chatId: number | string) => {
+              const id = Number(chatId);
+              if (id <= 222050) {
+                throw new Error('403: Forbidden: bot was blocked by the user');
+              }
+              deliveredC.add(id);
+              return { message_id: 9000 + deliveredC.size };
+            },
+          },
+        } as unknown as Telegraf;
+
+        await FulfillmentService.recoverPendingFulfillments(blockedHeadBot); // #1..#50 падают, курсор сдвигается на #50
+        assert.equal(deliveredC.size, 0);
+        await FulfillmentService.recoverPendingFulfillments(blockedHeadBot); // #51..#100 доставляются
+        assert.equal(deliveredC.size, 50);
+        await FulfillmentService.recoverPendingFulfillments(blockedHeadBot); // #101..#110 доставляются, курсор оборачивается
+        assert.equal(deliveredC.size, 60, 'Все 60 здоровых заказов за 50 падающими должны быть доставлены без голодания');
+
+        // --- Подсценарий D: 110 pending admin-уведомлений (на completed-заказах) дренируются за 3 прохода ---
+        firestoreRepo.enableIsolatedTestMode(true);
+        FulfillmentService.resetNotificationRecoveryState();
+        for (let i = 1; i <= 110; i++) {
+          const orderId = `ord_d_${String(i).padStart(3, '0')}`;
+          await firestoreRepo.setDoc<Order>('orders', orderId, {
+            orderId,
+            userId: `tg_${223000 + i}`,
+            userTelegramId: 223000 + i,
+            recipientUsername: `d_${i}`,
+            productId: 'stars_custom',
+            productName: '50 Stars',
+            category: 'stars',
+            quantity: 50,
+            totalPriceUsdCents: 100,
+            totalPrice: 1,
+            currency: 'USD',
+            paymentStatus: 'completed',
+            fulfillmentStatus: 'completed',
+            completedAt: nowIso,
+            buyerNotifiedAt: nowIso,
+            buyerNotificationState: {
+              status: 'sent',
+              eventId: `evt_b_${orderId}`,
+              operationId: `op_b_${orderId}`,
+              leaseOwner: 'w',
+              attemptCount: 1,
+            },
+            adminNotifiedAt: undefined,
+            adminNotificationState: {
+              status: 'pending',
+              eventId: `evt_a_${orderId}`,
+              operationId: `op_a_${orderId}`,
+              leaseOwner: 'w',
+              attemptCount: 1,
+            },
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          });
+        }
+
+        const adminMsgsD: Array<{ chatId: number | string; text: string }> = [];
+        const botD = createMockBot(adminMsgsD);
+        await FulfillmentService.recoverPendingFulfillments(botD);
+        assert.equal(adminMsgsD.length, 50);
+        await FulfillmentService.recoverPendingFulfillments(botD);
+        assert.equal(adminMsgsD.length, 100);
+        await FulfillmentService.recoverPendingFulfillments(botD);
+        assert.equal(adminMsgsD.length, 110);
+        await FulfillmentService.recoverPendingFulfillments(botD);
+        assert.equal(adminMsgsD.length, 110);
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Проверено отсутствие starvation: 50 активных sending не блокируют pending, 120 buyer и 110 admin дренируются за 3 прохода, 50 постоянно падающих 403 не блокируют 60 здоровых заказов.';
+    },
+  );
+
+  await runTest(
+    'S22-07',
+    'Fulfillment',
+    'Stage 2.2: Ошибка обработки одного заказа не прерывает восстановление остальных заказов в том же recovery-проходе',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9007001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_07_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const nowIso = new Date().toISOString();
+        const buyers = [
+          { id: 220701, username: 's22_iso_fail', first_name: 'Fail' },
+          { id: 220702, username: 's22_iso_timeout', first_name: 'Timeout' },
+          { id: 220703, username: 's22_iso_ok', first_name: 'Ok' },
+        ];
+        const orderIds: string[] = [];
+        for (const b of buyers) {
+          await UserService.upsertFromTelegram(b);
+          const ord = await OrderService.createOrder({
+            telegramUser: b,
+            recipientUsername: b.username,
+            productId: 'stars_custom',
+            quantity: 50,
+          });
+          await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+            paymentStatus: 'completed',
+            fulfillmentStatus: 'completed',
+            completedAt: nowIso,
+            adminNotifiedAt: nowIso,
+            buyerNotifiedAt: undefined,
+            buyerNotificationState: {
+              status: 'pending',
+              eventId: `evt_b_${ord.orderId}`,
+              operationId: `op_${ord.orderId}`,
+              leaseOwner: 'w',
+              attemptCount: 1,
+            },
+          });
+          orderIds.push(ord.orderId);
+        }
+
+        const deliveredChats: number[] = [];
+        const mixedBot = {
+          telegram: {
+            sendMessage: async (chatId: number | string) => {
+              const id = Number(chatId);
+              if (id === 220701) throw new Error('403: Forbidden: bot was blocked by the user');
+              if (id === 220702) {
+                const err = new Error('connect ETIMEDOUT') as Error & { code?: string };
+                err.code = 'ETIMEDOUT';
+                throw err;
+              }
+              deliveredChats.push(id);
+              return { message_id: 9701 };
+            },
+          },
+        } as unknown as Telegraf;
+
+        await FulfillmentService.recoverPendingFulfillments(mixedBot);
+
+        assert.deepEqual(deliveredChats, [220703]);
+        assert.equal((await OrderService.getOrderById(orderIds[0]))?.buyerNotificationState?.status, 'pending');
+        assert.equal((await OrderService.getOrderById(orderIds[1]))?.buyerNotificationState?.status, 'delivery_uncertain');
+        assert.equal((await OrderService.getOrderById(orderIds[2]))?.buyerNotificationState?.status, 'sent');
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Сбой 403 и ETIMEDOUT на первых двух заказах не прервали успешную доставку третьего заказа в том же проходе.';
+    },
+  );
+
+  await runTest(
+    'S22-08',
+    'Fulfillment',
+    'Stage 2.2: Повторное восстановление после рестарта процесса (смена workerInstanceId и сброс всех in-memory курсоров) идемпотентно',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      const prevWorkerId = FulfillmentService.workerInstanceId;
+      process.env.ADMIN_IDS = '9008001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_08_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const buyer = { id: 220801, username: 's22_restart_buyer', first_name: 'RestartBuyer' };
+        await UserService.upsertFromTelegram(buyer);
+        const nowIso = new Date().toISOString();
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer,
+          recipientUsername: 's22_restart_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          buyerNotifiedAt: undefined,
+          adminNotifiedAt: undefined,
+          buyerNotificationState: {
+            status: 'pending',
+            eventId: `evt_b_${ord.orderId}`,
+            operationId: 'op_before_restart_b',
+            leaseOwner: 'pod_1',
+            attemptCount: 1,
+          },
+          adminNotificationState: {
+            status: 'pending',
+            eventId: `evt_a_${ord.orderId}`,
+            operationId: 'op_before_restart_a',
+            leaseOwner: 'pod_1',
+            attemptCount: 1,
+          },
+        });
+
+        const msgs: Array<{ chatId: number | string; text: string }> = [];
+        const bot = createMockBot(msgs);
+
+        FulfillmentService.workerInstanceId = 'pod_before_restart';
+        await FulfillmentService.recoverPendingFulfillments(bot);
+        assert.equal(msgs.filter((m) => m.chatId === buyer.id).length, 1);
+        assert.equal(msgs.filter((m) => m.chatId === 9008001).length, 1);
+
+        // Полная имитация рестарта процесса (новый workerInstanceId + сброс всех in-memory состояний)
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.resetNotificationRecoveryState();
+        FulfillmentService.workerInstanceId = 'pod_after_restart_1';
+        await FulfillmentService.recoverPendingFulfillments(bot);
+
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.workerInstanceId = 'pod_after_restart_2';
+        await FulfillmentService.recoverPendingFulfillments(bot);
+
+        assert.equal(msgs.filter((m) => m.chatId === buyer.id).length, 1);
+        assert.equal(msgs.filter((m) => m.chatId === 9008001).length, 1);
+      } finally {
+        FulfillmentService.workerInstanceId = prevWorkerId;
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'После рестарта процесса и смены workerInstanceId повторные проходы recovery не отправили ни одного дубля.';
+    },
+  );
+
+  await runTest(
+    'S22-09',
+    'Database',
+    'Stage 2.2: Firestore dot-path запросы (buyerNotificationState.status / adminNotificationState.status) и cursor-пагинация startAfter (включая удалённый курсор)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const nowIso = new Date().toISOString();
+
+      const ids = ['ord_q_05', 'ord_q_01', 'ord_q_04', 'ord_q_02', 'ord_q_03'];
+      for (const orderId of ids) {
+        await firestoreRepo.setDoc<Order>('orders', orderId, {
+          orderId,
+          userId: 'tg_1',
+          userTelegramId: 1,
+          recipientUsername: 'u',
+          productId: 'stars_custom',
+          productName: '50 Stars',
+          category: 'stars',
+          quantity: 50,
+          totalPriceUsdCents: 100,
+          totalPrice: 1,
+          currency: 'USD',
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          buyerNotificationState: {
+            status: orderId === 'ord_q_04' ? 'sent' : 'pending',
+            eventId: `evt_${orderId}`,
+            operationId: `op_${orderId}`,
+            leaseOwner: 'w',
+            attemptCount: Number(orderId.slice(-2)),
+          },
+          adminNotificationState: {
+            status: orderId === 'ord_q_02' ? 'partial_sent' : 'pending',
+            eventId: `evt_a_${orderId}`,
+            operationId: `op_a_${orderId}`,
+            leaseOwner: 'w',
+            attemptCount: 1,
+          },
+        });
+      }
+
+      // 1. Dot-path == с детерминированной сортировкой по documentId и startAfter без orderBy
+      const page1 = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'buyerNotificationState.status', op: '==', value: 'pending' }],
+        limit: 2,
+      });
+      assert.deepEqual(
+        page1.map((o) => o.orderId),
+        ['ord_q_01', 'ord_q_02'],
+      );
+
+      const page2 = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'buyerNotificationState.status', op: '==', value: 'pending' }],
+        startAfter: page1[page1.length - 1].orderId,
+        limit: 2,
+      });
+      assert.deepEqual(
+        page2.map((o) => o.orderId),
+        ['ord_q_03', 'ord_q_05'],
+      );
+
+      // 2. Fallback после удаления документа-курсора без orderBy
+      await firestoreRepo.deleteDoc('orders', 'ord_q_02');
+      const afterDeletedCursor = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'buyerNotificationState.status', op: '==', value: 'pending' }],
+        startAfter: 'ord_q_02',
+        limit: 5,
+      });
+      assert.deepEqual(
+        afterDeletedCursor.map((o) => o.orderId),
+        ['ord_q_03', 'ord_q_05'],
+      );
+
+      // 3. Nested orderBy (dot-path) + удалённый курсор fallback
+      const nestedOrderFallback = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'buyerNotificationState.status', op: '==', value: 'pending' }],
+        orderBy: { field: 'buyerNotificationState.attemptCount', direction: 'asc' },
+        startAfter: { value: 2, id: 'ord_q_02' },
+        limit: 5,
+      });
+      assert.deepEqual(
+        nestedOrderFallback.map((o) => o.orderId),
+        ['ord_q_03', 'ord_q_05'],
+      );
+
+      // 4. Dot-path 'in' query для adminNotificationState.status
+      const inQuery = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [
+          {
+            field: 'adminNotificationState.status',
+            op: 'in',
+            value: ['pending', 'partial_sent'],
+          },
+        ],
+      });
+      assert.deepEqual(
+        inQuery.map((o) => o.orderId),
+        ['ord_q_01', 'ord_q_03', 'ord_q_04', 'ord_q_05'],
+      );
+
+      return 'Dot-path фильтрация (== и in), implicit __name__ сортировка и startAfter-пагинация (включая удалённый курсор и nested orderBy) работают корректно.';
+    },
+  );
+
+  await runTest(
+    'S22-10',
+    'Fulfillment',
+    'Stage 2.2: Legacy-заказы без buyerNotificationState/adminNotificationState: уже уведомлённые (*NotifiedAt) не шлются повторно, неуведомлённые восстанавливаются ровно 1 раз',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevAdminIds = process.env.ADMIN_IDS;
+      const prevOwnerId = process.env.OWNER_TELEGRAM_ID;
+      process.env.ADMIN_IDS = '9010001';
+      process.env.OWNER_TELEGRAM_ID = '';
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_test_s22_10_key_secret',
+        apiBaseUrl: 'https://mystars.example.test',
+      });
+      myStarsClient.setHttpTransport(async (req) => ({
+        status: 200,
+        ok: true,
+        json: { order_id: req.url.split('/').pop(), status: 'processing', eligible: true },
+      }));
+
+      try {
+        const nowIso = new Date().toISOString();
+
+        // 1. Legacy completed С buyerNotifiedAt и БЕЗ buyerNotificationState -> НЕ слать!
+        await firestoreRepo.setDoc<Order>('orders', 'legacy_comp_already_notified', {
+          orderId: 'legacy_comp_already_notified',
+          userId: 'tg_221001',
+          userTelegramId: 221001,
+          recipientUsername: 'legacy1',
+          productId: 'stars_custom',
+          productName: '50 Stars',
+          category: 'stars',
+          quantity: 50,
+          totalPriceUsdCents: 100,
+          totalPrice: 1,
+          currency: 'USD',
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          buyerNotifiedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        // 2. Legacy completed БЕЗ buyerNotifiedAt и БЕЗ buyerNotificationState -> восстановить 1 раз!
+        await firestoreRepo.setDoc<Order>('orders', 'legacy_comp_missing_notify', {
+          orderId: 'legacy_comp_missing_notify',
+          userId: 'tg_221002',
+          userTelegramId: 221002,
+          recipientUsername: 'legacy2',
+          productId: 'stars_custom',
+          productName: '50 Stars',
+          category: 'stars',
+          quantity: 50,
+          totalPriceUsdCents: 100,
+          totalPrice: 1,
+          currency: 'USD',
+          paymentStatus: 'completed',
+          fulfillmentStatus: 'completed',
+          completedAt: nowIso,
+          adminNotifiedAt: nowIso,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        // 3. Legacy processing (с mystarsOrderId) С adminNotifiedAt и БЕЗ adminNotificationState -> НЕ слать!
+        await firestoreRepo.setDoc<Order>('orders', 'legacy_proc_already_notified', {
+          orderId: 'legacy_proc_already_notified',
+          userId: 'tg_221003',
+          userTelegramId: 221003,
+          recipientUsername: 'legacy3',
+          productId: 'stars_custom',
+          productName: '100 Stars',
+          category: 'stars',
+          quantity: 100,
+          totalPriceUsdCents: 200,
+          totalPrice: 2,
+          currency: 'USD',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: nowIso,
+          mystarsOrderId: 'ms_legacy_already',
+          externalExecutionReference: 'mystars:ms_legacy_already',
+          adminNotifiedAt: nowIso,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        // 4. Legacy processing (с mystarsOrderId) БЕЗ adminNotifiedAt и БЕЗ adminNotificationState -> восстановить 1 раз!
+        await firestoreRepo.setDoc<Order>('orders', 'legacy_proc_missing_notify', {
+          orderId: 'legacy_proc_missing_notify',
+          userId: 'tg_221004',
+          userTelegramId: 221004,
+          recipientUsername: 'legacy4',
+          productId: 'stars_custom',
+          productName: '100 Stars',
+          category: 'stars',
+          quantity: 100,
+          totalPriceUsdCents: 200,
+          totalPrice: 2,
+          currency: 'USD',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: nowIso,
+          mystarsOrderId: 'ms_legacy_missing',
+          externalExecutionReference: 'mystars:ms_legacy_missing',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        const msgs: Array<{ chatId: number | string; text: string }> = [];
+        const bot = createMockBot(msgs);
+
+        await FulfillmentService.recoverPendingFulfillments(bot);
+        await FulfillmentService.recoverPendingFulfillments(bot);
+
+        // Покупатель legacy1 (уже был buyerNotifiedAt) -> 0 сообщений
+        assert.equal(msgs.filter((m) => m.chatId === 221001).length, 0);
+        // Покупатель legacy2 (без buyerNotifiedAt) -> ровно 1 сообщение
+        assert.equal(msgs.filter((m) => m.chatId === 221002).length, 1);
+        const leg2After = await OrderService.getOrderById('legacy_comp_missing_notify');
+        assert.equal(leg2After?.buyerNotificationState?.status, 'sent');
+        assert.ok(leg2After?.buyerNotifiedAt);
+
+        // Админ получил ровно 1 сообщение (только по legacy_proc_missing_notify, НЕ по legacy_proc_already_notified)
+        const adminMsgs = msgs.filter((m) => m.chatId === 9010001);
+        assert.equal(adminMsgs.length, 1);
+        assert.ok(adminMsgs[0].text.includes('legacy_proc_missing_notify'));
+        const leg4After = await OrderService.getOrderById('legacy_proc_missing_notify');
+        assert.equal(leg4After?.adminNotificationState?.status, 'sent');
+        assert.ok(leg4After?.adminNotifiedAt);
+      } finally {
+        myStarsClient.resetHttpTransport();
+        myStarsClient.setCredentialsOverride(null);
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevAdminIds === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdminIds;
+        if (prevOwnerId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwnerId;
+      }
+
+      return 'Legacy-заказы без полей *NotificationState обработаны корректно: уже уведомлённые (*NotifiedAt) не дублируются, неуведомлённые восстановлены ровно 1 раз.';
     },
   );
 
