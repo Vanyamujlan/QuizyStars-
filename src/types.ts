@@ -369,6 +369,43 @@ export interface MyStarsPollCheckpoint {
   resetEpoch?: number;
 }
 
+export interface FulfillmentRequestContext {
+  idempotencyKey: string;
+  attempt: number;
+}
+
+export interface FulfillmentAdapterResult {
+  handledAutomatically: boolean;
+  status: 'processing' | 'completed';
+  details: string;
+  externalReference?: string;
+}
+
+/**
+ * Official Provider Adapter Interface.
+ * Ready for future verified supplier integrations without rewriting the store logic.
+ * Supports idempotency keys and optional status verification after crash recovery.
+ */
+export interface FulfillmentProviderAdapter {
+  readonly providerName: string;
+  readonly supportsIdempotency?: boolean;
+  isConfigured(): boolean;
+  requestFulfillment(
+    order: Order,
+    context?: FulfillmentRequestContext,
+  ): Promise<FulfillmentAdapterResult>;
+  checkExternalStatus?(
+    order: Order,
+    idempotencyKey: string,
+  ): Promise<{
+    alreadyExecuted: boolean;
+    status?: 'processing' | 'completed';
+    details?: string;
+    externalReference?: string;
+    unknownStatus?: string;
+  }>;
+}
+
 export interface PaymentRecord {
   paymentId: string;
   kind?: 'order' | 'topup';

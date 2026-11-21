@@ -1,12 +1,13 @@
 import crypto from 'crypto';
 import { firestoreRepo } from '../db/firestore.ts';
 import { getEnvConfig } from '../config/env.ts';
-import { Order, ProductCategory } from '../types.ts';
 import {
-  FulfillmentRequestContext,
   FulfillmentAdapterResult,
   FulfillmentProviderAdapter,
-} from './FulfillmentService.ts';
+  FulfillmentRequestContext,
+  Order,
+  ProductCategory,
+} from '../types.ts';
 import {
   HttpTransportRequest,
   HttpTransportResponse,

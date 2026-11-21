@@ -14735,6 +14735,183 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  // =========================================================================
+  // STAGE 2.4: FINAL TECHNICAL AUDIT — REGRESSION & SECURITY HARDENING TESTS
+  // =========================================================================
+
+  await runTest(
+    'S24-01',
+    'Security',
+    'Stage 2.4: Некорректная percent-кодировка в callback_data (pay_ord / topup:xr_pay) безопасно отклоняется без необработанного URIError',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+
+      const harness = createWiredBotHarness(false);
+      await harness.sendCallback(
+        { id: 240101, username: 'audit_cb_user1', first_name: 'AuditUser1' },
+        'pay_ord:cryptobot:USDT:%E0%A4%A:ord_malformed_1',
+      );
+      await harness.sendCallback(
+        { id: 240102, username: 'audit_cb_user2', first_name: 'AuditUser2' },
+        'topup:xr_pay:USDT:%E0%A4%A:10',
+      );
+
+      const answers = harness.calls.filter((c) => c.method === 'answerCallbackQuery');
+      assert.equal(answers.length, 2, 'Оба некорректных callback должны завершиться безопасным answerCallbackQuery');
+      assert.ok(answers[0].showAlert && answers[0].text.includes('Некорректные параметры'));
+      assert.ok(answers[1].showAlert && answers[1].text.includes('Некорректные параметры'));
+
+      return 'Некорректная percent-кодировка в callback_data безопасно перехватывается без URIError.';
+    },
+  );
+
+  await runTest(
+    'S24-02',
+    'Security',
+    'Stage 2.4: HTML-спецсимволы (<, >, &) в названии товара и цифровом ключе корректно экранируются в parse_mode: HTML уведомлениях DigitalKeyService',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const prevOwner = process.env.OWNER_TELEGRAM_ID;
+      process.env.OWNER_TELEGRAM_ID = '240200';
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      try {
+        const product = await ProductService.createProduct({
+          category: 'gifts',
+          name: 'Pro <Key> & "Gift"',
+          description: 'Test product with HTML chars',
+          priceUsdCents: 500,
+        });
+        const buyer = { id: 240201, username: 's24_html_buyer', first_name: 'HtmlBuyer' };
+        await UserService.upsertFromTelegram(buyer);
+
+        // 1. Empty stock alert to owner must escape productName
+        const emptyOrder = await OrderService.createOrder({
+          telegramUser: buyer,
+          productId: product.id,
+          quantity: 1,
+        });
+        const paidEmptyOrder = (await firestoreRepo.updateDoc<Order>('orders', emptyOrder.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        }))!;
+        await DigitalKeyService.fulfillOrderWithDigitalKey(paidEmptyOrder, mockBot);
+        const ownerNotice = sentMessages.find((m) => Number(m.chatId) === 240200);
+        assert.ok(ownerNotice, 'Владелец должен получить уведомление о нехватке ключей');
+        assert.ok(
+          ownerNotice.text.includes('Pro &lt;Key&gt; &amp; &quot;Gift&quot;'),
+          `Название товара должно быть экранировано: ${ownerNotice.text}`,
+        );
+        assert.ok(!ownerNotice.text.includes('<Key>'), 'Сырые HTML-теги не должны попадать в сообщение');
+
+        // 2. Delivered key with < & > must be HTML-escaped for buyer
+        await DigitalKeyService.addKeys({
+          actorTelegramId: 240200,
+          productId: product.id,
+          keys: ['KEY-<A&B>-2402'],
+        });
+        const fulfilledOrder = await OrderService.createOrder({
+          telegramUser: buyer,
+          productId: product.id,
+          quantity: 1,
+        });
+        const paidFulfilledOrder = (await firestoreRepo.updateDoc<Order>('orders', fulfilledOrder.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        }))!;
+        await DigitalKeyService.fulfillOrderWithDigitalKey(paidFulfilledOrder, mockBot);
+        const buyerNotice = sentMessages.find((m) => Number(m.chatId) === buyer.id);
+        assert.ok(buyerNotice, 'Покупатель должен получить сообщение с цифровым ключом');
+        assert.ok(
+          buyerNotice.text.includes('KEY-&lt;A&amp;B&gt;-2402'),
+          `Цифровой ключ обязан быть HTML-экранирован: ${buyerNotice.text}`,
+        );
+        assert.ok(
+          buyerNotice.text.includes('Pro &lt;Key&gt; &amp; &quot;Gift&quot;'),
+          'Название товара в письме покупателю обязано быть HTML-экранировано',
+        );
+      } finally {
+        if (prevOwner === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwner;
+      }
+
+      return 'HTML-спецсимволы в названии товара и цифровых ключах безопасно экранируются перед отправкой в Telegram.';
+    },
+  );
+
+  await runTest(
+    'S24-03',
+    'Security',
+    'Stage 2.4: Правило Firestore /settings/{settingKey} ограничивает чтение для не-админов только документом global, а MyStarsService не создаёт циклических импортов',
+    async () => {
+      const rulesSource = fs.readFileSync(
+        path.resolve(process.cwd(), 'firestore.rules'),
+        'utf-8',
+      );
+      assert.ok(
+        rulesSource.includes(
+          "allow get: if isValidId(settingKey) && (isAdmin() || (isSignedIn() && settingKey == 'global'));",
+        ),
+        'firestore.rules должен ограничивать чтение /settings/{settingKey} для обычных пользователей только ключом global',
+      );
+
+      const mystarsSource = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/services/MyStarsService.ts'),
+        'utf-8',
+      );
+      assert.ok(
+        !mystarsSource.includes("from './FulfillmentService.ts'"),
+        'MyStarsService.ts не должен импортировать FulfillmentService.ts (исключение циклических зависимостей)',
+      );
+
+      return 'Доступ к внутренним настройкам /settings/* закрыт от не-админов, а циклический импорт MyStarsService <-> FulfillmentService устранён.';
+    },
+  );
+
+  await runTest(
+    'S24-04',
+    'Security',
+    'Stage 2.4: Падение фонового polling в bot.ts переводит статус в connected=false и маскирует секреты, а watcher в server.ts отслеживает остановку polling',
+    async () => {
+      const botSource = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/bot/bot.ts'),
+        'utf-8',
+      );
+      assert.ok(
+        botSource.includes('this.status.connected = false;\n            this.status.pollingActive = false;'),
+        'При ошибке фонового bot.launch() должен сбрасываться this.status.connected = false',
+      );
+
+      const serverSource = fs.readFileSync(
+        path.resolve(process.cwd(), 'server.ts'),
+        'utf-8',
+      );
+      assert.ok(
+        serverSource.includes("currentStatus.mode === 'polling' && !currentStatus.pollingActive"),
+        'watcherInterval в server.ts должен перезапускать бота при остановке polling',
+      );
+      assert.ok(
+        serverSource.includes("escapeHtml(order.productName)"),
+        'server.ts должен HTML-экранировать динамические поля заказа в уведомлениях Telegram',
+      );
+      assert.ok(
+        serverSource.includes("maskSecretsInText(raw, ["),
+        'server.ts должен маскировать секреты в bootstrap().catch',
+      );
+
+      const masked = maskSecretsInText('Fail key=PRIVATE_KEY_SECRET_999 token=BOT_TOK_123', [
+        'PRIVATE_KEY_SECRET_999',
+        'BOT_TOK_123',
+      ]);
+      assert.ok(!masked.includes('PRIVATE_KEY_SECRET_999'));
+      assert.ok(!masked.includes('BOT_TOK_123'));
+
+      return 'Сбой фонового polling корректно сбрасывает connected=false для автоперезапуска, а секреты и HTML-поля защищены.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {

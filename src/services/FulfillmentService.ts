@@ -7,6 +7,9 @@ import {
   AdminRecipientDeliveryRecord,
   DistributedLeaseRecord,
   FirestoreTimestampLike,
+  FulfillmentAdapterResult,
+  FulfillmentProviderAdapter,
+  FulfillmentRequestContext,
   MyStarsPollCheckpoint,
   NotificationDeliveryState,
   NotificationDeliveryStatus,
@@ -26,44 +29,17 @@ import {
 } from './MyStarsService.ts';
 import { redactSecretsFromText } from './PaymentProviders.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
-import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
+import {
+  escapeHtml,
+  formatAdminOrderCard,
+  formatOrderCompletedUserNotice,
+} from '../bot/formatters.ts';
 
-export interface FulfillmentRequestContext {
-  idempotencyKey: string;
-  attempt: number;
-}
-
-export interface FulfillmentAdapterResult {
-  handledAutomatically: boolean;
-  status: 'processing' | 'completed';
-  details: string;
-  externalReference?: string;
-}
-
-/**
- * Official Provider Adapter Interface.
- * Ready for future verified supplier integrations without rewriting the store logic.
- * Supports idempotency keys and optional status verification after crash recovery.
- */
-export interface FulfillmentProviderAdapter {
-  readonly providerName: string;
-  readonly supportsIdempotency?: boolean;
-  isConfigured(): boolean;
-  requestFulfillment(
-    order: Order,
-    context?: FulfillmentRequestContext,
-  ): Promise<FulfillmentAdapterResult>;
-  checkExternalStatus?(
-    order: Order,
-    idempotencyKey: string,
-  ): Promise<{
-    alreadyExecuted: boolean;
-    status?: 'processing' | 'completed';
-    details?: string;
-    externalReference?: string;
-    unknownStatus?: string;
-  }>;
-}
+export type {
+  FulfillmentAdapterResult,
+  FulfillmentProviderAdapter,
+  FulfillmentRequestContext,
+};
 
 export class ManualAdminFulfillmentAdapter implements FulfillmentProviderAdapter {
   public readonly providerName = 'ManualAdminFulfillment (Безопасная ручная выдача)';
@@ -3174,7 +3150,7 @@ export class FulfillmentService {
             await this.sendTelegramMessageWithRetry(
               bot,
               adminId,
-              `⚠️ <b>Неизвестный статус MyStars: "${extStatus.unknownStatus}"</b>\nЗаказ оставлен в статусе processing для безопасной проверки.\n\n${formatAdminOrderCard(refreshedForUnknown)}`,
+              `⚠️ <b>Неизвестный статус MyStars: "${escapeHtml(extStatus.unknownStatus)}"</b>\nЗаказ оставлен в статусе processing для безопасной проверки.\n\n${formatAdminOrderCard(refreshedForUnknown)}`,
               {
                 parse_mode: 'HTML',
                 ...buildAdminOrderActionKeyboard(refreshedForUnknown),
@@ -3579,7 +3555,7 @@ export class FulfillmentService {
     void this.recoverPendingFulfillments(getBot()).catch((err) => {
       console.error(
         '[FulfillmentService] Ошибка стартового прохода recoverPendingFulfillments:',
-        err instanceof Error ? err.message : String(err),
+        redactSecretsFromText(err instanceof Error ? err.message : String(err)),
       );
     });
 
@@ -3587,7 +3563,7 @@ export class FulfillmentService {
       void this.recoverPendingFulfillments(getBot()).catch((err) => {
         console.error(
           '[FulfillmentService] Ошибка фонового прохода recoverPendingFulfillments:',
-          err instanceof Error ? err.message : String(err),
+          redactSecretsFromText(err instanceof Error ? err.message : String(err)),
         );
       });
     }, intervalMs);

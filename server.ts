@@ -4,6 +4,7 @@ import express, { Express, Request, Response } from 'express';
 import { formatUsd, getEnvConfig } from './src/config/env.ts';
 import { firestoreRepo } from './src/db/firestore.ts';
 import { botManager, maskSecretsInText } from './src/bot/bot.ts';
+import { escapeHtml } from './src/bot/formatters.ts';
 import { oe } from './src/bot/outlineEmoji.ts';
 import { formatUsdCents } from './src/services/Money.ts';
 import { FulfillmentService } from './src/services/FulfillmentService.ts';
@@ -109,13 +110,13 @@ export async function handleProviderWebhookRequest(
             .sendMessage(
               order.userTelegramId,
               [
-                `${oe('check')} <b>Заказ #${order.orderId} оплачен!</b>`,
+                `${oe('check')} <b>Заказ #${escapeHtml(order.orderId)} оплачен!</b>`,
                 '',
-                `${oe('catalog')} Товар: <b>${order.productName}</b> (x${order.quantity})`,
+                `${oe('catalog')} Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
                 order.recipientUsername
-                  ? `${oe('profile')} Получатель: <b>@${order.recipientUsername}</b>`
+                  ? `${oe('profile')} Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
                   : '',
-                `${oe('provider')} Провайдер: <b>${providerTitle}</b>`,
+                `${oe('provider')} Провайдер: <b>${escapeHtml(providerTitle)}</b>`,
                 `${oe('amount')} Сумма: <code>${formatUsdCents(orderCents)}</code>`,
                 '',
                 `${oe('rocket')} Заказ передан на выдачу.`,
@@ -171,11 +172,11 @@ export async function handleProviderWebhookRequest(
             [
               `${oe('check')} <b>Баланс QuizyStars пополнен!</b>`,
               '',
-              `${oe('id')} Счёт: <code>${topUp.paymentId}</code>`,
-              `${oe('provider')} Провайдер: <b>${providerTitle}</b>`,
+              `${oe('id')} Счёт: <code>${escapeHtml(topUp.paymentId)}</code>`,
+              `${oe('provider')} Провайдер: <b>${escapeHtml(providerTitle)}</b>`,
               `${oe('usd')} Внесено: <code>${formatUsdCents(grossCents)}</code>`,
               isConverted
-                ? `${oe('coin')} Счёт оплачен: <code>${topUp.expectedAmountStr || topUp.amountPaid} ${topUp.currency}</code>`
+                ? `${oe('coin')} Счёт оплачен: <code>${escapeHtml(String(topUp.expectedAmountStr || topUp.amountPaid))} ${escapeHtml(topUp.currency)}</code>`
                 : '',
               `${oe('percent')} Комиссия (${topUp.feePercent}%): <code>−${formatUsdCents(feeCents)}</code>`,
               `${oe('money')} Зачислено: <b><code>+${formatUsdCents(creditedCents)}</code></b>`,
@@ -476,7 +477,9 @@ async function bootstrap(): Promise<void> {
     try {
       const currentStatus = botManager.getStatus();
       const latestConfig = getEnvConfig();
-      if (!currentStatus.connected && latestConfig.telegramBotToken) {
+      const pollingStopped =
+        currentStatus.mode === 'polling' && !currentStatus.pollingActive;
+      if ((!currentStatus.connected || pollingStopped) && latestConfig.telegramBotToken) {
         await botManager.start();
       }
     } catch (error) {
@@ -487,6 +490,7 @@ async function bootstrap(): Promise<void> {
         maskSecretsInText(raw, [
           latest.telegramBotToken,
           latest.webhookSecret,
+          latest.firebasePrivateKey,
           latest.cryptobotApiToken,
           latest.xrocketApiKey,
           latest.mystarsApiKey,
@@ -527,7 +531,19 @@ async function bootstrap(): Promise<void> {
 
 if (process.env.NODE_ENV !== 'test') {
   bootstrap().catch((error) => {
-    console.error('[Server] Критическая ошибка запуска:', error);
+    const raw = error instanceof Error ? error.message : String(error);
+    const latest = getEnvConfig();
+    console.error(
+      '[Server] Критическая ошибка запуска:',
+      maskSecretsInText(raw, [
+        latest.telegramBotToken,
+        latest.webhookSecret,
+        latest.firebasePrivateKey,
+        latest.cryptobotApiToken,
+        latest.xrocketApiKey,
+        latest.mystarsApiKey,
+      ]),
+    );
     process.exit(1);
   });
 }

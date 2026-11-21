@@ -782,7 +782,13 @@ export function registerUserHandlers(bot: Telegraf): void {
     /^topup:xr_pay:([A-Z0-9]+):([^:]+):([0-9.]+)$/,
     async (ctx) => {
       const currency = ctx.match[1];
-      const network = decodeURIComponent(ctx.match[2]);
+      let network: string;
+      try {
+        network = decodeURIComponent(ctx.match[2]);
+      } catch {
+        await safeAnswerCbQuery(ctx, 'Некорректные параметры сети пополнения.', true);
+        return;
+      }
       const amountUsd = Number(ctx.match[3]);
       if (
         !ctx.from ||

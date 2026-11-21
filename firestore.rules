@@ -541,7 +541,7 @@ service cloud.firestore {
 
     // 7. /settings/{settingKey}
     match /settings/{settingKey} {
-      allow get: if isValidId(settingKey) && (isSignedIn() || isAdmin());
+      allow get: if isValidId(settingKey) && (isAdmin() || (isSignedIn() && settingKey == 'global'));
       allow list: if isAdmin();
       allow create: if isValidId(settingKey) && isValidSetting(incoming(), settingKey) &&
         isFreshTimestamp(incoming().updatedAt) &&

@@ -11,6 +11,14 @@ import {
   StoreTransaction,
 } from '../types.ts';
 
+function escapeHtml(text: string): string {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 export class OwnerAccessDeniedError extends Error {
   public readonly code = 'OWNER_ACCESS_DENIED';
   constructor(
@@ -883,8 +891,8 @@ export class DigitalKeyService {
             [
               '⚠️ <b>НЕХВАТКА ЦИФРОВЫХ КЛЮЧЕЙ НА СКЛАДЕ</b>',
               '',
-              `📦 <b>Заказ:</b> <code>${txResult.order.orderId}</code>`,
-              `🛍 <b>Товар:</b> ${txResult.order.productName} (<code>${txResult.order.productId}</code>)`,
+              `📦 <b>Заказ:</b> <code>${escapeHtml(txResult.order.orderId)}</code>`,
+              `🛍 <b>Товар:</b> ${escapeHtml(txResult.order.productName)} (<code>${escapeHtml(txResult.order.productId)}</code>)`,
               `🔢 <b>Требуется ключей:</b> ${txResult.order.quantity}`,
               `👤 <b>Покупатель:</b> <code>${txResult.order.userTelegramId}</code>`,
               '',
@@ -905,7 +913,7 @@ export class DigitalKeyService {
     // If keys were delivered, send them to the buyer in Telegram (fault-tolerant: never loses key on sendMessage failure)
     if (txResult.fulfilled && bot && !txResult.order.buyerNotifiedAt) {
       const keysText = (txResult.order.deliveredKeyValues || [])
-        .map((k, idx) => `🔑 Ключ #${idx + 1}: <code>${k}</code>`)
+        .map((k, idx) => `🔑 Ключ #${idx + 1}: <code>${escapeHtml(k)}</code>`)
         .join('\n');
 
       try {
@@ -914,8 +922,8 @@ export class DigitalKeyService {
           [
             '🎉 <b>Ваш заказ успешно оплачен и выполнен!</b>',
             '',
-            `📦 <b>Номер заказа:</b> <code>${txResult.order.orderId}</code>`,
-            `🛍 <b>Товар:</b> ${txResult.order.productName}`,
+            `📦 <b>Номер заказа:</b> <code>${escapeHtml(txResult.order.orderId)}</code>`,
+            `🛍 <b>Товар:</b> ${escapeHtml(txResult.order.productName)}`,
             '',
             keysText,
             '',

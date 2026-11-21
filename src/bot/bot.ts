@@ -235,13 +235,16 @@ class TelegramBotManager {
             const safeMsg = maskSecretsInText(rawMsg, [
               token,
               config.webhookSecret,
+              config.firebasePrivateKey,
               config.cryptobotApiToken,
               config.xrocketApiKey,
               config.mystarsApiKey,
             ]);
             console.error(`[TelegramBot] Ошибка фонового polling: ${safeMsg}`);
             this.pollingStarted = false;
+            this.status.connected = false;
             this.status.pollingActive = false;
+            this.status.lastCheckedAt = new Date().toISOString();
             this.status.error = safeMsg;
           });
 
@@ -338,6 +341,10 @@ class TelegramBotManager {
       const safeMsg = maskSecretsInText(rawMsg, [
         config.telegramBotToken,
         config.webhookSecret,
+        config.firebasePrivateKey,
+        config.cryptobotApiToken,
+        config.xrocketApiKey,
+        config.mystarsApiKey,
       ]);
       console.error('[TelegramBot] Ошибка обработки webhook update:', safeMsg);
       if (!res.headersSent) {

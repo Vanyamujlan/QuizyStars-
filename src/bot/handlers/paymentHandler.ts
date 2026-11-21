@@ -579,7 +579,13 @@ export function registerPaymentHandlers(bot: Telegraf): void {
     async (ctx) => {
       const provider = ctx.match[1] as BalanceTopUpProvider;
       const currency = ctx.match[2];
-      const rawNet = decodeURIComponent(ctx.match[3]);
+      let rawNet: string;
+      try {
+        rawNet = decodeURIComponent(ctx.match[3]);
+      } catch {
+        await safeAnswerCbQuery(ctx, 'Некорректные параметры сети оплаты.', true);
+        return;
+      }
       const network = rawNet === 'NONE' ? undefined : rawNet;
       const orderId = ctx.match[4];
 
