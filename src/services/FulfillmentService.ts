@@ -9,6 +9,7 @@ import {
   FirestoreTimestampLike,
   MyStarsPollCheckpoint,
   NotificationDeliveryState,
+  NotificationDeliveryStatus,
   Order,
   StoreTransaction,
 } from '../types.ts';
@@ -1283,7 +1284,7 @@ export class FulfillmentService {
       return claim.order;
     }
 
-    const ok = await this.sendTelegramMessageWithRetry(
+    const sendResult = await this.sendTelegramMessageWithResult(
       bot,
       claim.order.userTelegramId,
       formatOrderCompletedUserNotice(claim.order),
@@ -1302,7 +1303,7 @@ export class FulfillmentService {
         return latest;
       }
 
-      if (ok) {
+      if (sendResult.ok) {
         const sentState: NotificationDeliveryState = {
           status: 'sent',
           eventId: latestState?.eventId || eventId,
@@ -1312,6 +1313,7 @@ export class FulfillmentService {
           attemptCount: latestState?.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
+          lastError: undefined,
         };
         const updated: Order = {
           ...latest,
@@ -1328,8 +1330,13 @@ export class FulfillmentService {
         eventId: latestState?.eventId || eventId,
         operationId,
         leaseOwner,
+        leaseUntil: undefined,
         attemptCount: latestState?.attemptCount ?? 1,
-        lastError: 'Не удалось доставить уведомление покупателю в Telegram',
+        sentAt: undefined,
+        deliveryUncertainAfterCrash: false,
+        lastError:
+          sendResult.error ||
+          'Не удалось доставить уведомление покупателю в Telegram',
       };
       const updated: Order = {
         ...latest,
@@ -2041,11 +2048,218 @@ export class FulfillmentService {
     return this.initiateFulfillment(refreshed, bot, { allowStaleTakeover: true });
   }
 
+  private static needsBuyerNotificationRecovery(
+    order: Order,
+    nowMs: number,
+  ): boolean {
+    if (order.fulfillmentStatus !== 'completed') {
+      return false;
+    }
+    const state = order.buyerNotificationState;
+    if (
+      order.buyerNotifiedAt ||
+      state?.status === 'sent' ||
+      state?.status === 'delivery_uncertain'
+    ) {
+      return false;
+    }
+    if (state?.status === 'sending') {
+      return this.timestampToMillis(state.leaseUntil) <= nowMs;
+    }
+    return true;
+  }
+
+  private static needsAdminNotificationRecovery(
+    order: Order,
+    nowMs: number,
+  ): boolean {
+    const state = order.adminNotificationState;
+    if (
+      order.adminNotifiedAt ||
+      state?.status === 'sent' ||
+      state?.status === 'delivery_uncertain'
+    ) {
+      return false;
+    }
+    if (state?.status === 'sending') {
+      return this.timestampToMillis(state.leaseUntil) <= nowMs;
+    }
+    if (state?.status === 'no_recipients') {
+      return getEnvConfig().adminIds.length > 0;
+    }
+    return true;
+  }
+
+  private static countSentAdminRecipients(
+    state?: NotificationDeliveryState,
+  ): number {
+    if (!state?.recipientDeliveries) {
+      return 0;
+    }
+    let count = 0;
+    for (const rec of Object.values(state.recipientDeliveries)) {
+      if (rec?.status === 'sent') {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private static didBuyerNotificationProgress(
+    before: Order,
+    after: Order,
+  ): boolean {
+    return (
+      (!before.buyerNotifiedAt && Boolean(after.buyerNotifiedAt)) ||
+      before.buyerNotificationState?.status !==
+        after.buyerNotificationState?.status
+    );
+  }
+
+  private static didAdminNotificationProgress(
+    before: Order,
+    after: Order,
+  ): boolean {
+    return (
+      (!before.adminNotifiedAt && Boolean(after.adminNotifiedAt)) ||
+      before.adminNotificationState?.status !==
+        after.adminNotificationState?.status ||
+      this.countSentAdminRecipients(after.adminNotificationState) >
+        this.countSentAdminRecipients(before.adminNotificationState)
+    );
+  }
+
+  /**
+   * Dedicated notification recovery pass:
+   * - Recovers pending / expired-lease / crash-interrupted buyer notifications for `completed` orders.
+   * - Recovers pending / partial_sent / no_recipients (once ADMIN_IDS configured) / expired-lease
+   *   admin notifications across `processing`, `failed`, and `completed` orders without starvation.
+   * - Respects active `sending` leases and never resends `sent` or `delivery_uncertain` notifications.
+   */
+  private static async recoverPendingNotifications(
+    bot: Telegraf | null | undefined,
+    nowMs: number,
+    skipBuyerOrderIds: Set<string>,
+    skipAdminOrderIds: Set<string>,
+  ): Promise<Order[]> {
+    if (!bot) {
+      return [];
+    }
+
+    const progressed: Order[] = [];
+
+    // 1. Buyer notifications for `completed` orders:
+    //    (a) Direct single-field index query on `buyerNotificationState.status` (zero starvation even with >50k completed orders)
+    //    (b) Recent `completed` orders (uses existing composite index `fulfillmentStatus ASC, createdAt DESC`)
+    //        to catch crash-before-notify orders where `buyerNotificationState` and `buyerNotifiedAt` are both missing.
+    const buyerCandidateMap = new Map<string, Order>();
+    const [pendingBuyerStateOrders, recentCompletedOrders] = await Promise.all([
+      firestoreRepo.queryDocs<Order>('orders', {
+        where: [
+          {
+            field: 'buyerNotificationState.status',
+            op: 'in',
+            value: ['pending', 'sending'],
+          },
+        ],
+        limit: 50,
+      }),
+      firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'fulfillmentStatus', op: '==', value: 'completed' }],
+        orderBy: { field: 'createdAt', direction: 'desc' },
+        limit: 50,
+      }),
+    ]);
+
+    for (const ord of pendingBuyerStateOrders) {
+      buyerCandidateMap.set(ord.orderId, ord);
+    }
+    for (const ord of recentCompletedOrders) {
+      if (!buyerCandidateMap.has(ord.orderId)) {
+        buyerCandidateMap.set(ord.orderId, ord);
+      }
+    }
+
+    for (const ord of buyerCandidateMap.values()) {
+      if (
+        skipBuyerOrderIds.has(ord.orderId) ||
+        !this.needsBuyerNotificationRecovery(ord, nowMs)
+      ) {
+        continue;
+      }
+      skipBuyerOrderIds.add(ord.orderId);
+      try {
+        const updated = await this.ensureBuyerNotified(ord, bot);
+        if (this.didBuyerNotificationProgress(ord, updated)) {
+          progressed.push(updated);
+        }
+      } catch (error) {
+        console.error(
+          `[FulfillmentService] Ошибка восстановления уведомления покупателю для заказа #${ord.orderId}:`,
+          redactSecretsFromText(
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
+    }
+
+    // 2. Admin notifications across orders with explicit unfinished `adminNotificationState`
+    //    (anti-starvation beyond the first 50 processing/failed orders, plus auto-completed orders
+    //    whose admin notification failed or remained in `no_recipients` until ADMIN_IDS was configured).
+    const adminStatuses: NotificationDeliveryStatus[] =
+      getEnvConfig().adminIds.length > 0
+        ? ['pending', 'partial_sent', 'no_recipients', 'sending']
+        : ['pending', 'partial_sent', 'sending'];
+
+    const pendingAdminStateOrders = await firestoreRepo.queryDocs<Order>(
+      'orders',
+      {
+        where: [
+          {
+            field: 'adminNotificationState.status',
+            op: 'in',
+            value: adminStatuses,
+          },
+        ],
+        limit: 50,
+      },
+    );
+
+    for (const ord of pendingAdminStateOrders) {
+      if (
+        (ord.fulfillmentStatus !== 'processing' &&
+          ord.fulfillmentStatus !== 'failed' &&
+          ord.fulfillmentStatus !== 'completed') ||
+        skipAdminOrderIds.has(ord.orderId) ||
+        !this.needsAdminNotificationRecovery(ord, nowMs)
+      ) {
+        continue;
+      }
+      skipAdminOrderIds.add(ord.orderId);
+      try {
+        const updated = await this.ensureAdminNotified(ord, bot);
+        if (this.didAdminNotificationProgress(ord, updated)) {
+          progressed.push(updated);
+        }
+      } catch (error) {
+        console.error(
+          `[FulfillmentService] Ошибка восстановления уведомления администраторам для заказа #${ord.orderId}:`,
+          redactSecretsFromText(
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
+    }
+
+    return progressed;
+  }
+
   /**
    * Recovery worker pass:
    * - Recovers orders in 'paid' (payment committed, fulfillment not started)
    * - Retries eligible orders in 'failed' whose backoff delay has elapsed and attempts < MAX_FULFILLMENT_ATTEMPTS
    * - Recovers stale 'processing' orders or retries missing admin/buyer notifications
+   * - Recovers unfinished buyer notifications for 'completed' orders and admin notifications across orders
    * Guarded by `isRecoveryPassRunning` mutex so two recovery passes never overlap.
    */
   public static async recoverPendingFulfillments(
@@ -2060,6 +2274,8 @@ export class FulfillmentService {
 
     this.isRecoveryPassRunning = true;
     const recovered: Order[] = [];
+    const adminNotifyAttemptedInPass = new Set<string>();
+    const buyerNotifyAttemptedInPass = new Set<string>();
 
     try {
       const nowMs = Date.now();
@@ -2076,6 +2292,10 @@ export class FulfillmentService {
         if (ord.paymentStatus === 'paid') {
           try {
             const updated = await this.initiateFulfillment(ord, bot);
+            adminNotifyAttemptedInPass.add(ord.orderId);
+            if (updated.fulfillmentStatus === 'completed') {
+              buyerNotifyAttemptedInPass.add(ord.orderId);
+            }
             recovered.push(updated);
           } catch (error) {
             console.error(
@@ -2104,6 +2324,10 @@ export class FulfillmentService {
         ) {
           try {
             const updated = await this.initiateFulfillment(ord, bot);
+            adminNotifyAttemptedInPass.add(ord.orderId);
+            if (updated.fulfillmentStatus === 'completed') {
+              buyerNotifyAttemptedInPass.add(ord.orderId);
+            }
             recovered.push(updated);
           } catch (error) {
             console.error(
@@ -2111,8 +2335,21 @@ export class FulfillmentService {
               error instanceof Error ? error.message : String(error),
             );
           }
-        } else if (!ord.adminNotifiedAt) {
-          await this.ensureAdminNotified(ord, bot);
+        } else if (this.needsAdminNotificationRecovery(ord, nowMs)) {
+          adminNotifyAttemptedInPass.add(ord.orderId);
+          try {
+            const notified = await this.ensureAdminNotified(ord, bot);
+            if (this.didAdminNotificationProgress(ord, notified)) {
+              recovered.push(notified);
+            }
+          } catch (error) {
+            console.error(
+              `[FulfillmentService] Ошибка восстановления уведомления админам для failed-заказа #${ord.orderId}:`,
+              redactSecretsFromText(
+                error instanceof Error ? error.message : String(error),
+              ),
+            );
+          }
         }
       }
 
@@ -2133,6 +2370,10 @@ export class FulfillmentService {
         if (!ord.externalExecutionReference && !ord.mystarsOrderId && isStale) {
           try {
             const reconciled = await this.reconcileStaleProcessingOrder(ord, bot);
+            adminNotifyAttemptedInPass.add(ord.orderId);
+            if (reconciled.fulfillmentStatus === 'completed') {
+              buyerNotifyAttemptedInPass.add(ord.orderId);
+            }
             recovered.push(reconciled);
           } catch (error) {
             console.error(
@@ -2143,10 +2384,31 @@ export class FulfillmentService {
           continue;
         }
 
-        if (!ord.adminNotifiedAt && !ord.mystarsOrderId) {
-          const notified = await this.ensureAdminNotified(ord, bot);
-          if (notified.adminNotifiedAt) {
-            recovered.push(notified);
+        const isActivelyDispatchingCreate =
+          !ord.mystarsOrderId &&
+          (Boolean(ord.mystarsCreateInFlight) ||
+            (!ord.externalExecutionReference &&
+              !ord.adminNotificationState &&
+              startedMs > 0 &&
+              !isStale));
+
+        if (
+          !isActivelyDispatchingCreate &&
+          this.needsAdminNotificationRecovery(ord, nowMs)
+        ) {
+          adminNotifyAttemptedInPass.add(ord.orderId);
+          try {
+            const notified = await this.ensureAdminNotified(ord, bot);
+            if (this.didAdminNotificationProgress(ord, notified)) {
+              recovered.push(notified);
+            }
+          } catch (error) {
+            console.error(
+              `[FulfillmentService] Ошибка восстановления уведомления админам для processing-заказа #${ord.orderId}:`,
+              redactSecretsFromText(
+                error instanceof Error ? error.message : String(error),
+              ),
+            );
           }
         }
       }
@@ -2157,11 +2419,32 @@ export class FulfillmentService {
       try {
         const pollSummary = await this.pollMyStarsOrders(bot);
         for (const polledOrder of pollSummary.orders) {
+          if (polledOrder.fulfillmentStatus === 'completed') {
+            buyerNotifyAttemptedInPass.add(polledOrder.orderId);
+          }
           recovered.push(polledOrder);
         }
       } catch (error) {
         console.error(
           '[FulfillmentService] Ошибка фонового polling MyStars:',
+          redactSecretsFromText(error instanceof Error ? error.message : String(error)),
+        );
+      }
+
+      // 3c. Dedicated Notification Recovery Pass (completed buyer notifications & pending/partial/no_recipients/expired-lease admin notifications)
+      try {
+        const notificationRecovered = await this.recoverPendingNotifications(
+          bot,
+          Date.now(),
+          buyerNotifyAttemptedInPass,
+          adminNotifyAttemptedInPass,
+        );
+        for (const notifiedOrder of notificationRecovered) {
+          recovered.push(notifiedOrder);
+        }
+      } catch (error) {
+        console.error(
+          '[FulfillmentService] Ошибка фонового восстановления уведомлений Telegram:',
           redactSecretsFromText(error instanceof Error ? error.message : String(error)),
         );
       }

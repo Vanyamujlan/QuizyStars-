@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { Express, Request, Response } from 'express';
-import { formatUsd, getEnvConfig } from './src/config/env.ts';
+import { formatUsd, getEnvConfig, readFragmentWalletSeedFromEnv } from './src/config/env.ts';
 import { firestoreRepo } from './src/db/firestore.ts';
 import { botManager, maskSecretsInText } from './src/bot/bot.ts';
 import { oe } from './src/bot/outlineEmoji.ts';
@@ -15,6 +15,7 @@ import {
 } from './src/services/BalanceService.ts';
 import { PaymentService } from './src/services/PaymentService.ts';
 import { myStarsClient } from './src/services/MyStarsService.ts';
+import { fragmentAuthService } from './src/services/FragmentAuthService.ts';
 import {
   ExchangeRateUnavailableError,
   PAYMENT_PROVIDER_CATALOG,
@@ -293,6 +294,7 @@ export function renderPlainTextStatus(): string {
   const config = getEnvConfig();
   const mystarsDiag = myStarsClient.getStatusSummary();
   const mystarsPolling = FulfillmentService.getMyStarsPollingStatus();
+  const fragmentDiag = fragmentAuthService.getStatusSummary();
   return [
     '=== QUIZYSTARS STORE SERVER ===',
     'QuizyStars — Магазин Telegram Stars, Telegram Premium и Gifts. Оплата: CryptoBot (3%), xRocket (2%), внутренний баланс (USD). XTR checkout отключён.',
@@ -307,12 +309,20 @@ export function renderPlainTextStatus(): string {
     })`,
     `База данных Firestore: проект ${dbStatus.projectId} (${dbStatus.databaseId})`,
     `Статус хранилища: ${dbStatus.degradedMode ? 'АВАРИЙНЫЙ РЕЖИМ (НЕДОСТУПНО)' : 'АКТИВНО'}`,
+    `Активный поставщик (FULFILLMENT_PROVIDER): ${config.fulfillmentProvider || 'auto (mystars/manual)'}`,
     `MyStars FaaS v1 (Polling): ${
       mystarsDiag.configured
         ? `НАСТРОЕН (${mystarsDiag.apiBaseUrl}, интервал: ${Math.round(mystarsDiag.pollIntervalMs / 1000)}с, воркер: ${
             mystarsPolling.workerActive ? 'активен' : 'остановлен'
           })`
         : 'РУЧНОЙ РЕЖИМ (MYSTARS_API_KEY не задан)'
+    }`,
+    `Fragment API v3 (Stage 4.6.1 Auth, без KYC): ${
+      fragmentDiag.walletConfigured
+        ? `КОШЕЛЁК НАСТРОЕН (${fragmentDiag.walletType}, ${fragmentDiag.walletAddressFriendly}, auth_key: ${
+            fragmentDiag.authenticated ? 'активен' : 'не получен'
+          })`
+        : 'ОЖИДАНИЕ TON_SEED (авторизация не настроена)'
     }`,
     `Валюта расчётов MyStars: ${config.mystarsPaymentCurrency}`,
     `Проверка здоровья (JSON): /health`,
@@ -361,6 +371,7 @@ export function createApp(deps?: ServerDependencies): Express {
     const gateway = deps?.gateway ?? defaultGateway;
     const providerDiag = gateway.getProviderStatusSummary();
     const mystarsDiag = myStarsClient.getStatusSummary();
+    const fragmentDiag = fragmentAuthService.getStatusSummary();
 
     const httpStatus = dbStatus.degradedMode ? 503 : 200;
     res.status(httpStatus).json({
@@ -373,6 +384,7 @@ export function createApp(deps?: ServerDependencies): Express {
       database: dbStatus,
       fulfillment: {
         ...fulfillment,
+        configuredProvider: config.fulfillmentProvider || 'auto',
         recoveryWorkerActive: FulfillmentService.isRecoveryWorkerActive(),
         mystars: {
           configured: mystarsDiag.configured,
@@ -382,6 +394,17 @@ export function createApp(deps?: ServerDependencies): Express {
           pollIntervalMs: mystarsDiag.pollIntervalMs,
           requestTimeoutMs: mystarsDiag.requestTimeoutMs,
           polling: FulfillmentService.getMyStarsPollingStatus(),
+        },
+        fragment: {
+          providerConfigured: fragmentDiag.providerConfigured,
+          walletConfigured: fragmentDiag.walletConfigured,
+          walletType: fragmentDiag.walletType,
+          walletAddressFriendly: fragmentDiag.walletAddressFriendly,
+          kycMode: fragmentDiag.kycMode,
+          apiBaseUrl: fragmentDiag.apiBaseUrl,
+          authenticated: fragmentDiag.authenticated,
+          idleExpiresAt: fragmentDiag.idleExpiresAt,
+          maxExpiresAt: fragmentDiag.maxExpiresAt,
         },
       },
       paymentProviders: {
@@ -433,6 +456,7 @@ async function bootstrap(): Promise<void> {
         latest.cryptobotApiToken,
         latest.xrocketApiKey,
         latest.mystarsApiKey,
+        readFragmentWalletSeedFromEnv(),
       ]),
     );
   });
@@ -449,6 +473,7 @@ async function bootstrap(): Promise<void> {
         latest.cryptobotApiToken,
         latest.xrocketApiKey,
         latest.mystarsApiKey,
+        readFragmentWalletSeedFromEnv(),
       ]),
     );
   });

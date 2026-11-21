@@ -188,11 +188,29 @@ function getDocumentPrimaryKey(doc: Record<string, unknown>): string {
   );
 }
 
+function getNestedFieldValue(
+  docRecord: Record<string, unknown>,
+  fieldPath: string,
+): unknown {
+  if (!fieldPath.includes('.')) {
+    return docRecord[fieldPath];
+  }
+  const segments = fieldPath.split('.');
+  let current: unknown = docRecord;
+  for (const segment of segments) {
+    if (current === null || current === undefined || typeof current !== 'object') {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
 function evaluateWhereFilter(
   docRecord: Record<string, unknown>,
   filter: QueryWhereFilter,
 ): boolean {
-  const fieldVal = docRecord[filter.field];
+  const fieldVal = getNestedFieldValue(docRecord, filter.field);
   switch (filter.op) {
     case '==':
       return fieldVal === filter.value;
@@ -226,8 +244,8 @@ function applyInMemorySortAndCursorPagination<T>(
     result.sort((a, b) => {
       const recA = a as Record<string, unknown>;
       const recB = b as Record<string, unknown>;
-      const va = recA[orderField];
-      const vb = recB[orderField];
+      const va = getNestedFieldValue(recA, orderField);
+      const vb = getNestedFieldValue(recB, orderField);
       if (typeof va === 'number' && typeof vb === 'number') {
         const diff = (va - vb) * factor;
         if (diff !== 0) return diff;
@@ -245,7 +263,7 @@ function applyInMemorySortAndCursorPagination<T>(
     const cursorIndex = result.findIndex((item) => {
       const rec = item as Record<string, unknown>;
       const pk = getDocumentPrimaryKey(rec);
-      const fieldVal = rec[orderField];
+      const fieldVal = getNestedFieldValue(rec, orderField);
       if (typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal && 'value' in cursorVal) {
         const typedCursor = cursorVal as { value: unknown; id: string };
         return fieldVal === typedCursor.value && pk === typedCursor.id;
