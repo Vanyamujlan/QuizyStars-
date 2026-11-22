@@ -465,8 +465,48 @@ async function bootstrap(): Promise<void> {
     );
   });
 
-  await firestoreRepo.init();
-  await botManager.start();
+  const server = app.listen(config.port, '0.0.0.0', () => {
+    console.log(
+      `[Server] QuizyStars server running on 0.0.0.0:${config.port} (Cloud Run ready).`,
+    );
+  });
+
+  try {
+    await firestoreRepo.init();
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : String(error);
+    const latest = getEnvConfig();
+    console.error(
+      '[Server] Ошибка инициализации Firestore:',
+      maskSecretsInText(raw, [
+        latest.telegramBotToken,
+        latest.webhookSecret,
+        latest.firebasePrivateKey,
+        latest.cryptobotApiToken,
+        latest.xrocketApiKey,
+        latest.mystarsApiKey,
+      ]),
+    );
+  }
+
+  try {
+    await botManager.start();
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : String(error);
+    const latest = getEnvConfig();
+    console.error(
+      '[Server] Ошибка запуска Telegram-бота:',
+      maskSecretsInText(raw, [
+        latest.telegramBotToken,
+        latest.webhookSecret,
+        latest.firebasePrivateKey,
+        latest.cryptobotApiToken,
+        latest.xrocketApiKey,
+        latest.mystarsApiKey,
+      ]),
+    );
+  }
+
   FulfillmentService.startRecoveryWorker(
     () => botManager.getBotInstance(),
     config.mystarsPollIntervalMs,
@@ -499,12 +539,6 @@ async function bootstrap(): Promise<void> {
     }
   }, 5000);
   watcherInterval.unref?.();
-
-  const server = app.listen(config.port, '0.0.0.0', () => {
-    console.log(
-      `[Server] QuizyStars server running on 0.0.0.0:${config.port} (Cloud Run ready).`,
-    );
-  });
 
   const shutdown = (signal: string) => {
     if (isShuttingDown) return;
