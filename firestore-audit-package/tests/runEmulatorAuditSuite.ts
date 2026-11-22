@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -27,6 +28,11 @@ import {
 import { OrderService } from '../../src/services/OrderService.ts';
 import { ProductService } from '../../src/services/ProductService.ts';
 import { PaymentService } from '../../src/services/PaymentService.ts';
+import { BalanceService } from '../../src/services/BalanceService.ts';
+import {
+  PaymentProviderGateway,
+  VerifiedProviderInvoice,
+} from '../../src/services/PaymentProviders.ts';
 import {
   FulfillmentService,
   FulfillmentProviderAdapter,
@@ -39,8 +45,10 @@ import {
 import { UserService } from '../../src/services/UserService.ts';
 import {
   AdminRecord,
+  BalanceTopUpRecord,
   Order,
   OrderStatus,
+  PaymentLockRecord,
   PaymentRecord,
   Product,
   StoreSettings,
@@ -562,25 +570,84 @@ async function main(): Promise<void> {
   await runCheck(
     'INT-06',
     'Integrity',
-    'Запрет повторной обработки одного telegram_payment_charge_id',
-    'Проверка идемпотентности PaymentService.processSuccessfulPayment на уже существующем charge_id',
+    'Запрет повторной обработки оплаченного платежа и корректное отключение XTR checkout',
+    'Проверка отключения XTR checkout (XTR_CHECKOUT_DISABLED), идемпотентности OrderService.markOrderPaid и дублирующего вызова verifyAndProcessOrderPayment',
     async () => {
       const beforeUser = await UserService.getUserById('tg_900001002');
       assert.ok(beforeUser);
+      const txsBefore = await firestoreRepo.listDocs<StoreTransaction>('transactions', 500);
 
-      const dupResult = await PaymentService.processSuccessfulPayment({
-        telegramUserId: 900001002,
+      // 1. Legacy XTR checkout must remain strictly disabled without mutating user or order
+      const preCheckout = await PaymentService.validatePreCheckout({
         invoicePayload: 'ord_syn_paid_02',
+        telegramUserId: 900001002,
         currency: 'XTR',
         totalAmount: 100,
+      });
+      assert.equal(preCheckout.ok, false, 'XTR validatePreCheckout должен быть отключён');
+
+      await assert.rejects(
+        async () => {
+          await PaymentService.processSuccessfulPayment({
+            telegramUserId: 900001002,
+            invoicePayload: 'ord_syn_paid_02',
+            currency: 'XTR',
+            totalAmount: 100,
+            telegramPaymentChargeId: 'chg_syn_paid_02',
+          });
+        },
+        /XTR_CHECKOUT_DISABLED/,
+      );
+
+      // 2. OrderService.markOrderPaid on already-paid order must be strictly idempotent
+      const existingOrder = await OrderService.markOrderPaid({
+        orderId: 'ord_syn_paid_02',
+        paymentId: 'pay_chg_syn_paid_02',
         telegramPaymentChargeId: 'chg_syn_paid_02',
       });
-      assert.equal(dupResult.alreadyProcessed, true);
+      assert.equal(existingOrder.paymentStatus, 'paid');
+
+      // 3. Active CryptoBot PaymentRecord duplicate verification must return duplicate=true
+      const tempDupPaymentId = 'ordpay_int06_dup_01';
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.setDoc<PaymentRecord>('payments', tempDupPaymentId, {
+        paymentId: tempDupPaymentId,
+        kind: 'order',
+        provider: 'cryptobot',
+        providerPaymentId: 'inv_int06_dup_01',
+        orderId: 'ord_syn_paid_02',
+        userId: 'tg_900001002',
+        userTelegramId: 900001002,
+        totalAmount: 100,
+        expectedUsdCents: 100,
+        expectedAmountStr: '1.00',
+        currency: 'USDT',
+        network: 'TON',
+        invoicePayload: 'ord_syn_paid_02',
+        status: 'paid',
+        paidAt: nowIso,
+        confirmedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      try {
+        const dupRes = await PaymentService.verifyAndProcessOrderPayment(tempDupPaymentId);
+        assert.equal(dupRes.ok, true);
+        assert.equal(dupRes.duplicate, true, 'Повторная верификация оплаченного PaymentRecord должна вернуть duplicate=true');
+        assert.equal(dupRes.status, 'paid');
+      } finally {
+        await firestoreRepo.deleteDoc('payments', tempDupPaymentId);
+      }
 
       const afterUser = await UserService.getUserById('tg_900001002');
       assert.equal(afterUser?.totalOrders, beforeUser.totalOrders);
       assert.equal(afterUser?.totalSpentStars, beforeUser.totalSpentStars);
-      return 'Повторный вызов с тем же telegram_payment_charge_id распознан как дубликат без изменения баланса и заказов.';
+      assert.equal(afterUser?.totalSpentUsdCents, beforeUser.totalSpentUsdCents);
+
+      const txsAfter = await firestoreRepo.listDocs<StoreTransaction>('transactions', 500);
+      assert.equal(txsAfter.length, txsBefore.length, 'Не должно создаваться дублирующих транзакций');
+      return 'XTR checkout строго отключён (XTR_CHECKOUT_DISABLED), markOrderPaid и verifyAndProcessOrderPayment на оплаченном платеже идемпотентны (duplicate=true) без изменения счётчиков.';
     },
   );
 
@@ -1270,8 +1337,8 @@ async function main(): Promise<void> {
   await runCheck(
     'IDX-01',
     'IndexesQueries',
-    'Сверка всех 10 составных индексов в firestore.indexes.json с запросами в коде',
-    'Проверка структуры, коллекций, полей и направлений сортировки всех 10 индексов',
+    'Сверка всех 17 составных индексов в firestore.indexes.json с запросами в коде',
+    'Проверка структуры, коллекций, queryScope, полей и направлений сортировки всех 17 индексов',
     async () => {
       const raw = fs.readFileSync(
         path.resolve(process.cwd(), 'firestore.indexes.json'),
@@ -1284,7 +1351,7 @@ async function main(): Promise<void> {
           fields: Array<{ fieldPath: string; order: string }>;
         }>;
       };
-      assert.equal(parsed.indexes.length, 10, 'Должно быть ровно 10 составных индексов');
+      assert.equal(parsed.indexes.length, 17, 'Должно быть ровно 17 составных индексов');
 
       const expectedSignatures = [
         'orders:userId:ASCENDING,createdAt:DESCENDING',
@@ -1296,8 +1363,23 @@ async function main(): Promise<void> {
         'products:category:ASCENDING,price:ASCENDING',
         'products:isActive:ASCENDING,price:ASCENDING',
         'payments:status:ASCENDING,createdAt:DESCENDING',
+        'payments:status:ASCENDING,createdAt:DESCENDING,paymentId:DESCENDING',
+        'payments:orderId:ASCENDING,createdAt:DESCENDING',
+        'balance_topups:paymentStatus:ASCENDING,createdAt:DESCENDING',
+        'balance_topups:paymentStatus:ASCENDING,createdAt:DESCENDING,paymentId:DESCENDING',
+        'balance_topups:userId:ASCENDING,createdAt:DESCENDING',
+        'balance_topups:userId:ASCENDING,createdAt:DESCENDING,paymentId:DESCENDING',
+        'balance_topups:userTelegramId:ASCENDING,createdAt:DESCENDING',
         'transactions:type:ASCENDING,createdAt:DESCENDING',
       ];
+
+      for (const idx of parsed.indexes) {
+        assert.equal(
+          idx.queryScope,
+          'COLLECTION',
+          `Индекс ${idx.collectionGroup} должен иметь queryScope=COLLECTION`,
+        );
+      }
 
       const actualSignatures = parsed.indexes.map(
         (idx) =>
@@ -1311,7 +1393,7 @@ async function main(): Promise<void> {
         );
       }
 
-      return 'Все 10 составных индексов в firestore.indexes.json присутствуют и полностью покрывают все комбинации where + orderBy в коде.';
+      return 'Все 17 составных индексов в firestore.indexes.json (orders, products, payments, balance_topups, transactions) присутствуют и полностью покрывают все комбинации where + orderBy в коде.';
     },
   );
 
@@ -1360,8 +1442,8 @@ async function main(): Promise<void> {
   await runCheck(
     'IDX-03',
     'IndexesQueries',
-    'Выполнение индексированных запросов к products, payments и transactions через Emulator',
-    'Реальный прогон запросов витрины товаров (3 индекса), платежей по статусу и транзакций по типу',
+    'Выполнение индексированных запросов к products, payments, balance_topups и transactions через Emulator',
+    'Реальный прогон запросов витрины товаров (3 индекса), платежей, очередей сверки (reconciliation) и транзакций по типу',
     async () => {
       // Index 6: products (category ASC, isActive ASC, price ASC)
       const activeGifts = await ProductService.getProductsByCategory('gifts', false, 20);
@@ -1385,7 +1467,96 @@ async function main(): Promise<void> {
       });
       assert.equal(paidPayments.length, 9);
 
-      // Index 10: transactions (type ASC, createdAt DESC)
+      // Index 10 (payments.status, createdAt DESC, paymentId DESC) + Index 11 (payments.orderId, createdAt DESC)
+      const orderPayments = await firestoreRepo.queryDocs<PaymentRecord>('payments', {
+        where: [{ field: 'orderId', op: '==', value: 'ord_syn_paid_02' }],
+        orderBy: { field: 'createdAt', direction: 'desc' },
+        limit: 10,
+      });
+      assert.equal(orderPayments.length, 1);
+
+      const sameCreatedAt = '2026-11-20T12:00:00.000Z';
+      const tempPayIds = ['ordpay_idx03_rec_a', 'ordpay_idx03_rec_b'];
+      const tempTopUpIds = ['topup_idx03_rec_a', 'topup_idx03_rec_b'];
+      for (const pid of tempPayIds) {
+        await firestoreRepo.setDoc<PaymentRecord>('payments', pid, {
+          paymentId: pid,
+          kind: 'order',
+          provider: 'cryptobot',
+          providerPaymentId: `inv_${pid}`,
+          orderId: 'ord_syn_pending_01',
+          userId: 'tg_900001002',
+          userTelegramId: 900001002,
+          totalAmount: 100,
+          expectedUsdCents: 100,
+          expectedAmountStr: '1.00',
+          currency: 'USDT',
+          network: 'TON',
+          invoicePayload: 'ord_syn_pending_01',
+          status: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationReason: 'LATE_PAYMENT_ORDER_CANCELLED',
+          createdAt: sameCreatedAt,
+          updatedAt: sameCreatedAt,
+        });
+      }
+      for (const tid of tempTopUpIds) {
+        await firestoreRepo.setDoc<BalanceTopUpRecord>('balance_topups', tid, {
+          paymentId: tid,
+          userId: 'tg_900001002',
+          userTelegramId: 900001002,
+          provider: 'cryptobot',
+          providerPaymentId: `inv_${tid}`,
+          amountUsdCents: 500,
+          feeUsdCents: 15,
+          amountCreditedUsdCents: 485,
+          expectedUsdCents: 500,
+          expectedAmountStr: '5.00',
+          currency: 'USDT',
+          network: 'TON',
+          paymentStatus: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationReason: 'LATE_PAYMENT_TOPUP_CANCELLED',
+          createdAt: sameCreatedAt,
+          updatedAt: sameCreatedAt,
+        });
+      }
+
+      try {
+        const payRecP1 = await PaymentService.getReconciliationRequiredPaymentsPaginated(1);
+        assert.equal(payRecP1.items.length, 1);
+        assert.equal(payRecP1.items[0].paymentId, 'ordpay_idx03_rec_b');
+        assert.equal(payRecP1.hasMore, true);
+        const payRecP2 = await PaymentService.getReconciliationRequiredPaymentsPaginated(
+          1,
+          payRecP1.nextCursor,
+        );
+        assert.equal(payRecP2.items.length, 1);
+        assert.equal(payRecP2.items[0].paymentId, 'ordpay_idx03_rec_a');
+
+        const bs = new BalanceService('idx03_check');
+        const topUpP1 = await bs.getAllTopUpsPaginated('refund_required', 1);
+        assert.equal(topUpP1.items.length, 1);
+        assert.equal(topUpP1.items[0].paymentId, 'topup_idx03_rec_b');
+        assert.equal(topUpP1.hasMore, true);
+        const topUpP2 = await bs.getAllTopUpsPaginated('refund_required', 1, topUpP1.nextCursor);
+        assert.equal(topUpP2.items.length, 1);
+        assert.equal(topUpP2.items[0].paymentId, 'topup_idx03_rec_a');
+
+        const topUpsByUser = await firestoreRepo.queryDocs<BalanceTopUpRecord>('balance_topups', {
+          where: [{ field: 'userTelegramId', op: '==', value: 900001002 }],
+          orderBy: { field: 'createdAt', direction: 'desc' },
+          limit: 10,
+        });
+        assert.equal(topUpsByUser.length, 2);
+      } finally {
+        for (const pid of tempPayIds) await firestoreRepo.deleteDoc('payments', pid);
+        for (const tid of tempTopUpIds) await firestoreRepo.deleteDoc('balance_topups', tid);
+      }
+
+      // Index 17: transactions (type ASC, createdAt DESC)
       const paymentTxs = await firestoreRepo.queryDocs<StoreTransaction>('transactions', {
         where: [{ field: 'type', op: '==', value: 'payment_received' }],
         orderBy: { field: 'createdAt', direction: 'desc' },
@@ -1393,7 +1564,7 @@ async function main(): Promise<void> {
       });
       assert.equal(paymentTxs.length, 10);
 
-      return 'Все 5 составных запросов к products, payments и transactions успешно выполнены через Emulator.';
+      return 'Все составные запросы к products, payments (включая reconciliation с secondaryOrderBy paymentId), balance_topups и transactions успешно выполнены через Emulator.';
     },
   );
 
@@ -1495,55 +1666,124 @@ async function main(): Promise<void> {
       assert.equal(secondPage.length, 2);
       assert.notEqual(secondPage[0].orderId, firstPage[0].orderId);
 
-      return 'Все запросы в сервисах используют равенство (==) + одиночный orderBy + DocumentSnapshot tie-breaker; запросов, способных вызвать FAILED_PRECONDITION при задеплоенных 10 индексах, не обнаружено.';
+      return 'Все запросы в сервисах используют равенство (==) + orderBy + secondaryOrderBy/DocumentSnapshot tie-breaker; запросов, способных вызвать FAILED_PRECONDITION при задеплоенных 17 индексах, не обнаружено.';
     },
   );
 
   // ===========================================================================
-  // SUITE 5: CONCURRENCY & CHAOS OPERATIONS ON EMULATOR (6 TESTS)
+  // SUITE 5: CONCURRENCY & CHAOS OPERATIONS ON EMULATOR (11 TESTS)
   // ===========================================================================
   await runCheck(
     'CON-01',
     'Concurrency',
-    'Два одновременных уведомления successful_payment на один заказ в Emulator',
-    'Параллельный запуск двух транзакций processSuccessfulPayment через Promise.all для заказа ord_syn_pending_01',
+    'Гонка двух одновременных подтверждений оплаты на один заказ (CryptoBot + защита отключённого XTR) в Emulator',
+    'Проверка параллельного отклонения XTR (XTR_CHECKOUT_DISABLED) и атомарного разрешения гонки двух параллельных verifyAndProcessOrderPayment (CryptoBot) через payment_locks для заказа ord_syn_pending_01',
     async () => {
       const userBefore = await UserService.getUserById('tg_900001002');
       assert.ok(userBefore);
 
-      const paymentPayload = {
+      // Part A: Parallel legacy XTR callbacks must both reject with XTR_CHECKOUT_DISABLED without side effects
+      const xtrPayload = {
         telegramUserId: 900001002,
         invoicePayload: 'ord_syn_pending_01',
         currency: 'XTR',
         totalAmount: 100,
-        telegramPaymentChargeId: 'chg_con_race_01',
-        providerPaymentChargeId: 'prov_con_race_01',
+        telegramPaymentChargeId: 'chg_con_race_xtr_01',
+        providerPaymentChargeId: 'prov_con_race_xtr_01',
       };
+      const [xtr1, xtr2] = await Promise.allSettled([
+        PaymentService.processSuccessfulPayment(xtrPayload),
+        PaymentService.processSuccessfulPayment(xtrPayload),
+      ]);
+      assert.equal(xtr1.status, 'rejected');
+      assert.equal(xtr2.status, 'rejected');
+      assert.match(String(xtr1.reason), /XTR_CHECKOUT_DISABLED/);
+      assert.match(String(xtr2.reason), /XTR_CHECKOUT_DISABLED/);
 
+      const pendingCheck = await OrderService.getOrderById('ord_syn_pending_01');
+      assert.equal(pendingCheck?.paymentStatus, 'pending');
+
+      // Part B: Active CryptoBot concurrent payment race via verifyAndProcessOrderPayment + payment_locks
+      const racePaymentId = 'ordpay_con01_race_01';
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.setDoc<PaymentRecord>('payments', racePaymentId, {
+        paymentId: racePaymentId,
+        kind: 'order',
+        provider: 'cryptobot',
+        providerPaymentId: 'inv_con_race_01',
+        orderId: 'ord_syn_pending_01',
+        userId: 'tg_900001002',
+        userTelegramId: 900001002,
+        totalAmount: 100,
+        expectedUsdCents: 100,
+        expectedAmountStr: '1.00',
+        currency: 'USDT',
+        network: 'TON',
+        invoicePayload: 'ord_syn_pending_01',
+        status: 'pending',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      class Con01RaceMockGateway extends PaymentProviderGateway {
+        public override async verifyInvoiceStatus(): Promise<VerifiedProviderInvoice> {
+          await new Promise((r) => setTimeout(r, 25));
+          return {
+            externalInvoiceId: 'inv_con_race_01',
+            paymentId: racePaymentId,
+            status: 'paid',
+            amountPaidStr: '1.00',
+            amountPaid: 1,
+            currency: 'USDT',
+            network: 'TON',
+            paidAt: nowIso,
+          };
+        }
+      }
+
+      const racePs = new PaymentService('con01_race', new Con01RaceMockGateway());
       const [res1, res2] = await Promise.all([
-        PaymentService.processSuccessfulPayment(paymentPayload),
-        PaymentService.processSuccessfulPayment(paymentPayload),
+        racePs.verifyAndProcessOrderPayment(racePaymentId),
+        racePs.verifyAndProcessOrderPayment(racePaymentId),
       ]);
 
-      // Exactly one should be newly processed, or the second sees alreadyProcessed=true after retry
-      const newlyProcessedCount = [res1, res2].filter((r) => !r.alreadyProcessed).length;
+      assert.equal(res1.ok, true);
+      assert.equal(res2.ok, true);
+      const newlyProcessedCount = [res1, res2].filter((r) => !r.duplicate).length;
+      const duplicateCount = [res1, res2].filter((r) => r.duplicate).length;
       assert.equal(
         newlyProcessedCount,
         1,
-        `Ровно 1 из 2 параллельных вызовов должен записать новый платёж, получено: ${newlyProcessedCount}`,
+        `Ровно 1 из 2 параллельных вызовов должен обработать платёж без флага duplicate, получено: ${newlyProcessedCount}`,
       );
+      assert.equal(duplicateCount, 1);
+
+      const lockDoc = await firestoreRepo.getDoc<PaymentLockRecord>(
+        'payment_locks',
+        'ext_cryptobot_inv_con_race_01',
+      );
+      assert.ok(lockDoc, 'Должен существовать атомарный lock в payment_locks');
+      assert.equal(lockDoc.targetId, 'ord_syn_pending_01');
+      assert.equal(lockDoc.paymentId, racePaymentId);
 
       const userAfter = await UserService.getUserById('tg_900001002');
       assert.equal(userAfter?.totalOrders, userBefore.totalOrders + 1);
-      assert.equal(userAfter?.totalSpentStars, userBefore.totalSpentStars + 100);
+      assert.equal(
+        userAfter?.totalSpentUsdCents,
+        (userBefore.totalSpentUsdCents || 0) + 100,
+      );
 
       const allTxs = await firestoreRepo.listDocs<StoreTransaction>('transactions', 500);
       const paymentTxsForOrder = allTxs.filter(
         (t) => t.orderId === 'ord_syn_pending_01' && t.type === 'payment_received',
       );
-      assert.equal(paymentTxsForOrder.length, 1, 'Должна быть создана ровно 1 транзакция payment_received');
+      assert.equal(
+        paymentTxsForOrder.length,
+        1,
+        'Должна быть создана ровно 1 транзакция payment_received',
+      );
 
-      return 'Параллельная гонка 2 уведомлений об оплате в Emulator разрешена атомарно: 1 PaymentRecord, +1 к totalOrders, 0 дублей.';
+      return 'Параллельный XTR отклонён (XTR_CHECKOUT_DISABLED), а гонка 2 вызовов verifyAndProcessOrderPayment разрешена атомарно через payment_locks: newlyProcessed=1, duplicate=1, +1 к totalOrders, +100¢ totalSpentUsdCents, 1 payment_received.';
     },
   );
 
@@ -2410,6 +2650,21 @@ async function main(): Promise<void> {
   );
   await exportEmulatorCollectionsToJson(dumpPath);
 
+  const gitSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+  const gitBranch = execFileSync('git', ['branch', '--show-current'], {
+    encoding: 'utf-8',
+  }).trim();
+  const javaInfo = verifyJavaRuntime('java', 21);
+  const firebaseCmd = process.platform === 'win32' ? 'firebase.cmd' : 'firebase';
+  const fbRes = spawnSync(firebaseCmd, ['--version'], {
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const firebaseCliVersion = (fbRes.stdout || fbRes.stderr || 'unknown').trim();
+  const passedResults = results.filter((r) => r.status === 'PASS');
+  const failedResults = results.filter((r) => r.status === 'FAIL');
+
   const resultsJsonPath = path.resolve(
     process.cwd(),
     'firestore-audit-package/export/audit-test-results.json',
@@ -2418,12 +2673,25 @@ async function main(): Promise<void> {
     resultsJsonPath,
     JSON.stringify(
       {
+        gitSha,
+        gitBranch,
         executedAt: new Date().toISOString(),
+        nodeVersion: process.version,
+        javaVersion: javaInfo.firstLine,
+        firebaseCliVersion,
         emulatorHost: finalSeedSummary.emulatorHost,
         projectId: finalSeedSummary.projectId,
+        emulatorUsed: firestoreRepo.isEmulatorMode(),
         totalTests: results.length,
-        passed: results.filter((r) => r.status === 'PASS').length,
-        failed: results.filter((r) => r.status === 'FAIL').length,
+        passed: passedResults.length,
+        failed: failedResults.length,
+        executedTestIds: results.map((r) => r.id),
+        failedDetails: failedResults.map((r) => ({
+          id: r.id,
+          suite: r.suite,
+          name: r.name,
+          details: r.details,
+        })),
         results,
       },
       null,
@@ -2432,7 +2700,7 @@ async function main(): Promise<void> {
     'utf-8',
   );
 
-  const failedCount = results.filter((r) => r.status === 'FAIL').length;
+  const failedCount = failedResults.length;
   console.log('================================================================================');
   console.log(
     `📊 ИТОГИ EMULATOR AUDIT SUITE: ${results.length - failedCount}/${results.length} PASS | ${failedCount} FAIL`,

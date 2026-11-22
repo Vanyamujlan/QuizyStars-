@@ -4,6 +4,7 @@ import {
   assertEmulatorOnlyEnvironment,
   firestoreRepo,
   CollectionName,
+  StoreCollectionName,
 } from '../../src/db/firestore.ts';
 import {
   AdminRecord,
@@ -31,7 +32,7 @@ export async function clearEmulatorCollections(): Promise<void> {
   if (!db) {
     throw new Error('Emulator AdminFirestore не инициализирован.');
   }
-  const collections: CollectionName[] = [
+  const collections: StoreCollectionName[] = [
     'users',
     'products',
     'orders',
@@ -39,6 +40,9 @@ export async function clearEmulatorCollections(): Promise<void> {
     'transactions',
     'admins',
     'settings',
+    'balance_topups',
+    'digital_keys',
+    'payment_locks',
   ];
   for (const col of collections) {
     const snap = await db.collection(col).get();

@@ -311,10 +311,22 @@ function verifyExportedArtifacts(): void {
   const resultsJson = JSON.parse(fs.readFileSync(resultsPath, 'utf-8'));
   if (
     resultsJson.projectId !== AUDIT_PROJECT_ID ||
-    resultsJson.emulatorHost !== EXPECTED_EMULATOR_HOST
+    resultsJson.emulatorHost !== EXPECTED_EMULATOR_HOST ||
+    resultsJson.emulatorUsed !== true
   ) {
     throw new Error(
-      `Несовпадение метаданных в audit-test-results.json: projectId=${resultsJson.projectId}, host=${resultsJson.emulatorHost}`,
+      `Несовпадение метаданных в audit-test-results.json: projectId=${resultsJson.projectId}, host=${resultsJson.emulatorHost}, emulatorUsed=${resultsJson.emulatorUsed}`,
+    );
+  }
+  if (typeof resultsJson.gitSha !== 'string' || resultsJson.gitSha.trim().length < 7) {
+    throw new Error(`Отсутствует или некорректен gitSha в audit-test-results.json: ${resultsJson.gitSha}`);
+  }
+  if (
+    !Array.isArray(resultsJson.executedTestIds) ||
+    resultsJson.executedTestIds.length !== resultsJson.totalTests
+  ) {
+    throw new Error(
+      `Некорректный список executedTestIds в audit-test-results.json: length=${resultsJson.executedTestIds?.length}, totalTests=${resultsJson.totalTests}`,
     );
   }
   if (resultsJson.failed !== 0 || resultsJson.passed !== resultsJson.totalTests) {

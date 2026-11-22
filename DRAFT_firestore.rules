@@ -9,7 +9,7 @@ service cloud.firestore {
 
     // Global Primitives
     function isValidId(id) {
-      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function incoming() {
@@ -25,9 +25,9 @@ service cloud.firestore {
     }
 
     function isVerified() {
-      return isSignedIn() && (
-        request.auth.token.email_verified == true ||
-        request.auth.token.telegram_verified == true
+      return isSignedIn() && request.auth.token != null && (
+        ('email_verified' in request.auth.token && request.auth.token.email_verified == true) ||
+        ('telegram_verified' in request.auth.token && request.auth.token.telegram_verified == true)
       );
     }
 
@@ -39,7 +39,7 @@ service cloud.firestore {
     // Verifies admin status only via custom claims (admin == true) or /admins/{uid} document.
     function isAdmin() {
       return isVerified() && (
-        request.auth.token.admin == true ||
+        ('admin' in request.auth.token && request.auth.token.admin == true) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
@@ -48,7 +48,6 @@ service cloud.firestore {
     function isValidDateVal(val) {
       return val is timestamp || (
         val is string &&
-        val.size() >= 20 &&
         val.size() <= 40 &&
         val.matches('^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+\\-]\\d{2}:\\d{2})$')
       );
@@ -57,7 +56,6 @@ service cloud.firestore {
     function isFreshTimestamp(val) {
       return (val is timestamp && val == request.time) || (
         val is string &&
-        val.size() >= 20 &&
         val.size() <= 40 &&
         val.matches('^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+\\-]\\d{2}:\\d{2})$')
       );
@@ -138,8 +136,45 @@ service cloud.firestore {
         isValidDateVal(data.updatedAt);
     }
 
-    function isValidOrder(data, orderId) {
+    function isValidOrderCore(data, orderId) {
       return data.keys().hasAll(['orderId', 'userId', 'userTelegramId', 'productId', 'productName', 'category', 'quantity', 'totalPrice', 'currency', 'paymentStatus', 'fulfillmentStatus', 'createdAt', 'updatedAt']) &&
+        data.orderId is string && data.orderId.size() <= 64 && data.orderId == orderId &&
+        isValidId(data.userId) &&
+        data.userTelegramId is number && data.userTelegramId > 0 &&
+        isValidId(data.productId) &&
+        data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 120 &&
+        data.category in ['stars', 'premium', 'gifts'] &&
+        data.quantity is int && data.quantity >= 1 && data.quantity <= 100000 &&
+        data.totalPrice is number && data.totalPrice > 0 &&
+        data.currency in ['USD', 'XTR'] &&
+        data.paymentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        data.fulfillmentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        isValidDateVal(data.createdAt) &&
+        isValidDateVal(data.updatedAt);
+    }
+
+    function isValidBuyerOrderCreate(data, orderId) {
+      return isValidOrderCore(data, orderId) &&
+        data.keys().hasOnly([
+          'orderId', 'userId', 'userTelegramId', 'username', 'recipientUsername',
+          'productId', 'productName', 'category', 'quantity', 'durationMonths',
+          'unitPriceUsdCents', 'totalPriceUsdCents', 'totalPrice', 'currency',
+          'paymentMethod', 'paymentStatus', 'fulfillmentStatus',
+          'fulfillmentAttempts', 'needsManualReconciliation', 'createdAt', 'updatedAt'
+        ]) &&
+        data.paymentStatus == 'pending' &&
+        data.fulfillmentStatus == 'pending' &&
+        (!('needsManualReconciliation' in data) || data.needsManualReconciliation == false) &&
+        (!('fulfillmentAttempts' in data) || data.fulfillmentAttempts == 0);
+    }
+
+    function isBuyerProductValid(productData, data) {
+      return productData.isActive == true &&
+        productData.price * data.quantity == data.totalPrice;
+    }
+
+    function isValidOrder(data, orderId) {
+      return isValidOrderCore(data, orderId) &&
         data.keys().hasOnly([
           'orderId',
           'userId',
@@ -150,6 +185,7 @@ service cloud.firestore {
           'productName',
           'category',
           'quantity',
+          'durationMonths',
           'unitPriceUsdCents',
           'totalPriceUsdCents',
           'totalPrice',
@@ -163,6 +199,7 @@ service cloud.firestore {
           'fulfillmentStatus',
           'telegramPaymentChargeId',
           'providerPaymentChargeId',
+          'fulfillmentProvider',
           'grossRevenueUsdCents',
           'providerFeeUsdCents',
           'mystarsCurrency',
@@ -171,6 +208,24 @@ service cloud.firestore {
           'tonNetworkFeeTon',
           'tonNetworkFeeUsdCents',
           'netProfitUsdCents',
+          'mystarsOrderId',
+          'mystarsOrderStatus',
+          'mystarsPayToAddress',
+          'mystarsPaymentMemo',
+          'mystarsPaymentAmountUsdt',
+          'mystarsPurchaseTx',
+          'mystarsPaymentTx',
+          'mystarsReversalTx',
+          'mystarsFailureReason',
+          'mystarsExpiresAt',
+          'mystarsLastPolledAt',
+          'mystarsPollAttempts',
+          'mystarsLastPollError',
+          'mystarsPollLease',
+          'mystarsStuckAlertedAt',
+          'mystarsUnknownStatusSeen',
+          'mystarsCreateInFlight',
+          'mystarsAmbiguousPostAt',
           'fulfillmentNote',
           'fulfillmentStartedAt',
           'fulfillmentAttempts',
@@ -189,63 +244,26 @@ service cloud.firestore {
           'refundStatsAdjusted',
           'adminNotifiedAt',
           'buyerNotifiedAt',
+          'buyerNotificationState',
+          'adminNotificationState',
           'createdAt',
           'paidAt',
           'completedAt',
+          'completedByAdminId',
           'updatedAt'
         ]) &&
-        data.orderId is string && data.orderId.size() <= 64 && data.orderId == orderId &&
-        isValidId(data.userId) &&
-        data.userTelegramId is number && data.userTelegramId > 0 &&
-        (!('username' in data) || (data.username is string && data.username.size() <= 64)) &&
-        (!('recipientUsername' in data) || (data.recipientUsername is string && data.recipientUsername.size() >= 1 && data.recipientUsername.size() <= 64)) &&
-        isValidId(data.productId) &&
-        data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 120 &&
-        data.category is string && data.category.size() <= 32 && data.category in ['stars', 'premium', 'gifts'] &&
-        data.quantity is int && data.quantity >= 1 && data.quantity <= 100000 &&
-        (!('unitPriceUsdCents' in data) || (data.unitPriceUsdCents is int && data.unitPriceUsdCents > 0)) &&
-        (!('totalPriceUsdCents' in data) || (data.totalPriceUsdCents is int && data.totalPriceUsdCents > 0)) &&
-        data.totalPrice is number && data.totalPrice > 0 &&
-        data.currency is string && data.currency.size() <= 8 && data.currency in ['USD', 'XTR'] &&
-        (!('paymentMethod' in data) || (data.paymentMethod is string && data.paymentMethod.size() <= 32 && data.paymentMethod in ['cryptobot', 'xrocket', 'balance', 'internal_balance', 'stars', 'telegram_stars'])) &&
-        (!('activePaymentId' in data) || (data.activePaymentId is string && data.activePaymentId.size() <= 128)) &&
-        (!('externalInvoiceId' in data) || (data.externalInvoiceId is string && data.externalInvoiceId.size() <= 128)) &&
-        (!('balancePaymentId' in data) || (data.balancePaymentId is string && data.balancePaymentId.size() <= 128)) &&
-        (!('balanceRefunded' in data) || data.balanceRefunded is bool) &&
-        data.paymentStatus is string && data.paymentStatus.size() <= 32 && data.paymentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
-        data.fulfillmentStatus is string && data.fulfillmentStatus.size() <= 32 && data.fulfillmentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
-        (!('telegramPaymentChargeId' in data) || (data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() <= 128)) &&
-        (!('providerPaymentChargeId' in data) || (data.providerPaymentChargeId is string && data.providerPaymentChargeId.size() <= 128)) &&
-        (!('grossRevenueUsdCents' in data) || (data.grossRevenueUsdCents is int && data.grossRevenueUsdCents >= 0)) &&
-        (!('providerFeeUsdCents' in data) || (data.providerFeeUsdCents is int && data.providerFeeUsdCents >= 0)) &&
-        (!('mystarsCurrency' in data) || (data.mystarsCurrency is string && data.mystarsCurrency.size() <= 16 && data.mystarsCurrency == 'usdt_ton')) &&
-        (!('mystarsWholesaleCostUsdt' in data) || (data.mystarsWholesaleCostUsdt is string && data.mystarsWholesaleCostUsdt.size() <= 64)) &&
-        (!('mystarsCostUsdCents' in data) || (data.mystarsCostUsdCents is int && data.mystarsCostUsdCents >= 0)) &&
-        (!('tonNetworkFeeTon' in data) || (data.tonNetworkFeeTon is string && data.tonNetworkFeeTon.size() <= 64)) &&
-        (!('tonNetworkFeeUsdCents' in data) || (data.tonNetworkFeeUsdCents is int && data.tonNetworkFeeUsdCents >= 0)) &&
-        (!('netProfitUsdCents' in data) || data.netProfitUsdCents is int) &&
-        (!('fulfillmentNote' in data) || (data.fulfillmentNote is string && data.fulfillmentNote.size() <= 500)) &&
-        (!('fulfillmentStartedAt' in data) || isValidDateVal(data.fulfillmentStartedAt)) &&
         (!('fulfillmentAttempts' in data) || (data.fulfillmentAttempts is number && data.fulfillmentAttempts >= 0 && data.fulfillmentAttempts <= 10)) &&
+        (!('fulfillmentNote' in data) || (data.fulfillmentNote is string && data.fulfillmentNote.size() <= 500)) &&
         (!('fulfillmentLastError' in data) || (data.fulfillmentLastError is string && data.fulfillmentLastError.size() <= 500)) &&
-        (!('fulfillmentNextRetryAt' in data) || isValidDateVal(data.fulfillmentNextRetryAt)) &&
         (!('fulfillmentIdempotencyKey' in data) || (data.fulfillmentIdempotencyKey is string && data.fulfillmentIdempotencyKey.size() >= 1 && data.fulfillmentIdempotencyKey.size() <= 128)) &&
-        (!('externalExecutionReference' in data) || (data.externalExecutionReference is string && data.externalExecutionReference.size() <= 256)) &&
         (!('needsManualReconciliation' in data) || data.needsManualReconciliation is bool) &&
         (!('assignedKeyIds' in data) || (data.assignedKeyIds is list && data.assignedKeyIds.size() <= 10)) &&
         (!('deliveredKeyValues' in data) || (data.deliveredKeyValues is list && data.deliveredKeyValues.size() <= 10)) &&
-        (!('awaitingKeyStock' in data) || data.awaitingKeyStock is bool) &&
-        (!('refundState' in data) || (data.refundState is string && data.refundState.size() <= 64 && data.refundState in ['refund_in_progress', 'telegram_refund_succeeded_pending_commit', 'refund_failed_needs_reconciliation', 'refunded'])) &&
-        (!('refundLockToken' in data) || (data.refundLockToken is string && data.refundLockToken.size() <= 128)) &&
-        (!('refundStartedAt' in data) || isValidDateVal(data.refundStartedAt)) &&
-        (!('refundLastError' in data) || (data.refundLastError is string && data.refundLastError.size() <= 500)) &&
-        (!('refundStatsAdjusted' in data) || data.refundStatsAdjusted is bool) &&
-        (!('adminNotifiedAt' in data) || isValidDateVal(data.adminNotifiedAt)) &&
-        (!('buyerNotifiedAt' in data) || isValidDateVal(data.buyerNotifiedAt)) &&
-        isValidDateVal(data.createdAt) &&
+        (!('refundState' in data) || data.refundState in ['refund_in_progress', 'telegram_refund_succeeded_pending_commit', 'refund_failed_needs_reconciliation', 'refunded']) &&
+        (!('fulfillmentStartedAt' in data) || isValidDateVal(data.fulfillmentStartedAt)) &&
+        (!('fulfillmentNextRetryAt' in data) || isValidDateVal(data.fulfillmentNextRetryAt)) &&
         (!('paidAt' in data) || isValidDateVal(data.paidAt)) &&
-        (!('completedAt' in data) || isValidDateVal(data.completedAt)) &&
-        isValidDateVal(data.updatedAt);
+        (!('completedAt' in data) || isValidDateVal(data.completedAt));
     }
 
     function isValidPayment(data, paymentId) {
@@ -267,6 +285,9 @@ service cloud.firestore {
           'netUsdCents',
           'expectedAmountStr',
           'actualAmountStr',
+          'verifiedAmountStr',
+          'verifiedCurrency',
+          'verifiedNetwork',
           'exchangeRateUsdStr',
           'currency',
           'network',
@@ -274,6 +295,14 @@ service cloud.firestore {
           'payUrl',
           'status',
           'statusReason',
+          'failureReason',
+          'needsManualReconciliation',
+          'refundRequired',
+          'reconciliationState',
+          'reconciliationReason',
+          'conflictingOrderStatus',
+          'conflictingFulfillmentStatus',
+          'supersededByPaymentId',
           'expiresAt',
           'paidAt',
           'confirmedAt',
@@ -282,43 +311,45 @@ service cloud.firestore {
           'refundedAt'
         ]) &&
         data.paymentId is string && data.paymentId.size() >= 1 && data.paymentId.size() <= 128 && data.paymentId == paymentId &&
-        (!('kind' in data) || (data.kind is string && data.kind.size() <= 16 && data.kind in ['order', 'topup'])) &&
-        (!('provider' in data) || (data.provider is string && data.provider.size() <= 32 && data.provider in ['cryptobot', 'xrocket', 'balance', 'telegram_stars'])) &&
-        (!('providerPaymentId' in data) || (data.providerPaymentId is string && data.providerPaymentId.size() <= 128)) &&
-        (!('telegramPaymentChargeId' in data) || (data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() >= 1 && data.telegramPaymentChargeId.size() <= 128)) &&
-        (!('providerPaymentChargeId' in data) || (data.providerPaymentChargeId is string && data.providerPaymentChargeId.size() <= 128)) &&
-        data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 64 && isValidId(data.orderId) &&
-        (!('topUpId' in data) || (data.topUpId is string && data.topUpId.size() <= 64)) &&
-        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && isValidId(data.userId) &&
+        (!('kind' in data) || data.kind in ['order', 'topup']) &&
+        (!('provider' in data) || data.provider in ['cryptobot', 'xrocket', 'balance', 'telegram_stars']) &&
+        isValidId(data.orderId) && data.orderId.size() <= 64 &&
+        isValidId(data.userId) && data.userId.size() <= 64 &&
         data.userTelegramId is number && data.userTelegramId > 0 &&
         data.totalAmount is number && data.totalAmount > 0 &&
-        (!('expectedUsdCents' in data) || (data.expectedUsdCents is int && data.expectedUsdCents >= 0)) &&
-        (!('feeUsdCents' in data) || (data.feeUsdCents is int && data.feeUsdCents >= 0)) &&
-        (!('netUsdCents' in data) || (data.netUsdCents is int && data.netUsdCents >= 0)) &&
-        (!('expectedAmountStr' in data) || (data.expectedAmountStr is string && data.expectedAmountStr.size() <= 64)) &&
-        (!('actualAmountStr' in data) || (data.actualAmountStr is string && data.actualAmountStr.size() <= 64)) &&
-        (!('exchangeRateUsdStr' in data) || (data.exchangeRateUsdStr is string && data.exchangeRateUsdStr.size() <= 64)) &&
         data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
-        (!('network' in data) || (data.network is string && data.network.size() <= 32)) &&
         data.invoicePayload is string && data.invoicePayload.size() >= 1 && data.invoicePayload.size() <= 256 &&
-        (!('payUrl' in data) || (data.payUrl is string && data.payUrl.size() <= 512)) &&
-        data.status is string && data.status.size() <= 32 && data.status in ['pending', 'paid', 'underpaid', 'overpaid', 'expired', 'cancelled', 'failed', 'refunded'] &&
+        data.status in ['pending', 'paid', 'underpaid', 'overpaid', 'expired', 'cancelled', 'failed', 'refunded', 'refund_required'] &&
         (!('statusReason' in data) || (data.statusReason is string && data.statusReason.size() <= 500)) &&
-        (!('expiresAt' in data) || isValidDateVal(data.expiresAt)) &&
-        (!('paidAt' in data) || isValidDateVal(data.paidAt)) &&
-        (!('confirmedAt' in data) || isValidDateVal(data.confirmedAt)) &&
-        isValidDateVal(data.createdAt) &&
-        (!('updatedAt' in data) || isValidDateVal(data.updatedAt)) &&
-        (!('refundedAt' in data) || isValidDateVal(data.refundedAt));
+        isValidDateVal(data.createdAt);
     }
 
     function isValidTransaction(data, transactionId) {
       return data.keys().hasAll(['transactionId', 'orderId', 'userId', 'type', 'amount', 'currency', 'details', 'createdAt']) &&
-        data.keys().hasOnly(['transactionId', 'orderId', 'userId', 'type', 'amount', 'amountUsdCents', 'currency', 'details', 'createdAt']) &&
+        data.keys().hasOnly([
+          'transactionId',
+          'orderId',
+          'userId',
+          'paymentId',
+          'supersededByPaymentId',
+          'provider',
+          'externalInvoiceId',
+          'verifiedAmountStr',
+          'verifiedCurrency',
+          'network',
+          'reconciliationReason',
+          'confirmedAt',
+          'type',
+          'amount',
+          'amountUsdCents',
+          'currency',
+          'details',
+          'createdAt'
+        ]) &&
         data.transactionId is string && data.transactionId.size() >= 1 && data.transactionId.size() <= 64 && data.transactionId == transactionId &&
-        data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 64 && isValidId(data.orderId) &&
-        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && isValidId(data.userId) &&
-        data.type is string && data.type.size() <= 32 && data.type in [
+        isValidId(data.orderId) && data.orderId.size() <= 64 &&
+        isValidId(data.userId) && data.userId.size() <= 64 &&
+        data.type in [
           'invoice_created',
           'pre_checkout_ok',
           'payment_received',
@@ -330,6 +361,7 @@ service cloud.firestore {
           'fulfillment_retry',
           'order_cancelled',
           'payment_refunded',
+          'payment_refund_required',
           'balance_topup_created',
           'balance_topup_paid',
           'balance_topup_underpaid',
@@ -427,34 +459,16 @@ service cloud.firestore {
     match /orders/{orderId} {
       allow get: if isValidId(orderId) && (isOwner(existing().userId) || isAdmin());
       allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
-      allow create: if isValidId(orderId) && isValidOrder(incoming(), orderId) &&
+      allow create: if isValidId(orderId) &&
         isFreshTimestamp(incoming().createdAt) &&
         isFreshTimestamp(incoming().updatedAt) && (
-          isAdmin() ||
+          (isAdmin() && isValidOrder(incoming(), orderId)) ||
           (isOwner(incoming().userId) &&
-            incoming().paymentStatus == 'pending' &&
-            incoming().fulfillmentStatus == 'pending' &&
-            !('activePaymentId' in incoming()) &&
-            !('externalInvoiceId' in incoming()) &&
-            !('balancePaymentId' in incoming()) &&
-            !('telegramPaymentChargeId' in incoming()) &&
-            !('providerPaymentChargeId' in incoming()) &&
-            !('grossRevenueUsdCents' in incoming()) &&
-            !('netProfitUsdCents' in incoming()) &&
-            !('paidAt' in incoming()) &&
-            !('completedAt' in incoming()) &&
-            !('externalExecutionReference' in incoming()) &&
-            !('assignedKeyIds' in incoming()) &&
-            !('deliveredKeyValues' in incoming()) &&
-            !('adminNotifiedAt' in incoming()) &&
-            !('buyerNotifiedAt' in incoming()) &&
-            (!('needsManualReconciliation' in incoming()) || incoming().needsManualReconciliation == false) &&
-            (!('fulfillmentAttempts' in incoming()) || incoming().fulfillmentAttempts == 0) &&
+            isValidBuyerOrderCreate(incoming(), orderId) &&
             exists(/databases/$(database)/documents/users/$(incoming().userId)) &&
             get(/databases/$(database)/documents/users/$(incoming().userId)).data.isBlocked == false &&
             exists(/databases/$(database)/documents/products/$(incoming().productId)) &&
-            get(/databases/$(database)/documents/products/$(incoming().productId)).data.isActive == true &&
-            get(/databases/$(database)/documents/products/$(incoming().productId)).data.price * incoming().quantity == incoming().totalPrice)
+            isBuyerProductValid(get(/databases/$(database)/documents/products/$(incoming().productId)).data, incoming()))
         );
       allow update: if isValidId(orderId) &&
         isFreshTimestamp(incoming().updatedAt) && (
@@ -541,7 +555,7 @@ service cloud.firestore {
 
     // 7. /settings/{settingKey}
     match /settings/{settingKey} {
-      allow get: if isValidId(settingKey) && (isSignedIn() || isAdmin());
+      allow get: if isValidId(settingKey) && (isAdmin() || (isSignedIn() && settingKey == 'global'));
       allow list: if isAdmin();
       allow create: if isValidId(settingKey) && isValidSetting(incoming(), settingKey) &&
         isFreshTimestamp(incoming().updatedAt) &&
