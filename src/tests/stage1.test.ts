@@ -144,6 +144,7 @@ import {
   validateRecipientWithActiveSupplier,
 } from '../services/SupplierValidation.ts';
 import type {
+  BalanceTopUpRecord,
   MyStarsPollCheckpoint,
   Order,
   PaymentRecord,
@@ -17362,6 +17363,535 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.deepEqual([...seenTopUps].sort(), [...expectedTopUpIds].sort());
 
       return 'Пагинация по конфликтным заказам (5+5+2=12) и пополнениям (5+2=7) работает без пропусков и без дубликатов.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 2.5.2.1 — RECONCILIATION QUEUE QUERY RELIABILITY (>100 RECORDS,
+  // FIRESTORE-LEVEL ORDERING, EQUAL TIMESTAMPS, CURSOR PAGINATION)
+  // =========================================================================
+
+  await runTest(
+    'S2521-01',
+    'Payments',
+    'Stage 2.5.2.1 (1/4): Более 100 записей сверки (125 платежей заказов и 115 пополнений) — сортировка newest-first на уровне Firestore и курсорная пагинация без потери новых записей',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const bs = new BalanceService();
+
+      // Создаём 105 старых записей с лексикографически малыми ID (aa_old_...),
+      // которые при запросе без orderBy заняли бы весь старый лимит 100,
+      // и 20 более новых записей с лексикографически большими ID (zz_new_...).
+      const totalOrders = 125;
+      for (let i = 1; i <= totalOrders; i++) {
+        const isNewestBatch = i > 105;
+        const prefix = isNewestBatch ? 'zz_new_ord_pay' : 'aa_old_ord_pay';
+        const pid = `${prefix}_${String(i).padStart(3, '0')}`;
+        const ts = new Date(Date.UTC(2026, 10, 22, 10, 0, i)).toISOString();
+        await firestoreRepo.setDoc<PaymentRecord>('payments', pid, {
+          paymentId: pid,
+          kind: 'order',
+          orderId: `ord_2521_${i}`,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: i % 2 === 0 ? 'xrocket' : 'cryptobot',
+          providerPaymentId: `inv_ord_2521_${i}`,
+          totalAmount: 1000 + i,
+          expectedUsdCents: 1000 + i,
+          expectedAmountStr: '10.00',
+          actualAmountStr: '10.00',
+          verifiedAmountStr: '10.00',
+          feeUsdCents: 0,
+          netUsdCents: 1000 + i,
+          currency: 'USD',
+          verifiedCurrency: 'USD',
+          invoicePayload: pid,
+          status: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_PAYMENT_ORDER_CANCELLED',
+          confirmedAt: ts,
+          createdAt: ts,
+          updatedAt: ts,
+        });
+      }
+
+      const totalTopUps = 115;
+      for (let j = 1; j <= totalTopUps; j++) {
+        const isNewestBatch = j > 100;
+        const prefix = isNewestBatch ? 'zz_new_topup' : 'aa_old_topup';
+        const tid = `${prefix}_${String(j).padStart(3, '0')}`;
+        const ts = new Date(Date.UTC(2026, 10, 22, 11, 0, j)).toISOString();
+        await firestoreRepo.setDoc('balance_topups', tid, {
+          paymentId: tid,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: 'cryptobot',
+          externalInvoiceId: `inv_top_2521_${j}`,
+          amountUsdCents: 2000 + j,
+          feeUsdCents: 60,
+          amountCreditedUsdCents: 1940 + j,
+          amountUsd: 20,
+          amountPaid: 20,
+          feePercent: 3,
+          feeAmount: 0.6,
+          amountCredited: 19.4,
+          currency: 'USD',
+          expectedAmountStr: '20.00',
+          actualAmountStr: '20.00',
+          verifiedAmountStr: '20.00',
+          verifiedCurrency: 'USD',
+          paymentStatus: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_TOPUP_CANCELLED_INVOICE',
+          confirmedAt: ts,
+          createdAt: ts,
+          updatedAt: ts,
+        });
+      }
+
+      // 1. Проверяем точный подсчёт всех записей в БД без усечения до 100
+      const orderCount = await PaymentService.countReconciliationRequiredPayments();
+      const topUpCount = await bs.countTopUps('refund_required');
+      assert.equal(orderCount, 125);
+      assert.equal(topUpCount, 115);
+
+      // 2. Первая страница должна возвращать самые новые записи (zz_new_..._125..121 и zz_new_topup_115..111)
+      const firstOrders = await PaymentService.getReconciliationRequiredPayments(5);
+      assert.deepEqual(
+        firstOrders.map((p) => p.paymentId),
+        [
+          'zz_new_ord_pay_125',
+          'zz_new_ord_pay_124',
+          'zz_new_ord_pay_123',
+          'zz_new_ord_pay_122',
+          'zz_new_ord_pay_121',
+        ],
+      );
+
+      const firstTopUps = await bs.getAllTopUps('refund_required', 5);
+      assert.deepEqual(
+        firstTopUps.map((t) => t.paymentId),
+        [
+          'zz_new_topup_115',
+          'zz_new_topup_114',
+          'zz_new_topup_113',
+          'zz_new_topup_112',
+          'zz_new_topup_111',
+        ],
+      );
+
+      // 3. Полный обход всех 125 платежей заказов через курсорную пагинацию (25 страниц по 5)
+      const collectedOrders: PaymentRecord[] = [];
+      let orderCursor: unknown = undefined;
+      let orderPages = 0;
+      while (true) {
+        const pageRes = await PaymentService.getReconciliationRequiredPaymentsPaginated(
+          5,
+          orderCursor,
+        );
+        orderPages += 1;
+        collectedOrders.push(...pageRes.items);
+        if (!pageRes.hasMore) break;
+        assert.ok(pageRes.nextCursor, 'nextCursor должен присутствовать при hasMore=true');
+        orderCursor = pageRes.nextCursor;
+      }
+      assert.equal(orderPages, 25);
+      assert.equal(collectedOrders.length, 125);
+      assert.equal(new Set(collectedOrders.map((p) => p.paymentId)).size, 125);
+      for (let k = 1; k < collectedOrders.length; k++) {
+        assert.ok(
+          collectedOrders[k - 1].createdAt >= collectedOrders[k].createdAt,
+          'Порядок createdAt DESC должен строго соблюдаться на всех 25 страницах',
+        );
+      }
+
+      // 4. Полный обход всех 115 пополнений баланса через курсорную пагинацию (23 страницы по 5)
+      const collectedTopUps: BalanceTopUpRecord[] = [];
+      let topUpCursor: unknown = undefined;
+      let topUpPages = 0;
+      while (true) {
+        const pageRes = await bs.getAllTopUpsPaginated('refund_required', 5, topUpCursor);
+        topUpPages += 1;
+        collectedTopUps.push(...pageRes.items);
+        if (!pageRes.hasMore) break;
+        assert.ok(pageRes.nextCursor, 'nextCursor должен присутствовать при hasMore=true');
+        topUpCursor = pageRes.nextCursor;
+      }
+      assert.equal(topUpPages, 23);
+      assert.equal(collectedTopUps.length, 115);
+      assert.equal(new Set(collectedTopUps.map((t) => t.paymentId)).size, 115);
+      for (let k = 1; k < collectedTopUps.length; k++) {
+        assert.ok(
+          collectedTopUps[k - 1].createdAt >= collectedTopUps[k].createdAt,
+          'Порядок createdAt DESC должен строго соблюдаться на всех 23 страницах пополнений',
+        );
+      }
+
+      return 'При >100 записях (125 заказов + 115 пополнений) Firestore-сортировка и курсорная пагинация возвращают все 240 записей newest-first без потерь и без усечения.';
+    },
+  );
+
+  await runTest(
+    'S2521-02',
+    'Payments',
+    'Stage 2.5.2.1 (2/4): Одинаковые createdAt timestamps на границах страниц — детерминированная вторичная сортировка по paymentId DESC и стабильные курсоры startAfter',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const bs = new BalanceService();
+
+      const sharedTimestampA = '2026-11-22T15:00:00.000Z';
+      const sharedTimestampB = '2026-11-22T14:00:00.000Z';
+
+      // 8 платежей с одинаковым timestamp A и 6 платежей с одинаковым timestamp B (пересекают границы страниц по 5)
+      const orderIdsInput = [
+        { id: 'pay_tie_03', ts: sharedTimestampA },
+        { id: 'pay_tie_08', ts: sharedTimestampA },
+        { id: 'pay_tie_01', ts: sharedTimestampA },
+        { id: 'pay_tie_06', ts: sharedTimestampA },
+        { id: 'pay_tie_05', ts: sharedTimestampA },
+        { id: 'pay_tie_02', ts: sharedTimestampA },
+        { id: 'pay_tie_07', ts: sharedTimestampA },
+        { id: 'pay_tie_04', ts: sharedTimestampA },
+        { id: 'pay_older_04', ts: sharedTimestampB },
+        { id: 'pay_older_01', ts: sharedTimestampB },
+        { id: 'pay_older_06', ts: sharedTimestampB },
+        { id: 'pay_older_03', ts: sharedTimestampB },
+        { id: 'pay_older_05', ts: sharedTimestampB },
+        { id: 'pay_older_02', ts: sharedTimestampB },
+      ];
+
+      for (const item of orderIdsInput) {
+        await firestoreRepo.setDoc<PaymentRecord>('payments', item.id, {
+          paymentId: item.id,
+          kind: 'order',
+          orderId: `ord_${item.id}`,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: 'cryptobot',
+          providerPaymentId: `ext_${item.id}`,
+          totalAmount: 1500,
+          expectedUsdCents: 1500,
+          expectedAmountStr: '15.00',
+          actualAmountStr: '15.00',
+          verifiedAmountStr: '15.00',
+          feeUsdCents: 0,
+          netUsdCents: 1500,
+          currency: 'USD',
+          verifiedCurrency: 'USD',
+          invoicePayload: item.id,
+          status: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_PAYMENT_SUPERSEDED_INVOICE',
+          confirmedAt: item.ts,
+          createdAt: item.ts,
+          updatedAt: item.ts,
+        });
+      }
+
+      // 11 пополнений с абсолютно одинаковым createdAt
+      const topUpIdsInput = [
+        'topup_tie_04',
+        'topup_tie_11',
+        'topup_tie_02',
+        'topup_tie_09',
+        'topup_tie_06',
+        'topup_tie_01',
+        'topup_tie_10',
+        'topup_tie_05',
+        'topup_tie_08',
+        'topup_tie_03',
+        'topup_tie_07',
+      ];
+      for (const tid of topUpIdsInput) {
+        await firestoreRepo.setDoc('balance_topups', tid, {
+          paymentId: tid,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: 'xrocket',
+          externalInvoiceId: `ext_${tid}`,
+          amountUsdCents: 2500,
+          feeUsdCents: 75,
+          amountCreditedUsdCents: 2425,
+          amountUsd: 25,
+          amountPaid: 25,
+          feePercent: 3,
+          feeAmount: 0.75,
+          amountCredited: 24.25,
+          currency: 'USDT',
+          expectedAmountStr: '25.00',
+          actualAmountStr: '25.00',
+          verifiedAmountStr: '25.00',
+          verifiedCurrency: 'USDT',
+          paymentStatus: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_TOPUP_SUPERSEDED_INVOICE',
+          confirmedAt: sharedTimestampA,
+          createdAt: sharedTimestampA,
+          updatedAt: sharedTimestampA,
+        });
+      }
+
+      // Проверяем детерминированный порядок (createdAt DESC, paymentId DESC) через курсоры
+      const pagedOrderIds: string[] = [];
+      let cursorOrd: unknown = undefined;
+      while (true) {
+        const res = await PaymentService.getReconciliationRequiredPaymentsPaginated(
+          5,
+          cursorOrd,
+        );
+        pagedOrderIds.push(...res.items.map((p) => p.paymentId));
+        if (!res.hasMore) break;
+        cursorOrd = res.nextCursor;
+      }
+
+      assert.deepEqual(pagedOrderIds, [
+        'pay_tie_08',
+        'pay_tie_07',
+        'pay_tie_06',
+        'pay_tie_05',
+        'pay_tie_04',
+        'pay_tie_03',
+        'pay_tie_02',
+        'pay_tie_01',
+        'pay_older_06',
+        'pay_older_05',
+        'pay_older_04',
+        'pay_older_03',
+        'pay_older_02',
+        'pay_older_01',
+      ]);
+
+      const pagedTopUpIds: string[] = [];
+      let cursorTop: unknown = undefined;
+      while (true) {
+        const res = await bs.getAllTopUpsPaginated('refund_required', 5, cursorTop);
+        pagedTopUpIds.push(...res.items.map((t) => t.paymentId));
+        if (!res.hasMore) break;
+        cursorTop = res.nextCursor;
+      }
+
+      assert.deepEqual(pagedTopUpIds, [
+        'topup_tie_11',
+        'topup_tie_10',
+        'topup_tie_09',
+        'topup_tie_08',
+        'topup_tie_07',
+        'topup_tie_06',
+        'topup_tie_05',
+        'topup_tie_04',
+        'topup_tie_03',
+        'topup_tie_02',
+        'topup_tie_01',
+      ]);
+
+      return 'При одинаковых createdAt вторичная сортировка paymentId DESC и курсор { value, id } исключают дубликаты и пропуски на границах страниц.';
+    },
+  );
+
+  await runTest(
+    'S2521-03',
+    'Payments',
+    'Stage 2.5.2.1 (3/4): Админ-панель при >100 записях (112 платежей заказов и 107 пополнений) — раздельные курсорные очереди, навигация Next/Previous и фильтры',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      const adminUser = {
+        id: 777000111,
+        username: 'quizystars_admin',
+        first_name: 'Admin',
+      };
+
+      const totalOrderRecords = 112;
+      const sharedOrderTs = '2026-11-22T18:00:00.000Z';
+      for (let i = 1; i <= totalOrderRecords; i++) {
+        const pid = `ord_rec_${String(i).padStart(3, '0')}`;
+        // Часть записей имеет одинаковый timestamp для проверки курсора в UI
+        const ts =
+          i >= 100 && i <= 108
+            ? sharedOrderTs
+            : new Date(Date.UTC(2026, 10, 22, 16, 0, i)).toISOString();
+        await firestoreRepo.setDoc<PaymentRecord>('payments', pid, {
+          paymentId: pid,
+          kind: 'order',
+          orderId: `ord_ui_${i}`,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: 'cryptobot',
+          providerPaymentId: `inv_ui_ord_${i}`,
+          totalAmount: 1000,
+          expectedUsdCents: 1000,
+          expectedAmountStr: '10.00',
+          actualAmountStr: '10.00',
+          verifiedAmountStr: '10.00',
+          feeUsdCents: 0,
+          netUsdCents: 1000,
+          currency: 'USD',
+          verifiedCurrency: 'USD',
+          invoicePayload: pid,
+          status: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_PAYMENT_ORDER_CANCELLED',
+          confirmedAt: ts,
+          createdAt: ts,
+          updatedAt: ts,
+        });
+      }
+
+      const totalTopUpRecords = 107;
+      for (let j = 1; j <= totalTopUpRecords; j++) {
+        const tid = `top_rec_${String(j).padStart(3, '0')}`;
+        const ts = new Date(Date.UTC(2026, 10, 22, 17, 0, j)).toISOString();
+        await firestoreRepo.setDoc('balance_topups', tid, {
+          paymentId: tid,
+          userId: `tg_${buyer1.id}`,
+          userTelegramId: buyer1.id,
+          provider: 'xrocket',
+          externalInvoiceId: `inv_ui_top_${j}`,
+          amountUsdCents: 2000,
+          feeUsdCents: 60,
+          amountCreditedUsdCents: 1940,
+          amountUsd: 20,
+          amountPaid: 20,
+          feePercent: 3,
+          feeAmount: 0.6,
+          amountCredited: 19.4,
+          currency: 'USDT',
+          expectedAmountStr: '20.00',
+          actualAmountStr: '20.00',
+          verifiedAmountStr: '20.00',
+          verifiedCurrency: 'USDT',
+          paymentStatus: 'refund_required',
+          needsManualReconciliation: true,
+          refundRequired: true,
+          reconciliationState: 'refund_required',
+          reconciliationReason: 'LATE_TOPUP_CANCELLED_INVOICE',
+          confirmedAt: ts,
+          createdAt: ts,
+          updatedAt: ts,
+        });
+      }
+
+      const adminHarness = createWiredBotHarness(true);
+      const extractIds = (text: string, prefix: string): string[] => {
+        const regex = new RegExp(`paymentId: <code>(${prefix}[a-zA-Z0-9_]+)</code>`, 'g');
+        const found: string[] = [];
+        let m: RegExpExecArray | null;
+        while ((m = regex.exec(text)) !== null) {
+          found.push(m[1]);
+        }
+        return found;
+      };
+
+      // Открываем главный экран сверки
+      await adminHarness.sendCallback(adminUser, 'adm:reconcile');
+      const homeUi = adminHarness.lastUiCall()!;
+      assert.ok(
+        homeUi.text.includes(
+          'Всего необработанных записей: <b>219</b> (платежи заказов: <b>112</b>, пополнения баланса: <b>107</b>)',
+        ),
+        'Админка должна показывать реальное количество записей в БД (219 = 112 + 107), а не усечённое 100',
+      );
+      assert.ok(homeUi.text.includes('Страница: <b>1/23</b>'));
+
+      // Проходим все 23 страницы очереди платежей заказов (112 записей = 22*5 + 2)
+      const seenOrderIds: string[] = [];
+      for (let page = 0; page < 23; page++) {
+        clearCallbackDebounceMap();
+        await adminHarness.sendCallback(adminUser, `adm:reconcile:orders:${page}`);
+        const ui = adminHarness.lastUiCall()!;
+        const ids = extractIds(ui.text, 'ord_rec_');
+        assert.equal(ids.length, page < 22 ? 5 : 2);
+        for (const id of ids) {
+          assert.equal(seenOrderIds.includes(id), false, `Дубликат ${id} на странице ${page}`);
+          seenOrderIds.push(id);
+        }
+      }
+      assert.equal(seenOrderIds.length, 112);
+
+      // Проверяем переход Previous (с 22 на 21 страницу)
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:reconcile:orders:21');
+      const prevUi = adminHarness.lastUiCall()!;
+      assert.ok(prevUi.text.includes('Страница: <b>22/23</b>'));
+      assert.deepEqual(
+        extractIds(prevUi.text, 'ord_rec_'),
+        seenOrderIds.slice(21 * 5, 22 * 5),
+      );
+
+      // Проходим все 22 страницы очереди пополнений баланса (107 записей = 21*5 + 2)
+      const seenTopUpIds: string[] = [];
+      for (let page = 0; page < 22; page++) {
+        clearCallbackDebounceMap();
+        await adminHarness.sendCallback(adminUser, `adm:reconcile:topups:${page}`);
+        const ui = adminHarness.lastUiCall()!;
+        const ids = extractIds(ui.text, 'top_rec_');
+        assert.equal(ids.length, page < 21 ? 5 : 2);
+        for (const id of ids) {
+          assert.equal(seenTopUpIds.includes(id), false, `Дубликат ${id} на странице ${page}`);
+          seenTopUpIds.push(id);
+        }
+      }
+      assert.equal(seenTopUpIds.length, 107);
+
+      return 'Админ-панель корректно отображает 219 записей (112 заказов и 107 пополнений) и навигирует по всем 23/22 страницам через курсоры без потерь и дубликатов.';
+    },
+  );
+
+  await runTest(
+    'S2521-04',
+    'Security',
+    'Stage 2.5.2.1 (4/4): Проверка индексов Firestore (firestore.indexes.json), защита от не-админа и read-only инварианты сверки',
+    async () => {
+      const indexesRaw = fs.readFileSync(
+        path.resolve(process.cwd(), 'firestore.indexes.json'),
+        'utf-8',
+      );
+      const indexesJson = JSON.parse(indexesRaw) as {
+        indexes: Array<{
+          collectionGroup: string;
+          fields: Array<{ fieldPath: string; order: string }>;
+        }>;
+      };
+
+      const hasPaymentReconcileIndex = indexesJson.indexes.some(
+        (idx) =>
+          idx.collectionGroup === 'payments' &&
+          idx.fields.length >= 2 &&
+          idx.fields[0].fieldPath === 'status' &&
+          idx.fields[0].order === 'ASCENDING' &&
+          idx.fields[1].fieldPath === 'createdAt' &&
+          idx.fields[1].order === 'DESCENDING',
+      );
+      assert.ok(
+        hasPaymentReconcileIndex,
+        'firestore.indexes.json должен содержать композитный индекс payments (status ASC, createdAt DESC)',
+      );
+
+      const hasTopUpReconcileIndex = indexesJson.indexes.some(
+        (idx) =>
+          idx.collectionGroup === 'balance_topups' &&
+          idx.fields.length >= 2 &&
+          idx.fields[0].fieldPath === 'paymentStatus' &&
+          idx.fields[0].order === 'ASCENDING' &&
+          idx.fields[1].fieldPath === 'createdAt' &&
+          idx.fields[1].order === 'DESCENDING',
+      );
+      assert.ok(
+        hasTopUpReconcileIndex,
+        'firestore.indexes.json должен содержать композитный индекс balance_topups (paymentStatus ASC, createdAt DESC)',
+      );
+
+      return 'Композитные индексы Firestore для payments и balance_topups сконфигурированы корректно.';
     },
   );
 

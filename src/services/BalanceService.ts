@@ -3,7 +3,7 @@ import {
   formatUsdCents,
   getEnvConfig,
 } from '../config/env.ts';
-import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
+import { PaginatedResult, firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
   BalanceTopUpProvider,
   BalanceTopUpRecord,
@@ -178,30 +178,64 @@ export class BalanceService {
   public async getUserTopUps(
     telegramId: number,
     limit = 15,
+    startAfterCursor?: unknown,
   ): Promise<BalanceTopUpRecord[]> {
     const userId = `tg_${telegramId}`;
-    const list = await firestoreRepo.queryDocs<BalanceTopUpRecord>('balance_topups', {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
+    return firestoreRepo.queryDocs<BalanceTopUpRecord>('balance_topups', {
       where: [{ field: 'userId', op: '==', value: userId }],
-      limit: Math.max(limit * 2, 30),
+      orderBy: { field: 'createdAt', direction: 'desc' },
+      secondaryOrderBy: { field: 'paymentId', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
+      limit,
     });
-    return list
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(0, limit);
   }
 
   public async getAllTopUps(
     statusFilter?: BalanceTopUpStatus,
     limit = 30,
+    startAfterCursor?: unknown,
   ): Promise<BalanceTopUpRecord[]> {
-    const list = await firestoreRepo.queryDocs<BalanceTopUpRecord>('balance_topups', {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
+    return firestoreRepo.queryDocs<BalanceTopUpRecord>('balance_topups', {
       ...(statusFilter
         ? { where: [{ field: 'paymentStatus', op: '==', value: statusFilter }] }
-        : { orderBy: { field: 'createdAt', direction: 'desc' } }),
-      limit: Math.max(limit * 2, 50),
+        : {}),
+      orderBy: { field: 'createdAt', direction: 'desc' },
+      secondaryOrderBy: { field: 'paymentId', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
+      limit,
     });
-    return list
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(0, limit);
+  }
+
+  public async getAllTopUpsPaginated(
+    statusFilter?: BalanceTopUpStatus,
+    limit = 5,
+    startAfterCursor?: unknown,
+  ): Promise<PaginatedResult<BalanceTopUpRecord>> {
+    return firestoreRepo.queryDocsPaginated<BalanceTopUpRecord>('balance_topups', {
+      ...(statusFilter
+        ? { where: [{ field: 'paymentStatus', op: '==', value: statusFilter }] }
+        : {}),
+      orderBy: { field: 'createdAt', direction: 'desc' },
+      secondaryOrderBy: { field: 'paymentId', direction: 'desc' },
+      startAfter: startAfterCursor,
+      limit,
+    });
+  }
+
+  public async countTopUps(
+    statusFilter?: BalanceTopUpStatus,
+  ): Promise<number> {
+    return firestoreRepo.countDocs('balance_topups', {
+      ...(statusFilter
+        ? { where: [{ field: 'paymentStatus', op: '==', value: statusFilter }] }
+        : {}),
+    });
   }
 
   /**

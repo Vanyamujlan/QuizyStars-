@@ -1279,6 +1279,11 @@ export function formatAdminPaymentReconciliationMessage(params: {
   scope?: AdminReconciliationScope;
   page?: number;
   pageSize?: number;
+  isCursorPageSlice?: boolean;
+  totalOrderPaymentsCount?: number;
+  totalTopUpsCount?: number;
+  orderPaymentsTruncated?: boolean;
+  topUpsTruncated?: boolean;
 }): {
   text: string;
   safePage: number;
@@ -1293,32 +1298,42 @@ export function formatAdminPaymentReconciliationMessage(params: {
     Math.min(params.pageSize || ADMIN_RECONCILIATION_PAGE_SIZE, 10),
   );
 
-  const sortedOrders = [...params.orderPayments]
-    .filter((p) => p.status === 'refund_required')
-    .sort(
-      (a, b) =>
-        (b.confirmedAt || b.createdAt).localeCompare(
-          a.confirmedAt || a.createdAt,
-        ) ||
-        b.createdAt.localeCompare(a.createdAt) ||
-        a.paymentId.localeCompare(b.paymentId),
-    )
-    .slice(0, ADMIN_RECONCILIATION_MAX_RECORDS);
+  // When called from cursor-based pagination (`isCursorPageSlice === true`),
+  // `orderPayments` and `topUps` are already the Firestore-ordered page slices.
+  // When called directly with full arrays in unit tests, sort consistently by
+  // `(createdAt DESC, paymentId DESC)` without silently truncating at 100.
+  const filteredOrders = [...params.orderPayments].filter(
+    (p) => p.status === 'refund_required',
+  );
+  const sortedOrders = params.isCursorPageSlice
+    ? filteredOrders
+    : filteredOrders.sort(
+        (a, b) =>
+          b.createdAt.localeCompare(a.createdAt) ||
+          b.paymentId.localeCompare(a.paymentId),
+      );
 
-  const sortedTopUps = [...params.topUps]
-    .filter((t) => t.paymentStatus === 'refund_required')
-    .sort(
-      (a, b) =>
-        (b.confirmedAt || b.createdAt).localeCompare(
-          a.confirmedAt || a.createdAt,
-        ) ||
-        b.createdAt.localeCompare(a.createdAt) ||
-        a.paymentId.localeCompare(b.paymentId),
-    )
-    .slice(0, ADMIN_RECONCILIATION_MAX_RECORDS);
+  const filteredTopUps = [...params.topUps].filter(
+    (t) => t.paymentStatus === 'refund_required',
+  );
+  const sortedTopUps = params.isCursorPageSlice
+    ? filteredTopUps
+    : filteredTopUps.sort(
+        (a, b) =>
+          b.createdAt.localeCompare(a.createdAt) ||
+          b.paymentId.localeCompare(a.paymentId),
+      );
 
-  const totalOrderPayments = sortedOrders.length;
-  const totalTopUps = sortedTopUps.length;
+  const totalOrderPayments =
+    typeof params.totalOrderPaymentsCount === 'number' &&
+    Number.isFinite(params.totalOrderPaymentsCount)
+      ? Math.max(0, Math.trunc(params.totalOrderPaymentsCount))
+      : sortedOrders.length;
+  const totalTopUps =
+    typeof params.totalTopUpsCount === 'number' &&
+    Number.isFinite(params.totalTopUpsCount)
+      ? Math.max(0, Math.trunc(params.totalTopUpsCount))
+      : sortedTopUps.length;
   const totalUnprocessed = totalOrderPayments + totalTopUps;
 
   const activeCollectionLength =
@@ -1348,8 +1363,14 @@ export function formatAdminPaymentReconciliationMessage(params: {
     '⚠️ <b>Возвраты / финансовая сверка (refund_required)</b>',
     `📊 Всего необработанных записей: <b>${totalUnprocessed}</b> (платежи заказов: <b>${totalOrderPayments}</b>, пополнения баланса: <b>${totalTopUps}</b>)`,
     `🗂 Режим просмотра: <b>${scopeTitle}</b> | Страница: <b>${safePage + 1}/${totalPages}</b> (лимит страницы: ${pageSize})`,
-    '',
   ];
+
+  if (params.orderPaymentsTruncated || params.topUpsTruncated) {
+    headerLines.push(
+      '⚠️ <i>Внимание: список записей ограничен защитным лимитом выборки. Используйте постраничную навигацию для просмотра всех записей.</i>',
+    );
+  }
+  headerLines.push('');
 
   if (totalUnprocessed === 0) {
     return {
@@ -1369,7 +1390,9 @@ export function formatAdminPaymentReconciliationMessage(params: {
   const bodyBlocks: string[] = [];
 
   if (scope === 'all' || scope === 'orders') {
-    const orderSlice = sortedOrders.slice(startIdx, endIdx);
+    const orderSlice = params.isCursorPageSlice
+      ? sortedOrders.slice(0, pageSize)
+      : sortedOrders.slice(startIdx, endIdx);
     bodyBlocks.push(
       `📦 <b>Конфликтные оплаты заказов (PaymentRecord: refund_required) — всего: ${totalOrderPayments}</b>`,
     );
@@ -1393,7 +1416,9 @@ export function formatAdminPaymentReconciliationMessage(params: {
   }
 
   if (scope === 'all' || scope === 'topups') {
-    const topUpSlice = sortedTopUps.slice(startIdx, endIdx);
+    const topUpSlice = params.isCursorPageSlice
+      ? sortedTopUps.slice(0, pageSize)
+      : sortedTopUps.slice(startIdx, endIdx);
     bodyBlocks.push(
       `💳 <b>Конфликтные пополнения баланса (BalanceTopUpRecord: refund_required) — всего: ${totalTopUps}</b>`,
     );
@@ -1426,4 +1451,3 @@ export function formatAdminPaymentReconciliationMessage(params: {
     totalUnprocessed,
   };
 }
-

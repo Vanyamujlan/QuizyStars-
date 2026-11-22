@@ -54,7 +54,7 @@ import {
   buildOwnerProductKeysKeyboard,
 } from '../keyboards.ts';
 import {
-  ADMIN_RECONCILIATION_MAX_RECORDS,
+  ADMIN_RECONCILIATION_PAGE_SIZE,
   AdminReconciliationScope,
   escapeHtml,
   formatAdminCatalogDiagnosticsSummary,
@@ -116,8 +116,22 @@ export function getAdminSession(
   return session;
 }
 
+interface AdminReconciliationCursorCache {
+  dbGeneration: number;
+  totalOrderPayments: number;
+  totalTopUps: number;
+  /** Map from pageIndex -> startAfterCursor (page 0 has undefined cursor) */
+  orderStartCursors: Map<number, unknown>;
+  /** Map from pageIndex -> startAfterCursor (page 0 has undefined cursor) */
+  topUpStartCursors: Map<number, unknown>;
+  updatedAt: number;
+}
+
+const adminReconciliationCursors = new Map<number, AdminReconciliationCursorCache>();
+
 export function clearAdminSession(adminId: number): void {
   adminSessions.delete(adminId);
+  adminReconciliationCursors.delete(adminId);
 }
 
 export async function ensureAdmin(ctx: Context): Promise<boolean> {
@@ -421,26 +435,149 @@ export function registerAdminHandlers(
   });
 
   // 1c. Возвраты / финансовая сверка (refund_required: конфликтные оплаты заказов и пополнения баланса)
+  const fetchReconciliationOrderPageWithCursor = async (
+    cache: AdminReconciliationCursorCache,
+    targetPage: number,
+    pageSize: number,
+  ) => {
+    // Walk forward using startAfter cursors if intermediate page cursors are not cached yet
+    let highestKnownPage = 0;
+    for (const p of cache.orderStartCursors.keys()) {
+      if (p <= targetPage && p > highestKnownPage) {
+        highestKnownPage = p;
+      }
+    }
+
+    let currentCursor = cache.orderStartCursors.get(highestKnownPage);
+    for (let p = highestKnownPage; p < targetPage; p++) {
+      const stepRes = await PaymentService.getReconciliationRequiredPaymentsPaginated(
+        pageSize,
+        currentCursor,
+      );
+      if (!stepRes.hasMore || !stepRes.nextCursor) {
+        return { items: [], hasMore: false, nextCursor: null };
+      }
+      currentCursor = stepRes.nextCursor;
+      cache.orderStartCursors.set(p + 1, currentCursor);
+    }
+
+    const pageRes = await PaymentService.getReconciliationRequiredPaymentsPaginated(
+      pageSize,
+      currentCursor,
+    );
+    if (pageRes.hasMore && pageRes.nextCursor) {
+      cache.orderStartCursors.set(targetPage + 1, pageRes.nextCursor);
+    }
+    return pageRes;
+  };
+
+  const fetchReconciliationTopUpPageWithCursor = async (
+    cache: AdminReconciliationCursorCache,
+    targetPage: number,
+    pageSize: number,
+  ) => {
+    let highestKnownPage = 0;
+    for (const p of cache.topUpStartCursors.keys()) {
+      if (p <= targetPage && p > highestKnownPage) {
+        highestKnownPage = p;
+      }
+    }
+
+    let currentCursor = cache.topUpStartCursors.get(highestKnownPage);
+    for (let p = highestKnownPage; p < targetPage; p++) {
+      const stepRes = await balanceService.getAllTopUpsPaginated(
+        'refund_required',
+        pageSize,
+        currentCursor,
+      );
+      if (!stepRes.hasMore || !stepRes.nextCursor) {
+        return { items: [], hasMore: false, nextCursor: null };
+      }
+      currentCursor = stepRes.nextCursor;
+      cache.topUpStartCursors.set(p + 1, currentCursor);
+    }
+
+    const pageRes = await balanceService.getAllTopUpsPaginated(
+      'refund_required',
+      pageSize,
+      currentCursor,
+    );
+    if (pageRes.hasMore && pageRes.nextCursor) {
+      cache.topUpStartCursors.set(targetPage + 1, pageRes.nextCursor);
+    }
+    return pageRes;
+  };
+
   const renderAdminPaymentReconciliation = async (
     ctx: Context,
     scope: AdminReconciliationScope,
     page: number,
   ): Promise<void> => {
-    const [orderPayments, topUps] = await Promise.all([
-      PaymentService.getReconciliationRequiredPayments(
-        ADMIN_RECONCILIATION_MAX_RECORDS,
-      ),
-      balanceService.getAllTopUps(
-        'refund_required',
-        ADMIN_RECONCILIATION_MAX_RECORDS,
-      ),
+    const adminId = ctx.from?.id ?? 0;
+    const pageSize = ADMIN_RECONCILIATION_PAGE_SIZE;
+    const dbGeneration = firestoreRepo.getStateGeneration();
+
+    const [totalOrderPayments, totalTopUps] = await Promise.all([
+      PaymentService.countReconciliationRequiredPayments(),
+      balanceService.countTopUps('refund_required'),
+    ]);
+
+    const activeCollectionLength =
+      scope === 'orders'
+        ? totalOrderPayments
+        : scope === 'topups'
+          ? totalTopUps
+          : Math.max(totalOrderPayments, totalTopUps);
+    const totalPages = Math.max(1, Math.ceil(activeCollectionLength / pageSize));
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+
+    let cache = adminReconciliationCursors.get(adminId);
+    if (
+      !cache ||
+      safePage === 0 ||
+      cache.dbGeneration !== dbGeneration ||
+      cache.totalOrderPayments !== totalOrderPayments ||
+      cache.totalTopUps !== totalTopUps ||
+      Date.now() - cache.updatedAt > ADMIN_SESSION_TTL_MS
+    ) {
+      cache = {
+        dbGeneration,
+        totalOrderPayments,
+        totalTopUps,
+        orderStartCursors: new Map([[0, undefined]]),
+        topUpStartCursors: new Map([[0, undefined]]),
+        updatedAt: Date.now(),
+      };
+      adminReconciliationCursors.set(adminId, cache);
+    } else {
+      cache.updatedAt = Date.now();
+    }
+
+    const maxOrderPage = Math.max(0, Math.ceil(totalOrderPayments / pageSize) - 1);
+    const maxTopUpPage = Math.max(0, Math.ceil(totalTopUps / pageSize) - 1);
+
+    const [orderPageRes, topUpPageRes] = await Promise.all([
+      (scope === 'all' || scope === 'orders') &&
+      totalOrderPayments > 0 &&
+      safePage <= maxOrderPage
+        ? fetchReconciliationOrderPageWithCursor(cache, safePage, pageSize)
+        : Promise.resolve({ items: [], hasMore: false, nextCursor: null }),
+      (scope === 'all' || scope === 'topups') &&
+      totalTopUps > 0 &&
+      safePage <= maxTopUpPage
+        ? fetchReconciliationTopUpPageWithCursor(cache, safePage, pageSize)
+        : Promise.resolve({ items: [], hasMore: false, nextCursor: null }),
     ]);
 
     const formatted = formatAdminPaymentReconciliationMessage({
-      orderPayments,
-      topUps,
+      orderPayments: orderPageRes.items,
+      topUps: topUpPageRes.items,
       scope,
-      page,
+      page: safePage,
+      pageSize,
+      isCursorPageSlice: true,
+      totalOrderPaymentsCount: totalOrderPayments,
+      totalTopUpsCount: totalTopUps,
     });
 
     await safeRespondOrEdit(

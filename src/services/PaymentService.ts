@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { getEnvConfig } from '../config/env.ts';
-import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
+import { PaginatedResult, firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
   BalanceTopUpProvider,
   Order,
@@ -1765,18 +1765,61 @@ export class PaymentService {
 
   public async getReconciliationRequiredPayments(
     limit = 50,
+    startAfterCursor?: unknown,
   ): Promise<PaymentRecord[]> {
-    const list = await firestoreRepo.queryDocs<PaymentRecord>('payments', {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
+    return firestoreRepo.queryDocs<PaymentRecord>('payments', {
       where: [{ field: 'status', op: '==', value: 'refund_required' }],
+      orderBy: { field: 'createdAt', direction: 'desc' },
+      secondaryOrderBy: { field: 'paymentId', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
     });
-    return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   public static async getReconciliationRequiredPayments(
     limit = 50,
+    startAfterCursor?: unknown,
   ): Promise<PaymentRecord[]> {
-    return this.defaultInstance.getReconciliationRequiredPayments(limit);
+    return this.defaultInstance.getReconciliationRequiredPayments(
+      limit,
+      startAfterCursor,
+    );
+  }
+
+  public async getReconciliationRequiredPaymentsPaginated(
+    limit = 5,
+    startAfterCursor?: unknown,
+  ): Promise<PaginatedResult<PaymentRecord>> {
+    return firestoreRepo.queryDocsPaginated<PaymentRecord>('payments', {
+      where: [{ field: 'status', op: '==', value: 'refund_required' }],
+      orderBy: { field: 'createdAt', direction: 'desc' },
+      secondaryOrderBy: { field: 'paymentId', direction: 'desc' },
+      startAfter: startAfterCursor,
+      limit,
+    });
+  }
+
+  public static async getReconciliationRequiredPaymentsPaginated(
+    limit = 5,
+    startAfterCursor?: unknown,
+  ): Promise<PaginatedResult<PaymentRecord>> {
+    return this.defaultInstance.getReconciliationRequiredPaymentsPaginated(
+      limit,
+      startAfterCursor,
+    );
+  }
+
+  public async countReconciliationRequiredPayments(): Promise<number> {
+    return firestoreRepo.countDocs('payments', {
+      where: [{ field: 'status', op: '==', value: 'refund_required' }],
+    });
+  }
+
+  public static async countReconciliationRequiredPayments(): Promise<number> {
+    return this.defaultInstance.countReconciliationRequiredPayments();
   }
 
   /**

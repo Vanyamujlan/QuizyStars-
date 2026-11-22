@@ -57,8 +57,12 @@ export interface QueryOptions {
     field: string;
     direction?: 'asc' | 'desc';
   };
+  secondaryOrderBy?: {
+    field: string;
+    direction?: 'asc' | 'desc';
+  };
   /**
-   * Cursor pagination: value of the orderBy field (or [orderByValue, docId]) to start after.
+   * Cursor pagination: value of the orderBy field (or { value, id } / [orderByValue, docId]) to start after.
    */
   startAfter?: unknown;
   limit?: number;
@@ -176,14 +180,14 @@ export function sanitizeDocId(rawId: string): string {
 
 function getDocumentPrimaryKey(doc: Record<string, unknown>): string {
   return String(
-    doc.orderId ??
+    doc.transactionId ??
       doc.lockId ??
       doc.keyId ??
-      doc.id ??
-      doc.userId ??
       doc.paymentId ??
-      doc.transactionId ??
+      doc.orderId ??
+      doc.id ??
       doc.adminId ??
+      doc.userId ??
       doc.key ??
       '',
   );
@@ -232,6 +236,20 @@ function evaluateWhereFilter(
   }
 }
 
+function resolveSecondaryOrderValue(
+  rec: Record<string, unknown>,
+  secondaryField?: string,
+): string {
+  if (!secondaryField || secondaryField === '__name__') {
+    return getDocumentPrimaryKey(rec);
+  }
+  const val = getNestedFieldValue(rec, secondaryField);
+  if (val !== undefined && val !== null && String(val) !== '') {
+    return String(val);
+  }
+  return getDocumentPrimaryKey(rec);
+}
+
 function applyInMemorySortAndCursorPagination<T>(
   docs: T[],
   options?: QueryOptions,
@@ -240,6 +258,9 @@ function applyInMemorySortAndCursorPagination<T>(
   const orderField = options?.orderBy?.field;
   const direction = options?.orderBy?.direction || 'asc';
   const factor = direction === 'desc' ? -1 : 1;
+  const secondaryField = options?.secondaryOrderBy?.field;
+  const secondaryDirection = options?.secondaryOrderBy?.direction || direction;
+  const secondaryFactor = secondaryDirection === 'desc' ? -1 : 1;
 
   if (orderField) {
     result.sort((a, b) => {
@@ -254,7 +275,9 @@ function applyInMemorySortAndCursorPagination<T>(
         const cmp = String(va ?? '').localeCompare(String(vb ?? '')) * factor;
         if (cmp !== 0) return cmp;
       }
-      return getDocumentPrimaryKey(recA).localeCompare(getDocumentPrimaryKey(recB)) * factor;
+      const secA = resolveSecondaryOrderValue(recA, secondaryField);
+      const secB = resolveSecondaryOrderValue(recB, secondaryField);
+      return secA.localeCompare(secB) * secondaryFactor;
     });
   } else {
     // Match Cloud Firestore's default implicit `__name__` ascending document ID ordering
@@ -265,33 +288,44 @@ function applyInMemorySortAndCursorPagination<T>(
     );
   }
 
-  // Cursor pagination (startAfter) with deterministic tie-breaker on document primary key
+  // Cursor pagination (startAfter) with deterministic tie-breaker on secondary field / document primary key
   if (options?.startAfter !== undefined && options.startAfter !== null) {
     const cursorVal = options.startAfter;
     if (orderField) {
+      let compareVal: unknown = cursorVal;
+      let compareId: string | null = null;
+
+      if (Array.isArray(cursorVal) && cursorVal.length >= 2) {
+        compareVal = cursorVal[0];
+        compareId = cursorVal[1] !== undefined && cursorVal[1] !== null ? String(cursorVal[1]) : null;
+      } else if (
+        typeof cursorVal === 'object' &&
+        cursorVal !== null &&
+        ('value' in cursorVal || 'id' in cursorVal)
+      ) {
+        const typedObj = cursorVal as { value?: unknown; id?: unknown };
+        compareVal = 'value' in typedObj ? typedObj.value : cursorVal;
+        compareId =
+          typedObj.id !== undefined && typedObj.id !== null
+            ? String(typedObj.id)
+            : null;
+      }
+
       const cursorIndex = result.findIndex((item) => {
         const rec = item as Record<string, unknown>;
+        const secKey = resolveSecondaryOrderValue(rec, secondaryField);
         const pk = getDocumentPrimaryKey(rec);
         const fieldVal = getNestedFieldValue(rec, orderField);
-        if (typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal && 'value' in cursorVal) {
-          const typedCursor = cursorVal as { value: unknown; id: string };
-          return fieldVal === typedCursor.value && pk === typedCursor.id;
+        if (compareId !== null && compareVal !== cursorVal) {
+          return fieldVal === compareVal && (secKey === compareId || pk === compareId);
         }
-        return fieldVal === cursorVal || pk === cursorVal;
+        return fieldVal === cursorVal || secKey === cursorVal || pk === cursorVal;
       });
 
       if (cursorIndex >= 0) {
         result = result.slice(cursorIndex + 1);
       } else {
-        // Value comparison fallback if exact item was deleted
-        const compareVal =
-          typeof cursorVal === 'object' && cursorVal !== null && 'value' in cursorVal
-            ? (cursorVal as { value: unknown }).value
-            : cursorVal;
-        const compareId =
-          typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal
-            ? String((cursorVal as { id: unknown }).id)
-            : null;
+        // Value comparison fallback if exact cursor item was deleted
         result = result.filter((item) => {
           const rec = item as Record<string, unknown>;
           const fieldVal = getNestedFieldValue(rec, orderField);
@@ -305,9 +339,9 @@ function applyInMemorySortAndCursorPagination<T>(
               return direction === 'desc' ? cmp < 0 : cmp > 0;
             }
           }
-          if (compareId) {
-            const pkCmp = getDocumentPrimaryKey(rec).localeCompare(compareId);
-            return direction === 'desc' ? pkCmp < 0 : pkCmp > 0;
+          if (compareId !== null) {
+            const secCmp = resolveSecondaryOrderValue(rec, secondaryField).localeCompare(compareId);
+            return secondaryDirection === 'desc' ? secCmp < 0 : secCmp > 0;
           }
           return false;
         });
@@ -317,7 +351,9 @@ function applyInMemorySortAndCursorPagination<T>(
       const compareId =
         typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal
           ? String((cursorVal as { id: unknown }).id)
-          : String(cursorVal);
+          : Array.isArray(cursorVal) && cursorVal.length > 0
+            ? String(cursorVal[cursorVal.length - 1])
+            : String(cursorVal);
       result = result.filter(
         (item) =>
           getDocumentPrimaryKey(item as Record<string, unknown>).localeCompare(
@@ -342,6 +378,7 @@ export class FirestoreRepository {
   private emulatorConnected = false;
   private degradedMode = false;
   private isolatedTestMode = false;
+  private stateGeneration = 0;
   private simulatedFailures: SimulatedFailureConfig = {};
   private adminStatusMessage = 'Не инициализирован';
   private dataDir: string;
@@ -392,6 +429,7 @@ export class FirestoreRepository {
    */
   public enableIsolatedTestMode(seedDefaults = true): void {
     this.isolatedTestMode = true;
+    this.stateGeneration += 1;
     this.adminReady = false;
     this.degradedMode = false;
     this.simulatedFailures = {};
@@ -429,7 +467,12 @@ export class FirestoreRepository {
 
   public disableIsolatedTestMode(): void {
     this.isolatedTestMode = false;
+    this.stateGeneration += 1;
     this.simulatedFailures = {};
+  }
+
+  public getStateGeneration(): number {
+    return this.stateGeneration;
   }
 
   /**
@@ -984,7 +1027,7 @@ export class FirestoreRepository {
   }
 
   /**
-   * Server-side indexed Firestore queries with where, orderBy, startAfter cursor, and limit.
+   * Server-side indexed Firestore queries with where, orderBy, secondaryOrderBy, startAfter cursor, and limit.
    */
   public async queryDocs<T>(
     collectionName: StoreCollectionName,
@@ -1000,11 +1043,19 @@ export class FirestoreRepository {
             query = query.where(filter.field, filter.op, filter.value);
           }
         }
+        let hasSecondaryOrder = false;
         if (options?.orderBy) {
-          query = query.orderBy(
-            options.orderBy.field,
-            options.orderBy.direction || 'asc',
-          );
+          const primaryDirection = options.orderBy.direction || 'asc';
+          query = query.orderBy(options.orderBy.field, primaryDirection);
+          if (options.secondaryOrderBy) {
+            const secField =
+              options.secondaryOrderBy.field === '__name__'
+                ? FieldPath.documentId()
+                : options.secondaryOrderBy.field;
+            const secDir = options.secondaryOrderBy.direction || primaryDirection;
+            query = query.orderBy(secField, secDir);
+            hasSecondaryOrder = true;
+          }
         } else if (options?.startAfter !== undefined && options.startAfter !== null) {
           // Explicit documentId ordering ensures startAfter(cursorId) works even if cursor doc was deleted
           // and uses Firestore's built-in automatic single-field index without requiring composite indexes.
@@ -1039,17 +1090,34 @@ export class FirestoreRepository {
           }
 
           if (!appliedSnapshotCursor) {
-            const cursorVal =
+            if (
+              hasSecondaryOrder &&
               typeof options.startAfter === 'object' &&
               options.startAfter !== null &&
-              'value' in options.startAfter
-                ? (options.startAfter as { value: unknown }).value
-                : typeof options.startAfter === 'object' &&
-                    options.startAfter !== null &&
-                    'id' in options.startAfter
-                  ? (options.startAfter as { id: unknown }).id
-                  : options.startAfter;
-            query = query.startAfter(cursorVal);
+              'value' in options.startAfter &&
+              'id' in options.startAfter
+            ) {
+              const typedCursor = options.startAfter as { value: unknown; id: unknown };
+              query = query.startAfter(typedCursor.value, typedCursor.id);
+            } else if (
+              hasSecondaryOrder &&
+              Array.isArray(options.startAfter) &&
+              options.startAfter.length >= 2
+            ) {
+              query = query.startAfter(options.startAfter[0], options.startAfter[1]);
+            } else {
+              const cursorVal =
+                typeof options.startAfter === 'object' &&
+                options.startAfter !== null &&
+                'value' in options.startAfter
+                  ? (options.startAfter as { value: unknown }).value
+                  : typeof options.startAfter === 'object' &&
+                      options.startAfter !== null &&
+                      'id' in options.startAfter
+                    ? (options.startAfter as { id: unknown }).id
+                    : options.startAfter;
+              query = query.startAfter(cursorVal);
+            }
           }
         } else if (options?.offset && options.offset > 0) {
           query = query.offset(options.offset);
@@ -1125,12 +1193,22 @@ export class FirestoreRepository {
     const items = hasMore ? fetched.slice(0, limit) : fetched;
 
     let nextCursor: unknown | null = null;
-    if (hasMore && items.length > 0 && options?.orderBy?.field) {
+    if (hasMore && items.length > 0) {
       const lastItem = items[items.length - 1] as Record<string, unknown>;
-      nextCursor = {
-        value: lastItem[options.orderBy.field],
-        id: getDocumentPrimaryKey(lastItem),
-      };
+      const secondaryId = resolveSecondaryOrderValue(
+        lastItem,
+        options?.secondaryOrderBy?.field,
+      );
+      if (options?.orderBy?.field) {
+        nextCursor = {
+          value: getNestedFieldValue(lastItem, options.orderBy.field),
+          id: secondaryId,
+        };
+      } else {
+        nextCursor = {
+          id: secondaryId,
+        };
+      }
     }
 
     return {
@@ -1139,6 +1217,52 @@ export class FirestoreRepository {
       nextOffset: offset + items.length,
       nextCursor,
     };
+  }
+
+  /**
+   * Counts documents matching the specified filters without arbitrary truncation.
+   */
+  public async countDocs(
+    collectionName: StoreCollectionName,
+    options?: { where?: QueryWhereFilter[] },
+  ): Promise<number> {
+    this.assertStorageAvailable(OperationType.LIST, collectionName);
+
+    if (!this.isolatedTestMode && this.adminReady && this.adminDb) {
+      try {
+        let query: AdminQuery = this.adminDb.collection(collectionName);
+        if (options?.where) {
+          for (const filter of options.where) {
+            query = query.where(filter.field, filter.op, filter.value);
+          }
+        }
+        if (typeof (query as unknown as { count?: () => { get: () => Promise<{ data: () => { count: number } }> } }).count === 'function') {
+          const aggSnap = await (
+            query as unknown as {
+              count: () => { get: () => Promise<{ data: () => { count: number } }> };
+            }
+          )
+            .count()
+            .get();
+          return aggSnap.data().count;
+        }
+        const snap = await query.select().get();
+        return snap.size;
+      } catch (error) {
+        this.handleOrRethrow(error, OperationType.LIST, collectionName);
+      }
+    }
+
+    const bucket = this.localState[collectionName] as Record<string, unknown>;
+    let docs = Object.values(bucket);
+    if (options?.where) {
+      docs = docs.filter((item) =>
+        options.where!.every((f) =>
+          evaluateWhereFilter(item as Record<string, unknown>, f),
+        ),
+      );
+    }
+    return docs.length;
   }
 
   public async listDocs<T>(
