@@ -316,6 +316,7 @@ export interface Order {
   createdAt: string;
   paidAt?: string;
   completedAt?: string;
+  completedByAdminId?: number;
   updatedAt: string;
 }
 

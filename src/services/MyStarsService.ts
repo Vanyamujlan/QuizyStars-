@@ -2162,7 +2162,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
     });
 
     const nowIso = new Date().toISOString();
-    await this.persistMyStarsOrderMetadata(order, {
+    const metadataUpdates: Partial<Order> = {
       ...pnlUpdates,
       mystarsOrderId: resolvedOrderId,
       mystarsOrderStatus: status,
@@ -2178,7 +2178,22 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       ...(isUnknownStatus ? { mystarsUnknownStatusSeen: status } : {}),
       mystarsExpiresAt: created.expires_at ?? undefined,
       externalExecutionReference: resolvedOrderId,
-    });
+    };
+
+    // Mutate caller's order reference in-memory immediately so FulfillmentService
+    // always retains resolvedOrderId and MyStars metadata even if Firestore fails transiently.
+    Object.assign(order, metadataUpdates);
+
+    try {
+      await this.persistMyStarsOrderMetadata(order, metadataUpdates);
+    } catch (dbErr) {
+      const safeDbMsg = redactSecretsFromText(
+        dbErr instanceof Error ? dbErr.message : String(dbErr),
+      );
+      console.warn(
+        `[MyStars] Временная ошибка Firestore при промежуточном сохранении метаданных после POST /v1/orders (${resolvedOrderId} для заказа #${order.orderId}): ${safeDbMsg}. Данные сохранены в памяти для фиксации в Phase 3 / recovery.`,
+      );
+    }
 
     if (isUnknownStatus) {
       console.warn(

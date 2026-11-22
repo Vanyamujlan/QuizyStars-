@@ -827,6 +827,7 @@ export function buildAdminOrdersKeyboard(orders: Order[]) {
     Markup.button.callback('Оплачены', 'adm:orders:paid'),
     Markup.button.callback('В работе', 'adm:orders:processing'),
     Markup.button.callback('Выполнены', 'adm:orders:completed'),
+    Markup.button.callback('Ошибки', 'adm:orders:failed'),
   ];
 
   const orderRows = orders.slice(0, 10).map((o) => [

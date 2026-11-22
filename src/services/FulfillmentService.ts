@@ -1741,6 +1741,15 @@ export class FulfillmentService {
         );
       }
 
+      if (
+        current.fulfillmentStatus === 'cancelled' ||
+        current.fulfillmentStatus === 'refunded'
+      ) {
+        throw new Error(
+          `Невозможно запустить выдачу заказа #${current.orderId}: статус выдачи уже "${current.fulfillmentStatus}".`,
+        );
+      }
+
       if (current.fulfillmentStatus === 'completed') {
         return { action: 'already_completed', order: current };
       }
@@ -1755,7 +1764,16 @@ export class FulfillmentService {
 
       if (current.fulfillmentStatus === 'processing') {
         // If external reference is already recorded, the adapter already finished; only ensure admin notification
-        if (current.externalExecutionReference) {
+        if (current.externalExecutionReference || current.mystarsOrderId) {
+          if (!current.adminNotifiedAt) {
+            return { action: 'needs_admin_notification_only', order: current };
+          }
+          return { action: 'already_processing', order: current };
+        }
+
+        // If an admin manually moved a quarantined order into 'processing' (needsManualReconciliation && !mystarsCreateInFlight),
+        // do not hijack it with automatic MyStars calls.
+        if (current.needsManualReconciliation && !current.mystarsCreateInFlight) {
           if (!current.adminNotifiedAt) {
             return { action: 'needs_admin_notification_only', order: current };
           }
@@ -1771,6 +1789,13 @@ export class FulfillmentService {
         if ((current.fulfillmentAttempts ?? 0) >= 1) {
           return { action: 'needs_reconciliation_check', order: current };
         }
+      }
+
+      if (
+        current.fulfillmentStatus === 'failed' &&
+        current.needsManualReconciliation
+      ) {
+        return { action: 'exhausted', order: current };
       }
 
       const prevAttempts = current.fulfillmentAttempts ?? 0;
@@ -1846,6 +1871,7 @@ export class FulfillmentService {
     // =========================================================================
     let { order: claimedOrder } = claim;
     const { attempt, hadLockedIdempotencyKey, wasAmbiguousBeforeClaim } = claim;
+    let adapterResult: FulfillmentAdapterResult | null = null;
     try {
       // If a previous attempt had an ambiguous POST /v1/orders timeout or crash before saving mystarsOrderId,
       // run strict multi-page reconciliation via GET /v1/orders before sending another POST /v1/orders.
@@ -1891,10 +1917,11 @@ export class FulfillmentService {
         }
       }
 
-      const adapterResult = await activeAdapter.requestFulfillment(claimedOrder, {
+      adapterResult = await activeAdapter.requestFulfillment(claimedOrder, {
         idempotencyKey: claimedOrder.fulfillmentIdempotencyKey || idempotencyKey,
         attempt,
       });
+      const resolvedAdapterResult = adapterResult;
 
       // =========================================================================
       // PHASE 3: PERSIST ADAPTER RESULT ATOMICALLY
@@ -1913,21 +1940,49 @@ export class FulfillmentService {
 
         const nowIso = new Date().toISOString();
         const isAutoCompleted =
-          adapterResult.handledAutomatically && adapterResult.status === 'completed';
+          resolvedAdapterResult.handledAutomatically &&
+          resolvedAdapterResult.status === 'completed';
+
+        const mergedBase: Order = {
+          ...latest,
+          ...(claimedOrder.mystarsOrderId && !latest.mystarsOrderId
+            ? {
+                mystarsOrderId: claimedOrder.mystarsOrderId,
+                mystarsOrderStatus: claimedOrder.mystarsOrderStatus,
+                mystarsLastPolledAt: claimedOrder.mystarsLastPolledAt,
+                mystarsPollAttempts: claimedOrder.mystarsPollAttempts,
+                mystarsPayToAddress: claimedOrder.mystarsPayToAddress,
+                mystarsPaymentMemo: claimedOrder.mystarsPaymentMemo,
+                mystarsPaymentAmountUsdt: claimedOrder.mystarsPaymentAmountUsdt,
+                mystarsPurchaseTx: claimedOrder.mystarsPurchaseTx,
+                mystarsUnknownStatusSeen: claimedOrder.mystarsUnknownStatusSeen,
+                mystarsExpiresAt: claimedOrder.mystarsExpiresAt,
+                mystarsWholesaleCostUsdt: claimedOrder.mystarsWholesaleCostUsdt,
+                mystarsCostUsdCents: claimedOrder.mystarsCostUsdCents,
+                mystarsCurrency: claimedOrder.mystarsCurrency,
+                grossRevenueUsdCents: claimedOrder.grossRevenueUsdCents,
+                providerFeeUsdCents: claimedOrder.providerFeeUsdCents,
+                netProfitUsdCents: claimedOrder.netProfitUsdCents,
+              }
+            : {}),
+        };
 
         const updated: Order = {
-          ...latest,
-          paymentStatus: isAutoCompleted ? 'completed' : latest.paymentStatus,
-          fulfillmentStatus: adapterResult.status,
-          fulfillmentNote: adapterResult.details.slice(0, 500),
+          ...mergedBase,
+          paymentStatus: isAutoCompleted ? 'completed' : mergedBase.paymentStatus,
+          fulfillmentStatus: resolvedAdapterResult.status,
+          fulfillmentNote: resolvedAdapterResult.details.slice(0, 500),
           externalExecutionReference:
-            adapterResult.externalReference ||
+            resolvedAdapterResult.externalReference ||
+            claimedOrder.mystarsOrderId ||
             `${activeAdapter.providerName}:${idempotencyKey}`,
           mystarsCreateInFlight: false,
           mystarsAmbiguousPostAt: undefined,
           fulfillmentLastError: undefined,
           fulfillmentNextRetryAt: undefined,
-          completedAt: isAutoCompleted ? latest.completedAt || nowIso : latest.completedAt,
+          completedAt: isAutoCompleted
+            ? mergedBase.completedAt || nowIso
+            : mergedBase.completedAt,
           updatedAt: nowIso,
         };
 
@@ -1945,7 +2000,7 @@ export class FulfillmentService {
             amount: updated.totalPriceUsdCents ?? updated.totalPrice,
             amountUsdCents: updated.totalPriceUsdCents ?? updated.totalPrice,
             currency: updated.currency || 'USD',
-            details: `Автоматическая выдача завершена: ${adapterResult.details}`.slice(
+            details: `Автоматическая выдача завершена: ${resolvedAdapterResult.details}`.slice(
               0,
               500,
             ),
@@ -1966,6 +2021,81 @@ export class FulfillmentService {
       return notifiedOrder;
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
+
+      // CRITICAL PROTECTION: If `adapterResult` is already non-null, the provider call
+      // SUCCEEDED and the error occurred during Phase 3 database persistence (or notification).
+      // Never mark the order as 'failed' with `mystarsCreateInFlight: false` after provider success!
+      if (adapterResult !== null) {
+        const nowIso = new Date().toISOString();
+        const isAutoCompleted =
+          adapterResult.handledAutomatically && adapterResult.status === 'completed';
+        const resolvedRef =
+          adapterResult.externalReference ||
+          claimedOrder.mystarsOrderId ||
+          `${activeAdapter.providerName}:${idempotencyKey}`;
+        const fallbackUpdates: Partial<Order> = {
+          ...(claimedOrder.mystarsOrderId
+            ? {
+                mystarsOrderId: claimedOrder.mystarsOrderId,
+                mystarsOrderStatus: claimedOrder.mystarsOrderStatus,
+                mystarsLastPolledAt: claimedOrder.mystarsLastPolledAt || nowIso,
+                mystarsPayToAddress: claimedOrder.mystarsPayToAddress,
+                mystarsPaymentMemo: claimedOrder.mystarsPaymentMemo,
+                mystarsPaymentAmountUsdt: claimedOrder.mystarsPaymentAmountUsdt,
+                mystarsPurchaseTx: claimedOrder.mystarsPurchaseTx,
+                mystarsExpiresAt: claimedOrder.mystarsExpiresAt,
+                mystarsWholesaleCostUsdt: claimedOrder.mystarsWholesaleCostUsdt,
+                mystarsCostUsdCents: claimedOrder.mystarsCostUsdCents,
+                mystarsCurrency: claimedOrder.mystarsCurrency,
+                grossRevenueUsdCents: claimedOrder.grossRevenueUsdCents,
+                providerFeeUsdCents: claimedOrder.providerFeeUsdCents,
+                netProfitUsdCents: claimedOrder.netProfitUsdCents,
+              }
+            : {}),
+          paymentStatus: isAutoCompleted ? 'completed' : claimedOrder.paymentStatus,
+          fulfillmentStatus: adapterResult.status,
+          fulfillmentNote: adapterResult.details.slice(0, 500),
+          externalExecutionReference: resolvedRef,
+          mystarsCreateInFlight: false,
+          mystarsAmbiguousPostAt: undefined,
+          fulfillmentLastError: undefined,
+          fulfillmentNextRetryAt: undefined,
+          ...(isAutoCompleted ? { completedAt: claimedOrder.completedAt || nowIso } : {}),
+          updatedAt: nowIso,
+        };
+
+        try {
+          const recoveredDoc = await firestoreRepo.updateDoc<Order>(
+            'orders',
+            claimedOrder.orderId,
+            fallbackUpdates,
+          );
+          if (recoveredDoc) {
+            let notified = await this.ensureAdminNotified(recoveredDoc, bot).catch(
+              () => recoveredDoc,
+            );
+            if (notified.fulfillmentStatus === 'completed') {
+              notified = await this.ensureBuyerNotified(notified, bot).catch(
+                () => notified,
+              );
+            }
+            return notified;
+          }
+        } catch (fallbackErr) {
+          console.error(
+            `[FulfillmentService] Сбой Firestore после успешного ответа провайдера для заказа #${claimedOrder.orderId} (${resolvedRef}):`,
+            redactSecretsFromText(
+              fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+            ),
+          );
+        }
+
+        // If Firestore remains completely unreachable, throw the DB error while leaving
+        // the Firestore order in its Phase 1 state ('processing' with mystarsCreateInFlight: true
+        // or persisted mystarsOrderId), so background recovery reconciles without duplicate POST.
+        throw error;
+      }
+
       const isNonRetryable =
         (error as { retryable?: boolean })?.retryable === false;
       const nowMs = Date.now();
@@ -1997,13 +2127,18 @@ export class FulfillmentService {
         ) {
           return latest;
         }
+        const resolvedMystarsId = claimedOrder.mystarsOrderId || latest.mystarsOrderId;
         const failed: Order = {
           ...latest,
+          ...(resolvedMystarsId ? { mystarsOrderId: resolvedMystarsId } : {}),
+          ...(claimedOrder.mystarsOrderStatus && !latest.mystarsOrderStatus
+            ? { mystarsOrderStatus: claimedOrder.mystarsOrderStatus }
+            : {}),
           fulfillmentStatus: 'failed',
           fulfillmentLastError: errMsg.slice(0, 500),
           fulfillmentNextRetryAt: nextRetryIso,
           needsManualReconciliation: !canRetry,
-          ...(isAmbiguousCreateError && !latest.mystarsOrderId
+          ...(isAmbiguousCreateError && !resolvedMystarsId
             ? {
                 mystarsCreateInFlight: true,
                 mystarsAmbiguousPostAt: latest.mystarsAmbiguousPostAt || nowIso,
@@ -2716,7 +2851,12 @@ export class FulfillmentService {
         const isStale =
           startedMs > 0 && nowMs - startedMs >= this.staleProcessingLeaseMs;
 
-        if (!ord.externalExecutionReference && !ord.mystarsOrderId && isStale) {
+        if (
+          !ord.externalExecutionReference &&
+          !ord.mystarsOrderId &&
+          isStale &&
+          (!ord.needsManualReconciliation || Boolean(ord.mystarsCreateInFlight))
+        ) {
           try {
             const reconciled = await this.reconcileStaleProcessingOrder(ord, bot);
             adminNotifyAttemptedInPass.add(ord.orderId);
@@ -3634,6 +3774,15 @@ export class FulfillmentService {
       }
 
       if (
+        existing.fulfillmentStatus === 'cancelled' ||
+        existing.fulfillmentStatus === 'refunded'
+      ) {
+        throw new Error(
+          `Заказ #${params.orderId} уже находится в терминальном статусе выдачи (${existing.fulfillmentStatus}).`,
+        );
+      }
+
+      if (
         existing.paymentStatus !== 'paid' &&
         existing.paymentStatus !== 'processing'
       ) {
@@ -3651,6 +3800,13 @@ export class FulfillmentService {
         fulfillmentLastError: undefined,
         fulfillmentNextRetryAt: undefined,
         needsManualReconciliation: false,
+        mystarsCreateInFlight: false,
+        mystarsAmbiguousPostAt: undefined,
+        mystarsPollLease: undefined,
+        awaitingKeyStock: false,
+        ...(params.adminTelegramId !== undefined
+          ? { completedByAdminId: params.adminTelegramId }
+          : {}),
         completedAt: existing.completedAt || now,
         updatedAt: now,
       };

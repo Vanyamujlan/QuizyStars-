@@ -445,7 +445,56 @@ export class OrderService {
         }
       }
 
-      if (nextFulfillment === 'processing' || nextFulfillment === 'completed') {
+      if (
+        existing.fulfillmentStatus === 'completed' &&
+        nextFulfillment !== 'completed'
+      ) {
+        if (nextFulfillment === 'processing') {
+          throw new Error(
+            `Невозможно вернуть уже выполненный заказ #${existing.orderId} обратно в обработку ("processing").`,
+          );
+        }
+        throw new Error(
+          `Невозможно вернуть уже выполненный заказ #${existing.orderId} в статус "${nextFulfillment}".`,
+        );
+      }
+
+      if (
+        (existing.fulfillmentStatus === 'cancelled' ||
+          existing.fulfillmentStatus === 'refunded') &&
+        nextFulfillment !== existing.fulfillmentStatus
+      ) {
+        throw new Error(
+          `Невозможно изменить статус выдачи заказа #${existing.orderId} из финального статуса "${existing.fulfillmentStatus}" в "${nextFulfillment}".`,
+        );
+      }
+
+      if (
+        (existing.paymentStatus === 'completed' ||
+          existing.paymentStatus === 'cancelled' ||
+          existing.paymentStatus === 'refunded') &&
+        nextPayment !== existing.paymentStatus
+      ) {
+        throw new Error(
+          `Невозможно изменить статус оплаты заказа #${existing.orderId} из финального статуса "${existing.paymentStatus}" в "${nextPayment}".`,
+        );
+      }
+
+      if (
+        (existing.paymentStatus === 'paid' ||
+          existing.paymentStatus === 'processing') &&
+        nextPayment === 'pending'
+      ) {
+        throw new Error(
+          `Невозможно вернуть статус оплаты оплаченного заказа #${existing.orderId} обратно в "pending".`,
+        );
+      }
+
+      if (
+        nextFulfillment === 'processing' ||
+        nextFulfillment === 'completed' ||
+        nextFulfillment === 'failed'
+      ) {
         const hasConfirmedPayment =
           existing.paymentStatus === 'paid' ||
           existing.paymentStatus === 'processing' ||
@@ -454,15 +503,6 @@ export class OrderService {
         if (!hasConfirmedPayment) {
           throw new Error(
             `Невозможно перевести заказ #${existing.orderId} в статус "${nextFulfillment}": заказ не оплачен (статус оплаты: "${existing.paymentStatus}").`,
-          );
-        }
-
-        if (
-          existing.fulfillmentStatus === 'completed' &&
-          nextFulfillment === 'processing'
-        ) {
-          throw new Error(
-            `Невозможно вернуть уже выполненный заказ #${existing.orderId} обратно в обработку ("processing").`,
           );
         }
       }

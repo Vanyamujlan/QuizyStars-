@@ -907,8 +907,23 @@ export function formatAdminOrderCard(order: Order): string {
     order.mystarsStuckAlertedAt
       ? `⏳ Мониторинг зависания (>15 мин): <code>${formatDateRu(order.mystarsStuckAlertedAt)}</code>`
       : '',
+    order.mystarsCreateInFlight
+      ? `⚠️ <b>Статус создания MyStars не определён (ambiguous POST — ожидает сверки GET /v1/orders)</b>`
+      : '',
+    order.needsManualReconciliation
+      ? `🚨 <b>Требуется ручная проверка / выдача администратором</b>`
+      : '',
+    order.fulfillmentAttempts
+      ? `🔢 Попыток автовыдачи: <code>${order.fulfillmentAttempts}</code>`
+      : '',
     order.mystarsFailureReason
       ? `${oe('warning')} Ошибка MyStars: ${escapeHtml(order.mystarsFailureReason)}`
+      : '',
+    order.fulfillmentLastError && order.fulfillmentLastError !== order.mystarsFailureReason
+      ? `${oe('warning')} Ошибка выдачи: <code>${escapeHtml(order.fulfillmentLastError)}</code>`
+      : '',
+    order.mystarsLastPollError
+      ? `${oe('warning')} Ошибка polling MyStars: <code>${escapeHtml(order.mystarsLastPollError)}</code>`
       : '',
     order.mystarsCurrency
       ? `📊 Учёт MyStars: <code>${escapeHtml(order.mystarsCurrency)}</code> | Выручка: <code>${formatUsdCents(order.grossRevenueUsdCents ?? order.totalPriceUsdCents ?? order.totalPrice)}</code>${
@@ -938,6 +953,9 @@ export function formatAdminOrderCard(order: Order): string {
           : '',
     order.fulfillmentNote
       ? `${oe('edit')} Примечание: ${escapeHtml(order.fulfillmentNote)}`
+      : '',
+    order.completedByAdminId
+      ? `👤 Выдал администратор: <code>${order.completedByAdminId}</code>`
       : '',
     `🕒 Создан: ${formatDateRu(order.createdAt)}`,
     order.paidAt ? `${oe('check')} Оплачен: ${formatDateRu(order.paidAt)}` : '',

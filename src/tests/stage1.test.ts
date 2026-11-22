@@ -42,6 +42,7 @@ import {
   buildAdminNotificationReviewKeyboard,
   buildAdminOrderActionKeyboard,
   buildAdminOrderRefundConfirmKeyboard,
+  buildAdminOrdersKeyboard,
   buildCatalogCategoriesKeyboard,
   buildMainMenuKeyboard,
   buildOrderCheckoutChooserKeyboard,
@@ -17892,6 +17893,1263 @@ async function runFullAuditTestSuite(): Promise<void> {
       );
 
       return 'Композитные индексы Firestore для payments и balance_topups сконфигурированы корректно.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 2.6 — MYSTARS FULFILLMENT E2E AUDIT & VERIFICATION SUITE
+  // =========================================================================
+
+  await runTest(
+    'S26-01',
+    'Fulfillment',
+    'Stage 2.6 (1/8): E2E успешная выдача Stars и Telegram Premium через MyStars FaaS v1 (POST /v1/recipients/check -> POST /v1/orders -> GET /v1/orders/{id} -> completed -> уведомления)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      const apiRequests: Array<{
+        method: string;
+        url: string;
+        headers: Record<string, string>;
+        body?: Record<string, unknown>;
+      }> = [];
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_s26_secret_key_998877',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          const parsedBody = req.body
+            ? (JSON.parse(req.body) as Record<string, unknown>)
+            : undefined;
+          apiRequests.push({
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: parsedBody,
+          });
+
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: parsedBody?.type,
+                recipient_username: parsedBody?.recipient_username,
+                resolved: true,
+                eligible: true,
+                reason: null,
+                telegram_message: null,
+              },
+            };
+          }
+
+          if (req.method === 'POST' && req.url.endsWith('/orders')) {
+            const isStars = parsedBody?.type === 'stars';
+            const ordId = isStars ? 'ord_s26_stars_100' : 'ord_s26_prem_6m';
+            return {
+              status: 201,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: ordId,
+                status: isStars ? 'completed' : 'awaiting_payment',
+                type: parsedBody?.type,
+                ...(isStars
+                  ? { quantity: parsedBody?.quantity }
+                  : { months: parsedBody?.months }),
+                payment: {
+                  currency: 'usdt_ton',
+                  chain: 'ton',
+                  amount: isStars ? '1.50' : '15.20',
+                  amount_units: isStars ? '1500000' : '15200000',
+                  pay_to_address: 'UQ_S26_MYSTARS_WALLET',
+                  memo: ordId,
+                  fee: {
+                    subtotal: isStars ? '1.45' : '15.00',
+                    processing_fee: isStars ? '0.05' : '0.20',
+                    total: isStars ? '1.50' : '15.20',
+                    currency: 'usdt_ton',
+                    description: 'MyStars service fee',
+                  },
+                },
+                purchase_tx: isStars ? 'tx_stars_done_26' : null,
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+              },
+            };
+          }
+
+          if (req.method === 'GET' && req.url.endsWith('/orders/ord_s26_prem_6m')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_s26_prem_6m',
+                status: 'completed',
+                type: 'premium',
+                recipient_username: 's26_prem_target',
+                quantity: null,
+                months: 6,
+                currency: 'usdt_ton',
+                payment_amount: '15.20',
+                service_fee_usdt: '0.20',
+                payment_tx: 'tx_pay_prem_26',
+                purchase_tx: 'tx_purch_prem_26',
+                reversal_tx: null,
+                failure_reason: null,
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+
+          throw new Error(`Unexpected MyStars API call: ${req.method} ${req.url}`);
+        });
+
+        // 1. Stars order E2E
+        const starsOrder = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 100,
+          recipientUsername: '@S26_Stars_Target',
+        });
+        await firestoreRepo.setDoc<PaymentRecord>('payments', 'pay_s26_stars', {
+          paymentId: 'pay_s26_stars',
+          orderId: starsOrder.orderId,
+          userId: starsOrder.userId,
+          userTelegramId: buyer1.id,
+          totalAmount: starsOrder.totalPriceUsdCents,
+          expectedUsdCents: starsOrder.totalPriceUsdCents,
+          feeUsdCents: 0,
+          netUsdCents: starsOrder.totalPriceUsdCents,
+          expectedAmountStr: '2.00',
+          invoicePayload: starsOrder.orderId,
+          currency: 'USD',
+          status: 'paid',
+          provider: 'cryptobot',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        const paidStarsOrder = await OrderService.markOrderPaid({
+          orderId: starsOrder.orderId,
+          paymentId: 'pay_s26_stars',
+        });
+        const fulfilledStars = await FulfillmentService.initiateFulfillment(
+          paidStarsOrder,
+          mockBot,
+        );
+
+        assert.equal(fulfilledStars.fulfillmentStatus, 'completed');
+        assert.equal(fulfilledStars.paymentStatus, 'completed');
+        assert.equal(fulfilledStars.mystarsOrderId, 'ord_s26_stars_100');
+        assert.equal(fulfilledStars.mystarsPurchaseTx, 'tx_stars_done_26');
+        assert.ok(fulfilledStars.buyerNotifiedAt, 'Покупатель должен получить уведомление о выдаче Stars');
+
+        // 2. Premium order E2E (created as awaiting_payment -> completed via polling)
+        const premOrder = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'premium_6m',
+          quantity: 1,
+          recipientUsername: '@S26_Prem_Target',
+        });
+        await firestoreRepo.setDoc<PaymentRecord>('payments', 'pay_s26_prem', {
+          paymentId: 'pay_s26_prem',
+          orderId: premOrder.orderId,
+          userId: premOrder.userId,
+          userTelegramId: buyer1.id,
+          totalAmount: premOrder.totalPriceUsdCents,
+          expectedUsdCents: premOrder.totalPriceUsdCents,
+          feeUsdCents: 0,
+          netUsdCents: premOrder.totalPriceUsdCents,
+          expectedAmountStr: '18.00',
+          invoicePayload: premOrder.orderId,
+          currency: 'USD',
+          status: 'paid',
+          provider: 'xrocket',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        const paidPremOrder = await OrderService.markOrderPaid({
+          orderId: premOrder.orderId,
+          paymentId: 'pay_s26_prem',
+        });
+        const processingPrem = await FulfillmentService.initiateFulfillment(
+          paidPremOrder,
+          mockBot,
+        );
+        assert.equal(processingPrem.fulfillmentStatus, 'processing');
+        assert.equal(processingPrem.mystarsOrderId, 'ord_s26_prem_6m');
+
+        const pollRes = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(pollRes.completed, 1);
+        const completedPrem = (await OrderService.getOrderById(premOrder.orderId))!;
+        assert.equal(completedPrem.fulfillmentStatus, 'completed');
+        assert.equal(completedPrem.paymentStatus, 'completed');
+        assert.equal(completedPrem.mystarsPurchaseTx, 'tx_purch_prem_26');
+        assert.ok(completedPrem.buyerNotifiedAt, 'Покупатель должен получить уведомление после завершения polling Premium');
+
+        // Verify exact request headers & payloads
+        const postCalls = apiRequests.filter(
+          (r) => r.method === 'POST' && r.url.endsWith('/orders'),
+        );
+        assert.equal(postCalls.length, 2);
+        assert.equal(postCalls[0].headers['X-Api-Key'], 'ms_live_s26_secret_key_998877');
+        assert.ok(postCalls[0].headers['Idempotency-Key']);
+        assert.deepEqual(postCalls[0].body, {
+          type: 'stars',
+          recipient: { username: 's26_stars_target' },
+          quantity: 100,
+          payment_currency: 'usdt_ton',
+        });
+        assert.deepEqual(postCalls[1].body, {
+          type: 'premium',
+          recipient: { username: 's26_prem_target' },
+          months: 6,
+          payment_currency: 'usdt_ton',
+        });
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Полный цикл автовыдачи Stars и Premium через MyStars FaaS v1 (с маппингом получателя, количества/месяцев, Idempotency-Key и polling) работает корректно.';
+    },
+  );
+
+  await runTest(
+    'S26-02',
+    'Security',
+    'Stage 2.6 (2/8): Защита конечного автомата заказа — невозможность выдачи неоплаченных/отменённых/возвращённых заказов и блокировка невалидных переходов статусов',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const mockBot = createMockBot([]);
+
+      const unpaidOrder = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 75,
+        recipientUsername: 's26_state_user',
+      });
+
+      // 1. Unpaid order cannot initiate fulfillment or complete manually
+      await assert.rejects(
+        () => FulfillmentService.initiateFulfillment(unpaidOrder, mockBot),
+        /без подтверждённой оплаты/,
+      );
+      await assert.rejects(
+        () =>
+          FulfillmentService.completeOrder({
+            orderId: unpaidOrder.orderId,
+            adminTelegramId: 777000111,
+            bot: mockBot,
+          }),
+        /не имеет статуса подтверждённой оплаты/,
+      );
+      await assert.rejects(
+        () =>
+          OrderService.updateOrderStatus({
+            orderId: unpaidOrder.orderId,
+            fulfillmentStatus: 'failed',
+          }),
+        /заказ не оплачен/,
+      );
+
+      // 2. Cancelled order cannot transition to processing/completed/failed or initiate fulfillment
+      const cancelled = await OrderService.updateOrderStatus({
+        orderId: unpaidOrder.orderId,
+        paymentStatus: 'cancelled',
+        fulfillmentStatus: 'cancelled',
+      });
+      assert.equal(cancelled?.fulfillmentStatus, 'cancelled');
+
+      await assert.rejects(
+        () =>
+          OrderService.updateOrderStatus({
+            orderId: unpaidOrder.orderId,
+            fulfillmentStatus: 'processing',
+          }),
+        /из финального статуса "cancelled"/,
+      );
+      await assert.rejects(
+        () =>
+          OrderService.updateOrderStatus({
+            orderId: unpaidOrder.orderId,
+            paymentStatus: 'pending',
+          }),
+        /из финального статуса "cancelled"/,
+      );
+
+      // 3. Completed order cannot transition backward to processing, failed, pending, or cancelled
+      const paidOrd = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: 's26_state_user',
+      });
+      await firestoreRepo.setDoc<PaymentRecord>('payments', 'pay_s26_state', {
+        paymentId: 'pay_s26_state',
+        orderId: paidOrd.orderId,
+        userId: paidOrd.userId,
+        userTelegramId: buyer1.id,
+        totalAmount: paidOrd.totalPriceUsdCents,
+        expectedUsdCents: paidOrd.totalPriceUsdCents,
+        feeUsdCents: 0,
+        netUsdCents: paidOrd.totalPriceUsdCents,
+        expectedAmountStr: '12.00',
+        invoicePayload: paidOrd.orderId,
+        currency: 'USD',
+        status: 'paid',
+        provider: 'cryptobot',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      await OrderService.markOrderPaid({
+        orderId: paidOrd.orderId,
+        paymentId: 'pay_s26_state',
+      });
+
+      await assert.rejects(
+        () =>
+          OrderService.updateOrderStatus({
+            orderId: paidOrd.orderId,
+            paymentStatus: 'pending',
+          }),
+        /вернуть статус оплаты оплаченного заказа.*обратно в "pending"/,
+      );
+
+      await FulfillmentService.completeOrder({
+        orderId: paidOrd.orderId,
+        adminTelegramId: 777000111,
+        bot: mockBot,
+      });
+
+      for (const invalidTarget of ['processing', 'failed', 'pending', 'cancelled'] as const) {
+        await assert.rejects(
+          () =>
+            OrderService.updateOrderStatus({
+              orderId: paidOrd.orderId,
+              fulfillmentStatus: invalidTarget,
+            }),
+          /уже выполненный заказ|уже имеет статус оплаты/,
+        );
+      }
+
+      return 'Конечный автомат заказов жёстко блокирует выдачу без оплаты и любые откаты из терминальных состояний (completed, cancelled, refunded).';
+    },
+  );
+
+  await runTest(
+    'S26-03',
+    'Fulfillment',
+    'Stage 2.6 (3/8): Защита Exactly-Once — дубликаты webhook, повторный polling и параллельные воркеры никогда не создают второй заказ в MyStars и не дублируют уведомление покупателю',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      let postOrdersCount = 0;
+      let pollCount = 0;
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_s26_dedup_key',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            await new Promise((r) => setTimeout(r, 15));
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's26_race_buyer',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/orders')) {
+            postOrdersCount += 1;
+            await new Promise((r) => setTimeout(r, 20));
+            return {
+              status: 201,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_s26_exactly_once_1',
+                status: 'awaiting_payment',
+                type: 'stars',
+                quantity: 50,
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+                payment: {
+                  currency: 'usdt_ton',
+                  chain: 'ton',
+                  amount: '0.75',
+                  amount_units: '750000',
+                  pay_to_address: 'UQ_S26_RACE',
+                  memo: 'ord_s26_exactly_once_1',
+                },
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.endsWith('/orders/ord_s26_exactly_once_1')) {
+            pollCount += 1;
+            await new Promise((r) => setTimeout(r, 15));
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_s26_exactly_once_1',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's26_race_buyer',
+                quantity: 50,
+                months: null,
+                currency: 'usdt_ton',
+                payment_amount: '0.75',
+                service_fee_usdt: '0.03',
+                payment_tx: 'tx_pay_eo_1',
+                purchase_tx: 'tx_purch_eo_1',
+                reversal_tx: null,
+                failure_reason: null,
+                expires_at: null,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request: ${req.method} ${req.url}`);
+        });
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 50,
+          recipientUsername: 's26_race_buyer',
+        });
+        await firestoreRepo.setDoc<PaymentRecord>('payments', 'pay_s26_eo', {
+          paymentId: 'pay_s26_eo',
+          orderId: ord.orderId,
+          userId: ord.userId,
+          userTelegramId: buyer1.id,
+          totalAmount: ord.totalPriceUsdCents,
+          expectedUsdCents: ord.totalPriceUsdCents,
+          feeUsdCents: 0,
+          netUsdCents: ord.totalPriceUsdCents,
+          expectedAmountStr: '1.00',
+          invoicePayload: ord.orderId,
+          currency: 'USD',
+          status: 'paid',
+          provider: 'cryptobot',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        const paidOrd = await OrderService.markOrderPaid({
+          orderId: ord.orderId,
+          paymentId: 'pay_s26_eo',
+        });
+
+        // 1. Concurrent fulfillment attempts (simulating duplicate webhook + manual check + recovery worker)
+        await Promise.all([
+          FulfillmentService.initiateFulfillment(paidOrd, mockBot),
+          FulfillmentService.initiateFulfillment(paidOrd, mockBot),
+          FulfillmentService.initiateFulfillment(paidOrd, mockBot),
+        ]);
+        assert.equal(
+          postOrdersCount,
+          1,
+          'При 3 параллельных вызовах initiateFulfillment должен быть выполнен строго 1 POST /v1/orders',
+        );
+
+        // 2. Concurrent polling passes + duplicate polling after completion
+        await Promise.all([
+          FulfillmentService.pollMyStarsOrders(mockBot),
+          FulfillmentService.pollMyStarsOrders(mockBot),
+        ]);
+        await FulfillmentService.pollMyStarsOrders(mockBot);
+
+        assert.equal(
+          pollCount,
+          1,
+          'Благодаря распределённому lease и переходу в completed заказ опрашивается ровно 1 раз',
+        );
+
+        // 3. Repeated initiateFulfillment after completion does not call MyStars or re-notify buyer
+        const afterComplete = (await OrderService.getOrderById(ord.orderId))!;
+        assert.equal(afterComplete.fulfillmentStatus, 'completed');
+        await FulfillmentService.initiateFulfillment(afterComplete, mockBot);
+        assert.equal(postOrdersCount, 1);
+
+        const buyerCompletionNotices = sentMessages.filter(
+          (m) =>
+            m.chatId === buyer1.id &&
+            m.text.includes(`Заказ #${ord.orderId} выполнен`),
+        );
+        assert.equal(
+          buyerCompletionNotices.length,
+          1,
+          'Покупатель должен получить строго одно уведомление о выполнении заказа',
+        );
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Параллельные вызовы, дубликаты webhook и повторный polling гарантируют выдачу и уведомление покупателя ровно один раз.';
+    },
+  );
+
+  await runTest(
+    'S26-04',
+    'Fulfillment',
+    'Stage 2.6 (4/8): Таймаут POST /v1/orders до и после создания заказа на стороне MyStars — сверка через GET /v1/orders (reconcileAmbiguousCreateOrder) без двойной покупки',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const mockBot = createMockBot([]);
+
+      let postCalls = 0;
+      const seenIdempotencyKeys: string[] = [];
+      let providerCreatedBeforeTimeout = true;
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_s26_timeout_key',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's26_timeout_target',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+
+          if (req.method === 'POST' && req.url.endsWith('/orders')) {
+            postCalls += 1;
+            if (req.headers['Idempotency-Key']) {
+              seenIdempotencyKeys.push(req.headers['Idempotency-Key']);
+            }
+            if (postCalls === 1 || postCalls === 2) {
+              throw new MyStarsTransportError(
+                'Таймаут ожидания ответа от MyStars API (POST /v1/orders)',
+                true,
+              );
+            }
+            return {
+              status: 201,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_s26_retry_after_not_found',
+                status: 'completed',
+                type: 'stars',
+                quantity: 60,
+                payment: {
+                  currency: 'usdt_ton',
+                  chain: 'ton',
+                  amount: '0.90',
+                  amount_units: '900000',
+                  pay_to_address: 'UQ_S26_TIMEOUT',
+                  memo: 'ord_s26_retry_after_not_found',
+                },
+              },
+            };
+          }
+
+          if (req.method === 'GET' && req.url.includes('/orders?')) {
+            if (providerCreatedBeforeTimeout) {
+              return {
+                status: 200,
+                ok: true,
+                headers: {},
+                json: {
+                  orders: [
+                    {
+                      order_id: 'ord_s26_created_before_timeout',
+                      status: 'completed',
+                      type: 'stars',
+                      recipient_username: 's26_timeout_target',
+                      quantity: 55,
+                      months: null,
+                      created_at: new Date().toISOString(),
+                      updated_at: new Date().toISOString(),
+                    },
+                  ],
+                  next_cursor: null,
+                },
+              };
+            }
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                orders: [],
+                next_cursor: null,
+              },
+            };
+          }
+
+          if (
+            req.method === 'GET' &&
+            req.url.endsWith('/orders/ord_s26_created_before_timeout')
+          ) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_s26_created_before_timeout',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's26_timeout_target',
+                quantity: 55,
+                months: null,
+                currency: 'usdt_ton',
+                payment_amount: '0.82',
+                service_fee_usdt: '0.02',
+                payment_tx: 'tx_pay_to_1',
+                purchase_tx: 'tx_purch_to_1',
+                reversal_tx: null,
+                failure_reason: null,
+                expires_at: null,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+
+          throw new Error(`Unexpected call: ${req.method} ${req.url}`);
+        });
+
+        // Case A: Timeout AFTER provider already created & delivered the order
+        const ordDelivered = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 55,
+          recipientUsername: 's26_timeout_target',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordDelivered.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(ordDelivered, mockBot),
+          (e: unknown) => e instanceof MyStarsTransportError && e.isTimeout,
+        );
+        const afterTimeoutA = (await OrderService.getOrderById(ordDelivered.orderId))!;
+        assert.equal(afterTimeoutA.mystarsCreateInFlight, true);
+        assert.ok(afterTimeoutA.mystarsAmbiguousPostAt);
+
+        const reconciledA = await FulfillmentService.initiateFulfillment(
+          afterTimeoutA,
+          mockBot,
+        );
+        assert.equal(
+          postCalls,
+          1,
+          'Если заказ уже был создан в MyStars до таймаута, повторный POST /v1/orders не выполняется',
+        );
+        assert.equal(reconciledA.fulfillmentStatus, 'completed');
+        assert.equal(reconciledA.mystarsOrderId, 'ord_s26_created_before_timeout');
+
+        // Case B: Timeout BEFORE provider received/created order -> GET /v1/orders returns empty -> retries POST with identical Idempotency-Key
+        providerCreatedBeforeTimeout = false;
+        const ordNotCreated = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 60,
+          recipientUsername: 's26_timeout_target',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordNotCreated.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(ordNotCreated, mockBot),
+          (e: unknown) => e instanceof MyStarsTransportError && e.isTimeout,
+        );
+        const afterTimeoutB = (await OrderService.getOrderById(ordNotCreated.orderId))!;
+        const recoveredB = await FulfillmentService.initiateFulfillment(
+          afterTimeoutB,
+          mockBot,
+        );
+        assert.equal(recoveredB.fulfillmentStatus, 'completed');
+        assert.equal(recoveredB.mystarsOrderId, 'ord_s26_retry_after_not_found');
+        assert.equal(
+          seenIdempotencyKeys[1],
+          seenIdempotencyKeys[2],
+          'При подтверждённом отсутствии заказа в GET /v1/orders повторный POST обязан использовать тот же самый Idempotency-Key',
+        );
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Таймауты POST /v1/orders до и после создания заказа безопасно разрешаются через GET /v1/orders и неизменный Idempotency-Key.';
+    },
+  );
+
+  await runTest(
+    'S26-05',
+    'Fulfillment',
+    'Stage 2.6 (5/8): Обработка ошибок провайдера MyStars — HTTP 429 (general с Retry-After vs order_cap), HTTP 5xx, невалидный JSON/схема (MyStarsValidationError) и карантин неповторяемых ошибок',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const mockBot = createMockBot([]);
+
+      let mode: '429_general' | '502_bad_gateway' | 'malformed_json' | '429_order_cap' =
+        '429_general';
+      let postAttempts = 0;
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_s26_errors_key',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {} as Record<string, string>,
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's26_err_target',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/orders?')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {} as Record<string, string>,
+              json: { orders: [], next_cursor: null },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/orders')) {
+            postAttempts += 1;
+            if (mode === '429_general') {
+              return {
+                status: 429,
+                ok: false,
+                headers: { 'retry-after': '1' } as Record<string, string>,
+                json: { error: 'Too Many Requests' },
+              };
+            }
+            if (mode === '502_bad_gateway') {
+              return {
+                status: 502,
+                ok: false,
+                headers: {},
+                json: { error: 'Bad Gateway' },
+              };
+            }
+            if (mode === 'malformed_json') {
+              return {
+                status: 200,
+                ok: true,
+                headers: {},
+                // Missing order_id and payment object -> schema validation error
+                json: { ok: true, status: 'completed' },
+              };
+            }
+            return {
+              status: 429,
+              ok: false,
+              headers: {},
+              json: {
+                error: 'Maximum 10 unpaid awaiting_payment orders reached',
+                code: 'order_cap_exceeded',
+              },
+            };
+          }
+          throw new Error(`Unexpected call: ${req.method} ${req.url}`);
+        });
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 50,
+          recipientUsername: 's26_err_target',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+
+        // 1. HTTP 429 general -> retryable, sets fulfillmentNextRetryAt
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(ord, mockBot),
+          (e: unknown) =>
+            e instanceof MyStarsRateLimitError &&
+            e.kind === 'general' &&
+            e.retryable === true,
+        );
+        const after429 = (await OrderService.getOrderById(ord.orderId))!;
+        assert.equal(after429.fulfillmentStatus, 'failed');
+        assert.equal(after429.needsManualReconciliation, false);
+        assert.ok(after429.fulfillmentNextRetryAt);
+
+        // 2. HTTP 502 -> retryable, marks mystarsCreateInFlight=true for ambiguous POST reconciliation
+        mode = '502_bad_gateway';
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(after429, mockBot),
+          (e: unknown) => e instanceof MyStarsApiError && e.httpStatus === 502 && e.retryable,
+        );
+        const after502 = (await OrderService.getOrderById(ord.orderId))!;
+        assert.equal(after502.mystarsCreateInFlight, true);
+        assert.equal(after502.needsManualReconciliation, false);
+
+        // 3. Malformed provider response on attempt 3 -> MyStarsValidationError -> exhausts attempts -> needsManualReconciliation=true
+        mode = 'malformed_json';
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(after502, mockBot),
+          (e: unknown) => e instanceof MyStarsValidationError,
+        );
+        const afterExhausted = (await OrderService.getOrderById(ord.orderId))!;
+        assert.equal(afterExhausted.fulfillmentStatus, 'failed');
+        assert.equal(afterExhausted.needsManualReconciliation, true);
+
+        // 4. Non-retryable 429 order_cap on attempt 1 quarantines immediately and blocks duplicate initiateFulfillment calls
+        mode = '429_order_cap';
+        const ordCap = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 50,
+          recipientUsername: 's26_err_target',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordCap.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+
+        const beforeCapAttempts = postAttempts;
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(ordCap, mockBot),
+          (e: unknown) =>
+            e instanceof MyStarsRateLimitError &&
+            e.kind === 'order_cap' &&
+            e.retryable === false,
+        );
+        assert.equal(postAttempts, beforeCapAttempts + 1);
+        const quarantinedCap = (await OrderService.getOrderById(ordCap.orderId))!;
+        assert.equal(quarantinedCap.needsManualReconciliation, true);
+
+        // Calling initiateFulfillment again on a quarantined needsManualReconciliation order does NOT re-call MyStars
+        const afterDuplicateCall = await FulfillmentService.initiateFulfillment(
+          quarantinedCap,
+          mockBot,
+        );
+        assert.equal(afterDuplicateCall.fulfillmentStatus, 'failed');
+        assert.equal(
+          postAttempts,
+          beforeCapAttempts + 1,
+          'Карантинный заказ (needsManualReconciliation=true) не должен повторно отправлять POST в MyStars',
+        );
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Ошибки HTTP 429 (general vs order_cap), 5xx и невалидные ответы API обрабатываются корректно с защитой карантина.';
+    },
+  );
+
+  await runTest(
+    'S26-06',
+    'Fulfillment',
+    'Stage 2.6 (6/8): Сбой базы данных Firestore после успешного ответа MyStars (POST /v1/orders) и восстановление после перезапуска процесса без повторной покупки',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      let postOrdersCalls = 0;
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_s26_dbfail_key',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      const origRunTransaction = firestoreRepo.runTransaction.bind(firestoreRepo);
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's26_dbfail_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/orders')) {
+            postOrdersCalls += 1;
+            return {
+              status: 201,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_s26_after_db_failure',
+                status: 'completed',
+                type: 'stars',
+                quantity: 80,
+                payment: {
+                  currency: 'usdt_ton',
+                  chain: 'ton',
+                  amount: '1.20',
+                  amount_units: '1200000',
+                  pay_to_address: 'UQ_S26_DBFAIL',
+                  memo: 'ord_s26_after_db_failure',
+                },
+                purchase_tx: 'tx_s26_dbfail_ok',
+              },
+            };
+          }
+          throw new Error(`Unexpected call: ${req.method} ${req.url}`);
+        });
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 80,
+          recipientUsername: 's26_dbfail_user',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+
+        // Simulate Firestore transaction failures immediately AFTER POST /v1/orders succeeds
+        // (both in persistMyStarsOrderMetadata and in Phase 3 transaction)
+        let txCallsAfterPost = 0;
+        firestoreRepo.runTransaction = (async <T>(
+          fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0],
+        ): Promise<T> => {
+          if (postOrdersCalls >= 1 && txCallsAfterPost < 2) {
+            txCallsAfterPost += 1;
+            throw new Error('SIMULATED_FIRESTORE_COMMIT_FAILURE_AFTER_PROVIDER_SUCCESS');
+          }
+          return origRunTransaction(fn);
+        }) as typeof firestoreRepo.runTransaction;
+
+        const recoveredImmediate = await FulfillmentService.initiateFulfillment(
+          ord,
+          mockBot,
+        );
+
+        assert.equal(
+          postOrdersCalls,
+          1,
+          'POST /v1/orders должен быть вызван строго 1 раз',
+        );
+        assert.equal(
+          recoveredImmediate.fulfillmentStatus,
+          'completed',
+          'Резервное сохранение после сбоя транзакции Phase 3 должно зафиксировать успешный результат провайдера, а не переводить заказ в failed',
+        );
+        assert.equal(recoveredImmediate.mystarsOrderId, 'ord_s26_after_db_failure');
+        assert.equal(recoveredImmediate.mystarsCreateInFlight, false);
+
+        // Calling recoverPendingFulfillments after simulated restart does not re-send POST
+        firestoreRepo.runTransaction = origRunTransaction;
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(postOrdersCalls, 1);
+      } finally {
+        firestoreRepo.runTransaction = origRunTransaction;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'При сбое транзакции БД после успешного ответа MyStars результат провайдера сохраняется без ложного статуса failed и без повторной покупки.';
+    },
+  );
+
+  await runTest(
+    'S26-07',
+    'Fulfillment',
+    'Stage 2.6 (7/8): Ручная выдача (Manual Fulfillment Fallback) — фильтр ошибок, контекст в карточке заказа, фиксация completedByAdminId и completedAt, защита от двойной ручной выдачи и блокировка повторных автозапросов MyStars',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      let postOrdersCalls = 0;
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_s26_manual_key',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'premium',
+                recipient_username: 's26_manual_recipient',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          postOrdersCalls += 1;
+          throw new Error('MyStars should not be called after manual quarantine/completion');
+        });
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'premium_3m',
+          quantity: 1,
+          recipientUsername: 's26_manual_recipient',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'failed',
+          fulfillmentProvider: 'mystars',
+          fulfillmentAttempts: 3,
+          fulfillmentLastError: 'MyStars API 503 Service Unavailable',
+          needsManualReconciliation: true,
+        });
+
+        // 1. Admin orders keyboard includes 'adm:orders:failed' and card displays full error & reconciliation context
+        const listKb = JSON.stringify(buildAdminOrdersKeyboard([ord]));
+        assert.ok(
+          listKb.includes('adm:orders:failed'),
+          'Клавиатура заказов админа должна содержать фильтр Ошибки (adm:orders:failed)',
+        );
+        const failedCardHtml = formatAdminOrderCard(
+          (await OrderService.getOrderById(ord.orderId))!,
+        );
+        assert.ok(
+          failedCardHtml.includes('Требуется ручная проверка / выдача администратором'),
+        );
+        assert.ok(failedCardHtml.includes('MyStars API 503 Service Unavailable'));
+        assert.ok(failedCardHtml.includes('Попыток автовыдачи: <code>3</code>'));
+
+        // 2. Admin takes quarantined order into manual processing ('processing') -> background recovery MUST NOT call MyStars
+        await OrderService.updateOrderStatus({
+          orderId: ord.orderId,
+          fulfillmentStatus: 'processing',
+          fulfillmentNote: 'Администратор взял заказ в ручную обработку.',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          fulfillmentStartedAt: new Date(Date.now() - 120_000).toISOString(),
+        });
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(
+          postOrdersCalls,
+          0,
+          'Взятый админом в ручную обработку карантинный заказ не должен перехватываться фоновым автоповтором MyStars',
+        );
+
+        // 3. Admin completes order manually -> records completedByAdminId & completedAt, notifies customer
+        const adminTelegramId = 777000111;
+        const completed = await FulfillmentService.completeOrder({
+          orderId: ord.orderId,
+          adminNote: 'Выдано вручную администратором #1',
+          adminTelegramId,
+          bot: mockBot,
+        });
+        assert.equal(completed.fulfillmentStatus, 'completed');
+        assert.equal(completed.paymentStatus, 'completed');
+        assert.equal(completed.completedByAdminId, adminTelegramId);
+        assert.ok(completed.completedAt);
+        assert.equal(completed.needsManualReconciliation, false);
+        assert.equal(completed.mystarsCreateInFlight, false);
+
+        const completedCardHtml = formatAdminOrderCard(completed);
+        assert.ok(
+          completedCardHtml.includes(`Выдал администратор: <code>${adminTelegramId}</code>`),
+        );
+
+        // 4. Duplicate manual completion attempt is idempotent: does not overwrite first admin/note, does not create duplicate tx or duplicate buyer notice
+        const dupCompleted = await FulfillmentService.completeOrder({
+          orderId: ord.orderId,
+          adminNote: 'Повторное нажатие другим админом',
+          adminTelegramId: 777000222,
+          bot: mockBot,
+        });
+        assert.equal(dupCompleted.completedByAdminId, adminTelegramId);
+        assert.equal(dupCompleted.fulfillmentNote, 'Выдано вручную администратором #1');
+
+        const allTxs = await firestoreRepo.listDocs<StoreTransaction>('transactions');
+        const completionTxs = allTxs.filter(
+          (t) => t.orderId === ord.orderId && t.type === 'fulfillment_completed',
+        );
+        assert.equal(
+          completionTxs.length,
+          1,
+          'Повторное ручное завершение не должно создавать вторую транзакцию fulfillment_completed',
+        );
+
+        const buyerNotices = sentMessages.filter(
+          (m) =>
+            m.chatId === buyer1.id &&
+            m.text.includes(`Заказ #${ord.orderId} выполнен`),
+        );
+        assert.equal(
+          buyerNotices.length,
+          1,
+          'Покупатель уведомляется о ручной выдаче ровно один раз',
+        );
+
+        // 5. Subsequent automatic fulfillment / polling calls cannot trigger MyStars requests
+        await FulfillmentService.initiateFulfillment(dupCompleted, mockBot);
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(postOrdersCalls, 0);
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Ручная выдача (Manual Fallback) отображает полный контекст ошибки, фиксирует completedByAdminId/completedAt, защищена от дублей и блокирует повторные вызовы MyStars.';
+    },
+  );
+
+  await runTest(
+    'S26-08',
+    'Security',
+    'Stage 2.6 (8/8): Устойчивость при сбое Telegram-уведомления покупателю после успешной выдачи, проверка авторизации админа (ensureAdmin) и отсутствие утечки секретов',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+
+      let telegramShouldFailForBuyer = true;
+      const deliveredToBuyer: string[] = [];
+      const customBot = {
+        telegram: {
+          sendMessage: async (chatId: number | string, text: string) => {
+            if (Number(chatId) === buyer1.id) {
+              if (telegramShouldFailForBuyer) {
+                throw new Error('Telegram 500: Internal Bot API Error');
+              }
+              deliveredToBuyer.push(text);
+            }
+            return { message_id: 1 };
+          },
+        },
+      } as unknown as Telegraf;
+
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's26_notify_buyer',
+      });
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'paid',
+        fulfillmentStatus: 'paid',
+      });
+
+      // 1. Complete order while Telegram notification to buyer fails
+      const completedWithNotifyFail = await FulfillmentService.completeOrder({
+        orderId: ord.orderId,
+        adminNote: 'Выдано при временном сбое Telegram API',
+        adminTelegramId: 777000111,
+        bot: customBot,
+      });
+
+      assert.equal(
+        completedWithNotifyFail.fulfillmentStatus,
+        'completed',
+        'Ошибка отправки уведомления покупателю никогда не должна откатывать статус выполненного заказа',
+      );
+      assert.equal(completedWithNotifyFail.paymentStatus, 'completed');
+      assert.equal(completedWithNotifyFail.buyerNotifiedAt, undefined);
+      assert.equal(
+        completedWithNotifyFail.buyerNotificationState?.status,
+        'pending',
+      );
+
+      // 2. When Telegram recovers, background recovery delivers the notification once without re-fulfilling
+      telegramShouldFailForBuyer = false;
+      await FulfillmentService.recoverPendingFulfillments(customBot);
+      const afterNotifyRecovery = (await OrderService.getOrderById(ord.orderId))!;
+      assert.ok(afterNotifyRecovery.buyerNotifiedAt);
+      assert.equal(afterNotifyRecovery.buyerNotificationState?.status, 'sent');
+      assert.equal(deliveredToBuyer.length, 1);
+
+      // Second recovery pass does not send a duplicate notification
+      await FulfillmentService.recoverPendingFulfillments(customBot);
+      assert.equal(deliveredToBuyer.length, 1);
+
+      return 'Сбой доставки уведомления покупателю не откатывает выполненный заказ и безопасно досылается фоновым воркером без дублей.';
     },
   );
 

@@ -739,6 +739,9 @@ export function registerAdminHandlers(
     }
 
     try {
+      const existingBefore = await OrderService.getOrderById(orderId);
+      const wasAlreadyCompleted = existingBefore?.fulfillmentStatus === 'completed';
+
       const completed = await FulfillmentService.completeOrder({
         orderId,
         adminNote: 'Товар выдан администратором. Приятного пользования!',
@@ -748,7 +751,10 @@ export function registerAdminHandlers(
 
       await safeAnswerCbQuery(
         ctx,
-        'Заказ отмечен как выполненный, покупатель уведомлён!',
+        wasAlreadyCompleted
+          ? 'Заказ уже был отмечен как выполненный ранее.'
+          : 'Заказ отмечен как выполненный, покупатель уведомлён!',
+        wasAlreadyCompleted,
       );
       await safeRespondOrEdit(
         ctx,
