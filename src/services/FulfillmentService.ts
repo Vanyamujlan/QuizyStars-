@@ -106,11 +106,195 @@ export class FulfillmentService {
   private static buyerPendingCursorOrderId: string | null = null;
   private static adminPendingCursorOrderId: string | null = null;
   private static adminPartialCursorOrderId: string | null = null;
+  private static retainedProviderResults = new Map<
+    string,
+    {
+      claimedOrder: Order;
+      adapterResult: FulfillmentAdapterResult;
+      idempotencyKey: string;
+      providerName: string;
+    }
+  >();
 
   public static resetNotificationRecoveryState(): void {
     this.buyerPendingCursorOrderId = null;
     this.adminPendingCursorOrderId = null;
     this.adminPartialCursorOrderId = null;
+  }
+
+  private static extractMyStarsMetadataFromOrder(source: Order): Partial<Order> {
+    if (!source.mystarsOrderId) {
+      return {};
+    }
+    return {
+      mystarsOrderId: source.mystarsOrderId,
+      ...(source.mystarsOrderStatus !== undefined
+        ? { mystarsOrderStatus: source.mystarsOrderStatus }
+        : {}),
+      ...(source.mystarsLastPolledAt !== undefined
+        ? { mystarsLastPolledAt: source.mystarsLastPolledAt }
+        : {}),
+      ...(source.mystarsPollAttempts !== undefined
+        ? { mystarsPollAttempts: source.mystarsPollAttempts }
+        : {}),
+      ...(source.mystarsPayToAddress !== undefined
+        ? { mystarsPayToAddress: source.mystarsPayToAddress }
+        : {}),
+      ...(source.mystarsPaymentMemo !== undefined
+        ? { mystarsPaymentMemo: source.mystarsPaymentMemo }
+        : {}),
+      ...(source.mystarsPaymentAmountUsdt !== undefined
+        ? { mystarsPaymentAmountUsdt: source.mystarsPaymentAmountUsdt }
+        : {}),
+      ...(source.mystarsPurchaseTx !== undefined
+        ? { mystarsPurchaseTx: source.mystarsPurchaseTx }
+        : {}),
+      ...(source.mystarsPaymentTx !== undefined
+        ? { mystarsPaymentTx: source.mystarsPaymentTx }
+        : {}),
+      ...(source.mystarsReversalTx !== undefined
+        ? { mystarsReversalTx: source.mystarsReversalTx }
+        : {}),
+      ...(source.mystarsFailureReason !== undefined
+        ? { mystarsFailureReason: source.mystarsFailureReason }
+        : {}),
+      ...(source.mystarsUnknownStatusSeen !== undefined
+        ? { mystarsUnknownStatusSeen: source.mystarsUnknownStatusSeen }
+        : {}),
+      ...(source.mystarsExpiresAt !== undefined
+        ? { mystarsExpiresAt: source.mystarsExpiresAt }
+        : {}),
+      ...(source.mystarsWholesaleCostUsdt !== undefined
+        ? { mystarsWholesaleCostUsdt: source.mystarsWholesaleCostUsdt }
+        : {}),
+      ...(source.mystarsCostUsdCents !== undefined
+        ? { mystarsCostUsdCents: source.mystarsCostUsdCents }
+        : {}),
+      ...(source.mystarsCurrency !== undefined
+        ? { mystarsCurrency: source.mystarsCurrency }
+        : {}),
+      ...(source.grossRevenueUsdCents !== undefined
+        ? { grossRevenueUsdCents: source.grossRevenueUsdCents }
+        : {}),
+      ...(source.providerFeeUsdCents !== undefined
+        ? { providerFeeUsdCents: source.providerFeeUsdCents }
+        : {}),
+      ...(source.tonNetworkFeeUsdCents !== undefined
+        ? { tonNetworkFeeUsdCents: source.tonNetworkFeeUsdCents }
+        : {}),
+      ...(source.netProfitUsdCents !== undefined
+        ? { netProfitUsdCents: source.netProfitUsdCents }
+        : {}),
+    };
+  }
+
+  private static async ensureFulfillmentCompletedTransaction(
+    order: Order,
+    details: string,
+    nowIso: string,
+  ): Promise<void> {
+    const existingTxs = await firestoreRepo.queryDocs<StoreTransaction>('transactions', {
+      where: [{ field: 'orderId', op: '==', value: order.orderId }],
+      limit: 50,
+    });
+    if (existingTxs.some((t) => t.type === 'fulfillment_completed')) {
+      return;
+    }
+    const txId = sanitizeDocId(`tx_fulfill_done_${order.orderId}`);
+    await firestoreRepo.setDoc<StoreTransaction>('transactions', txId, {
+      transactionId: txId,
+      orderId: order.orderId,
+      userId: order.userId,
+      type: 'fulfillment_completed',
+      amount: order.totalPriceUsdCents ?? order.totalPrice,
+      amountUsdCents: order.totalPriceUsdCents ?? order.totalPrice,
+      currency: order.currency || 'USD',
+      details: details.slice(0, 500),
+      createdAt: nowIso,
+    });
+  }
+
+  private static async flushRetainedProviderResultForOrder(
+    orderId: string,
+    bot?: Telegraf | null,
+  ): Promise<Order | null> {
+    const retained = this.retainedProviderResults.get(orderId);
+    if (!retained) {
+      return null;
+    }
+    const { claimedOrder, adapterResult, idempotencyKey, providerName } = retained;
+    const nowIso = new Date().toISOString();
+    const isAutoCompleted =
+      adapterResult.handledAutomatically && adapterResult.status === 'completed';
+    const resolvedRef =
+      adapterResult.externalReference ||
+      claimedOrder.mystarsOrderId ||
+      `${providerName}:${idempotencyKey}`;
+    const fallbackUpdates: Partial<Order> = {
+      ...this.extractMyStarsMetadataFromOrder(claimedOrder),
+      paymentStatus: isAutoCompleted ? 'completed' : claimedOrder.paymentStatus,
+      fulfillmentStatus: adapterResult.status,
+      fulfillmentNote: adapterResult.details.slice(0, 500),
+      externalExecutionReference: resolvedRef,
+      mystarsCreateInFlight: false,
+      mystarsAmbiguousPostAt: undefined,
+      fulfillmentLastError: undefined,
+      fulfillmentNextRetryAt: undefined,
+      ...(isAutoCompleted ? { completedAt: claimedOrder.completedAt || nowIso } : {}),
+      updatedAt: nowIso,
+    };
+
+    const recoveredDoc = await firestoreRepo.updateDoc<Order>(
+      'orders',
+      claimedOrder.orderId,
+      fallbackUpdates,
+    );
+    if (!recoveredDoc) {
+      return null;
+    }
+
+    if (isAutoCompleted) {
+      await this.ensureFulfillmentCompletedTransaction(
+        recoveredDoc,
+        `Автоматическая выдача завершена: ${adapterResult.details}`,
+        nowIso,
+      );
+    }
+
+    this.retainedProviderResults.delete(orderId);
+
+    let notified = await this.ensureAdminNotified(recoveredDoc, bot).catch(
+      () => recoveredDoc,
+    );
+    if (notified.fulfillmentStatus === 'completed') {
+      notified = await this.ensureBuyerNotified(notified, bot).catch(
+        () => notified,
+      );
+    }
+    return notified;
+  }
+
+  private static async flushAllRetainedProviderResults(
+    bot?: Telegraf | null,
+  ): Promise<Order[]> {
+    if (this.retainedProviderResults.size === 0) {
+      return [];
+    }
+    const flushedOrders: Order[] = [];
+    for (const orderId of Array.from(this.retainedProviderResults.keys())) {
+      try {
+        const flushed = await this.flushRetainedProviderResultForOrder(orderId, bot);
+        if (flushed) {
+          flushedOrders.push(flushed);
+        }
+      } catch (err) {
+        console.warn(
+          `[FulfillmentService] Отложенное сохранение результата провайдера для заказа #${orderId} пока не удалось:`,
+          redactSecretsFromText(err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+    return flushedOrders;
   }
 
   /**
@@ -278,6 +462,7 @@ export class FulfillmentService {
     this.checkpointLastError = null;
     this.checkpointConsecutiveFailures = 0;
     this.checkpointRetryAfterMs = 0;
+    this.retainedProviderResults.clear();
     this.resetNotificationRecoveryState();
   }
 
@@ -1725,6 +1910,21 @@ export class FulfillmentService {
           wasAmbiguousBeforeClaim: boolean;
         };
 
+    if (this.retainedProviderResults.has(orderInput.orderId)) {
+      try {
+        const flushed = await this.flushRetainedProviderResultForOrder(
+          orderInput.orderId,
+          bot,
+        );
+        if (flushed) {
+          Object.assign(orderInput, flushed);
+          return flushed;
+        }
+      } catch {
+        // Proceed with standard recovery / claim flow if flush could not complete
+      }
+    }
+
     // =========================================================================
     // PHASE 1: ATOMIC CLAIM BEFORE EXTERNAL ADAPTER CALL
     // =========================================================================
@@ -1922,6 +2122,13 @@ export class FulfillmentService {
         attempt,
       });
       const resolvedAdapterResult = adapterResult;
+      Object.assign(orderInput, this.extractMyStarsMetadataFromOrder(claimedOrder));
+      this.retainedProviderResults.set(claimedOrder.orderId, {
+        claimedOrder: { ...claimedOrder },
+        adapterResult: resolvedAdapterResult,
+        idempotencyKey: claimedOrder.fulfillmentIdempotencyKey || idempotencyKey,
+        providerName: activeAdapter.providerName,
+      });
 
       // =========================================================================
       // PHASE 3: PERSIST ADAPTER RESULT ATOMICALLY
@@ -1945,26 +2152,7 @@ export class FulfillmentService {
 
         const mergedBase: Order = {
           ...latest,
-          ...(claimedOrder.mystarsOrderId && !latest.mystarsOrderId
-            ? {
-                mystarsOrderId: claimedOrder.mystarsOrderId,
-                mystarsOrderStatus: claimedOrder.mystarsOrderStatus,
-                mystarsLastPolledAt: claimedOrder.mystarsLastPolledAt,
-                mystarsPollAttempts: claimedOrder.mystarsPollAttempts,
-                mystarsPayToAddress: claimedOrder.mystarsPayToAddress,
-                mystarsPaymentMemo: claimedOrder.mystarsPaymentMemo,
-                mystarsPaymentAmountUsdt: claimedOrder.mystarsPaymentAmountUsdt,
-                mystarsPurchaseTx: claimedOrder.mystarsPurchaseTx,
-                mystarsUnknownStatusSeen: claimedOrder.mystarsUnknownStatusSeen,
-                mystarsExpiresAt: claimedOrder.mystarsExpiresAt,
-                mystarsWholesaleCostUsdt: claimedOrder.mystarsWholesaleCostUsdt,
-                mystarsCostUsdCents: claimedOrder.mystarsCostUsdCents,
-                mystarsCurrency: claimedOrder.mystarsCurrency,
-                grossRevenueUsdCents: claimedOrder.grossRevenueUsdCents,
-                providerFeeUsdCents: claimedOrder.providerFeeUsdCents,
-                netProfitUsdCents: claimedOrder.netProfitUsdCents,
-              }
-            : {}),
+          ...this.extractMyStarsMetadataFromOrder(claimedOrder),
         };
 
         const updated: Order = {
@@ -2011,6 +2199,9 @@ export class FulfillmentService {
         return updated;
       });
 
+      this.retainedProviderResults.delete(claimedOrder.orderId);
+      Object.assign(orderInput, finalizedOrder);
+
       // =========================================================================
       // PHASE 4: SEND NOTIFICATIONS OUTSIDE TRANSACTION (FAULT-TOLERANT)
       // =========================================================================
@@ -2018,6 +2209,7 @@ export class FulfillmentService {
       if (notifiedOrder.fulfillmentStatus === 'completed') {
         notifiedOrder = await this.ensureBuyerNotified(notifiedOrder, bot);
       }
+      Object.assign(orderInput, notifiedOrder);
       return notifiedOrder;
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -2026,60 +2218,19 @@ export class FulfillmentService {
       // SUCCEEDED and the error occurred during Phase 3 database persistence (or notification).
       // Never mark the order as 'failed' with `mystarsCreateInFlight: false` after provider success!
       if (adapterResult !== null) {
-        const nowIso = new Date().toISOString();
-        const isAutoCompleted =
-          adapterResult.handledAutomatically && adapterResult.status === 'completed';
         const resolvedRef =
           adapterResult.externalReference ||
           claimedOrder.mystarsOrderId ||
           `${activeAdapter.providerName}:${idempotencyKey}`;
-        const fallbackUpdates: Partial<Order> = {
-          ...(claimedOrder.mystarsOrderId
-            ? {
-                mystarsOrderId: claimedOrder.mystarsOrderId,
-                mystarsOrderStatus: claimedOrder.mystarsOrderStatus,
-                mystarsLastPolledAt: claimedOrder.mystarsLastPolledAt || nowIso,
-                mystarsPayToAddress: claimedOrder.mystarsPayToAddress,
-                mystarsPaymentMemo: claimedOrder.mystarsPaymentMemo,
-                mystarsPaymentAmountUsdt: claimedOrder.mystarsPaymentAmountUsdt,
-                mystarsPurchaseTx: claimedOrder.mystarsPurchaseTx,
-                mystarsExpiresAt: claimedOrder.mystarsExpiresAt,
-                mystarsWholesaleCostUsdt: claimedOrder.mystarsWholesaleCostUsdt,
-                mystarsCostUsdCents: claimedOrder.mystarsCostUsdCents,
-                mystarsCurrency: claimedOrder.mystarsCurrency,
-                grossRevenueUsdCents: claimedOrder.grossRevenueUsdCents,
-                providerFeeUsdCents: claimedOrder.providerFeeUsdCents,
-                netProfitUsdCents: claimedOrder.netProfitUsdCents,
-              }
-            : {}),
-          paymentStatus: isAutoCompleted ? 'completed' : claimedOrder.paymentStatus,
-          fulfillmentStatus: adapterResult.status,
-          fulfillmentNote: adapterResult.details.slice(0, 500),
-          externalExecutionReference: resolvedRef,
-          mystarsCreateInFlight: false,
-          mystarsAmbiguousPostAt: undefined,
-          fulfillmentLastError: undefined,
-          fulfillmentNextRetryAt: undefined,
-          ...(isAutoCompleted ? { completedAt: claimedOrder.completedAt || nowIso } : {}),
-          updatedAt: nowIso,
-        };
 
         try {
-          const recoveredDoc = await firestoreRepo.updateDoc<Order>(
-            'orders',
+          const recoveredOrder = await this.flushRetainedProviderResultForOrder(
             claimedOrder.orderId,
-            fallbackUpdates,
+            bot,
           );
-          if (recoveredDoc) {
-            let notified = await this.ensureAdminNotified(recoveredDoc, bot).catch(
-              () => recoveredDoc,
-            );
-            if (notified.fulfillmentStatus === 'completed') {
-              notified = await this.ensureBuyerNotified(notified, bot).catch(
-                () => notified,
-              );
-            }
-            return notified;
+          if (recoveredOrder) {
+            Object.assign(orderInput, recoveredOrder);
+            return recoveredOrder;
           }
         } catch (fallbackErr) {
           console.error(
@@ -2092,7 +2243,8 @@ export class FulfillmentService {
 
         // If Firestore remains completely unreachable, throw the DB error while leaving
         // the Firestore order in its Phase 1 state ('processing' with mystarsCreateInFlight: true
-        // or persisted mystarsOrderId), so background recovery reconciles without duplicate POST.
+        // or persisted mystarsOrderId) and keeping the retained result in memory so background
+        // recovery reconciles without duplicate POST.
         throw error;
       }
 
@@ -2288,8 +2440,10 @@ export class FulfillmentService {
         const finalStatus = extStatus.status || 'completed';
         const reconciled = await firestoreRepo.runTransaction<Order>(async (tx) => {
           const current = (await tx.get<Order>('orders', staleOrder.orderId)) || staleOrder;
+          const wasAlreadyCompleted = current.fulfillmentStatus === 'completed';
           const updated: Order = {
             ...current,
+            ...this.extractMyStarsMetadataFromOrder(staleOrder),
             paymentStatus:
               finalStatus === 'completed' ? 'completed' : current.paymentStatus,
             fulfillmentStatus: finalStatus,
@@ -2309,6 +2463,22 @@ export class FulfillmentService {
             updatedAt: nowIso,
           };
           tx.set<Order>('orders', updated.orderId, updated);
+          if (finalStatus === 'completed' && !wasAlreadyCompleted) {
+            const txId = sanitizeDocId(`tx_fulfill_done_${updated.orderId}`);
+            tx.set<StoreTransaction>('transactions', txId, {
+              transactionId: txId,
+              orderId: updated.orderId,
+              userId: updated.userId,
+              type: 'fulfillment_completed',
+              amount: updated.totalPriceUsdCents ?? updated.totalPrice,
+              amountUsdCents: updated.totalPriceUsdCents ?? updated.totalPrice,
+              currency: updated.currency || 'USD',
+              details: `Автоматическая выдача восстановлена после сверки: ${
+                extStatus.details || updated.externalExecutionReference
+              }`.slice(0, 500),
+              createdAt: nowIso,
+            });
+          }
           return updated;
         });
 
@@ -2756,6 +2926,15 @@ export class FulfillmentService {
     const buyerNotifyAttemptedInPass = new Set<string>();
 
     try {
+      const flushedRetained = await this.flushAllRetainedProviderResults(bot);
+      for (const flushedOrd of flushedRetained) {
+        adminNotifyAttemptedInPass.add(flushedOrd.orderId);
+        if (flushedOrd.fulfillmentStatus === 'completed') {
+          buyerNotifyAttemptedInPass.add(flushedOrd.orderId);
+        }
+        recovered.push(flushedOrd);
+      }
+
       const nowMs = Date.now();
       const nowIso = new Date(nowMs).toISOString();
 
@@ -3047,6 +3226,8 @@ export class FulfillmentService {
     if (!activeAdapter.checkExternalStatus || !activeAdapter.isConfigured()) {
       return summary;
     }
+
+    await this.flushAllRetainedProviderResults(bot);
 
     const nowMs = Date.now();
     if (this.mystarsPollCooldownUntilMs > nowMs) {

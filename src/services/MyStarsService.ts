@@ -1668,8 +1668,13 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
         ...updates,
         updatedAt: new Date().toISOString(),
       });
-    } catch {
-      // Best-effort metadata persistence; main FulfillmentService transaction still runs
+    } catch (dbErr) {
+      const safeDbMsg = redactSecretsFromText(
+        dbErr instanceof Error ? dbErr.message : String(dbErr),
+      );
+      console.warn(
+        `[MyStars] Временная ошибка Firestore (updateDoc) при промежуточном сохранении метаданных (${updates.mystarsOrderId || order.mystarsOrderId || 'n/a'} для заказа #${order.orderId}): ${safeDbMsg}. Данные сохранены в памяти для фиксации в Phase 3 / recovery.`,
+      );
     }
   }
 
@@ -2083,28 +2088,27 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
         ? order.externalExecutionReference
         : undefined);
     if (existingMyStarsId) {
+      order.mystarsOrderId = existingMyStarsId;
       const existingCheck = await this.checkExternalStatus(
-        { ...order, mystarsOrderId: existingMyStarsId },
+        order,
         context?.idempotencyKey || order.fulfillmentIdempotencyKey || `fulfill_${order.orderId}`,
       );
       if (existingCheck.alreadyExecuted && existingCheck.status === 'completed') {
         return {
           handledAutomatically: true,
           status: 'completed',
-          externalReference: existingCheck.externalReference,
+          externalReference: existingCheck.externalReference || existingMyStarsId,
           details: existingCheck.details || `Выдача выполнена через MyStars (${existingMyStarsId}).`,
         };
       }
-      if (existingCheck.alreadyExecuted && existingCheck.status === 'processing') {
-        return {
-          handledAutomatically: false,
-          status: 'processing',
-          externalReference: existingCheck.externalReference,
-          details:
-            existingCheck.details ||
-            `Заказ MyStars ${existingMyStarsId} ожидает завершения выдачи.`,
-        };
-      }
+      return {
+        handledAutomatically: false,
+        status: 'processing',
+        externalReference: existingCheck.externalReference || existingMyStarsId,
+        details:
+          existingCheck.details ||
+          `Заказ MyStars ${existingMyStarsId} ожидает завершения выдачи.`,
+      };
     }
 
     // 2. Verify recipient eligibility via POST /v1/recipients/check
@@ -2183,17 +2187,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
     // Mutate caller's order reference in-memory immediately so FulfillmentService
     // always retains resolvedOrderId and MyStars metadata even if Firestore fails transiently.
     Object.assign(order, metadataUpdates);
-
-    try {
-      await this.persistMyStarsOrderMetadata(order, metadataUpdates);
-    } catch (dbErr) {
-      const safeDbMsg = redactSecretsFromText(
-        dbErr instanceof Error ? dbErr.message : String(dbErr),
-      );
-      console.warn(
-        `[MyStars] Временная ошибка Firestore при промежуточном сохранении метаданных после POST /v1/orders (${resolvedOrderId} для заказа #${order.orderId}): ${safeDbMsg}. Данные сохранены в памяти для фиксации в Phase 3 / recovery.`,
-      );
-    }
+    await this.persistMyStarsOrderMetadata(order, metadataUpdates);
 
     if (isUnknownStatus) {
       console.warn(

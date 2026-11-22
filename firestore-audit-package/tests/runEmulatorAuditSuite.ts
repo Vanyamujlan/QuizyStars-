@@ -32,6 +32,10 @@ import {
   FulfillmentProviderAdapter,
   ManualAdminFulfillmentAdapter,
 } from '../../src/services/FulfillmentService.ts';
+import {
+  MyStarsFulfillmentAdapter,
+  myStarsClient,
+} from '../../src/services/MyStarsService.ts';
 import { UserService } from '../../src/services/UserService.ts';
 import {
   AdminRecord,
@@ -1782,6 +1786,617 @@ async function main(): Promise<void> {
       const ordersAfter = await firestoreRepo.listDocs<Order>('orders', 500);
       assert.ok(ordersAfter.length >= 11);
       return 'Во время сбоя БД создание заказов и оплата безопасно блокируются (StorageUnavailableError), а после восстановления все заказы сохранены.';
+    },
+  );
+
+  await runCheck(
+    'CON-07',
+    'Concurrency',
+    'Stage 2.6.1 Scenario A: Concurrent fulfillment claim (MyStars POST /v1/orders)',
+    'Два воркера одновременно запускают initiateFulfillment на один оплаченный заказ в реальном Firestore Emulator; только один захватывает claim и вызывает POST /v1/orders',
+    async () => {
+      let postOrdersCalls = 0;
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_emu_scen_a_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 'emu_scen_a_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postOrdersCalls += 1;
+            await new Promise((r) => setTimeout(r, 40));
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_emu_scen_a_01',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 'emu_scen_a_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.30',
+                purchase_tx: '0x_emu_scen_a_tx',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in CON-07: ${req.method} ${req.url}`);
+        });
+
+        const scenAOrder: Order = {
+          orderId: 'ord_emu_s261_scen_a',
+          userId: 'tg_900001001',
+          userTelegramId: 900001001,
+          username: 'syn_alex_buyer',
+          recipientUsername: 'emu_scen_a_user',
+          productId: 'stars_pack_100',
+          productName: '100 Telegram Stars (Synthetic)',
+          category: 'stars',
+          quantity: 100,
+          totalPrice: 100,
+          totalPriceUsdCents: 185,
+          currency: 'XTR',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          telegramPaymentChargeId: 'chg_emu_s261_scen_a',
+          createdAt: '2026-11-22T10:00:00.000Z',
+          paidAt: '2026-11-22T10:00:05.000Z',
+          updatedAt: '2026-11-22T10:00:05.000Z',
+        };
+        await firestoreRepo.setDoc<Order>('orders', scenAOrder.orderId, scenAOrder);
+
+        const { bot } = createMockBot();
+        const [w1, w2] = await Promise.all([
+          FulfillmentService.initiateFulfillment({ ...scenAOrder }, bot),
+          FulfillmentService.initiateFulfillment({ ...scenAOrder }, bot),
+        ]);
+
+        assert.equal(postOrdersCalls, 1, 'В реальном Emulator POST /v1/orders должен быть вызван ровно 1 раз');
+        assert.ok(w1.fulfillmentStatus === 'completed' || w2.fulfillmentStatus === 'completed');
+        const finalDoc = await OrderService.getOrderById(scenAOrder.orderId);
+        assert.equal(finalDoc?.fulfillmentStatus, 'completed');
+        assert.equal(finalDoc?.mystarsOrderId, 'ord_ms_emu_scen_a_01');
+        assert.equal(finalDoc?.externalExecutionReference, 'ord_ms_emu_scen_a_01');
+        return `В реальном Firestore Emulator только 1 из 2 параллельных воркеров захватил claim: POST /v1/orders вызван ровно 1 раз (postOrdersCalls=${postOrdersCalls}).`;
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+        FulfillmentService.resetMyStarsPollingState();
+      }
+    },
+  );
+
+  await runCheck(
+    'CON-08',
+    'Concurrency',
+    'Stage 2.6.1 Scenario B: Concurrent polling lease (mystarsPollLease on Emulator)',
+    'Два воркера одновременно опрашивают один processing-заказ в реальном Firestore Emulator; только один захватывает mystarsPollLease, истёкший lease перехватывается',
+    async () => {
+      let getOrderCalls = 0;
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_emu_scen_b_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_emu_scen_b_02')) {
+            getOrderCalls += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_emu_scen_b_02',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 'emu_scen_b_user',
+                quantity: 100,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in CON-08: ${req.method} ${req.url}`);
+        });
+
+        const scenBOrder: Order = {
+          orderId: 'ord_emu_s261_scen_b',
+          userId: 'tg_900001001',
+          userTelegramId: 900001001,
+          username: 'syn_alex_buyer',
+          recipientUsername: 'emu_scen_b_user',
+          productId: 'stars_pack_100',
+          productName: '100 Telegram Stars (Synthetic)',
+          category: 'stars',
+          quantity: 100,
+          totalPrice: 100,
+          totalPriceUsdCents: 185,
+          currency: 'XTR',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ord_ms_emu_scen_b_02',
+          externalExecutionReference: 'ord_ms_emu_scen_b_02',
+          fulfillmentIdempotencyKey: 'fulfill_ord_emu_s261_scen_b',
+          telegramPaymentChargeId: 'chg_emu_s261_scen_b',
+          createdAt: '2026-11-22T10:01:00.000Z',
+          paidAt: '2026-11-22T10:01:05.000Z',
+          updatedAt: '2026-11-22T10:01:05.000Z',
+        };
+        await firestoreRepo.setDoc<Order>('orders', scenBOrder.orderId, scenBOrder);
+
+        const nowMs = Date.now();
+        const [l1, l2] = await Promise.all([
+          FulfillmentService.acquireOrderPollLease({
+            orderId: scenBOrder.orderId,
+            leaseOwner: 'emu_worker_1',
+            operationId: 'emu_op_1',
+            ttlMs: 30_000,
+            nowMs,
+          }),
+          FulfillmentService.acquireOrderPollLease({
+            orderId: scenBOrder.orderId,
+            leaseOwner: 'emu_worker_2',
+            operationId: 'emu_op_2',
+            ttlMs: 30_000,
+            nowMs,
+          }),
+        ]);
+        const acquiredCount = [l1, l2].filter((l) => l.acquired).length;
+        assert.equal(acquiredCount, 1, 'В реальном Emulator ровно 1 воркер захватывает mystarsPollLease');
+
+        // Reclaim after expiry
+        const reclaimed = await FulfillmentService.acquireOrderPollLease({
+          orderId: scenBOrder.orderId,
+          leaseOwner: 'emu_worker_2',
+          operationId: 'emu_op_2_reclaim',
+          ttlMs: 30_000,
+          nowMs: nowMs + 31_000,
+        });
+        assert.equal(reclaimed.acquired, true, 'Истёкший mystarsPollLease в Emulator успешно перехватывается');
+        await FulfillmentService.releaseOrderPollLease({
+          orderId: scenBOrder.orderId,
+          leaseOwner: 'emu_worker_2',
+          operationId: 'emu_op_2_reclaim',
+        });
+
+        const { bot } = createMockBot();
+        const pollRes = await FulfillmentService.pollMyStarsOrders(bot);
+        assert.ok(pollRes.polled >= 1);
+        assert.equal(getOrderCalls, 1, 'Выполнен ровно 1 запрос GET /v1/orders/{id} за окно lease');
+
+        await firestoreRepo.updateDoc<Order>('orders', scenBOrder.orderId, {
+          fulfillmentStatus: 'completed',
+          paymentStatus: 'completed',
+        });
+        return 'В реальном Firestore Emulator конкурирующий захват mystarsPollLease разрешён атомарно (acquired=1, GET=1, истёкший lease перехвачен).';
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+        FulfillmentService.resetMyStarsPollingState();
+      }
+    },
+  );
+
+  await runCheck(
+    'CON-09',
+    'Concurrency',
+    'Stage 2.6.1 Scenario C: Crash and recovery (ambiguous POST reconciliation on Emulator)',
+    'Заказ в processing с mystarsCreateInFlight=true после падения воркера восстанавливается через GET /v1/orders без дублирующего POST /v1/orders',
+    async () => {
+      let postCalls = 0;
+      let listCalls = 0;
+      let getDetailCalls = 0;
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_emu_scen_c_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        const crashIso = new Date(Date.now() - 120_000).toISOString();
+        const scenCOrder: Order = {
+          orderId: 'ord_emu_s261_scen_c',
+          userId: 'tg_900001001',
+          userTelegramId: 900001001,
+          username: 'syn_alex_buyer',
+          recipientUsername: 'emu_scen_c_crash_user',
+          productId: 'stars_pack_100',
+          productName: '100 Telegram Stars (Synthetic)',
+          category: 'stars',
+          quantity: 100,
+          totalPrice: 100,
+          totalPriceUsdCents: 185,
+          currency: 'XTR',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: crashIso,
+          fulfillmentAttempts: 1,
+          fulfillmentIdempotencyKey: 'fulfill_ord_emu_s261_scen_c',
+          mystarsCreateInFlight: true,
+          telegramPaymentChargeId: 'chg_emu_s261_scen_c',
+          createdAt: crashIso,
+          paidAt: crashIso,
+          updatedAt: crashIso,
+        };
+        await firestoreRepo.setDoc<Order>('orders', scenCOrder.orderId, scenCOrder);
+
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCalls += 1;
+            throw new Error('Duplicate POST /v1/orders must not be called in CON-09');
+          }
+          if (req.method === 'GET' && /\/v1\/orders(\?|$)/.test(req.url)) {
+            listCalls += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                orders: [
+                  {
+                    order_id: 'ord_ms_emu_scen_c_reconciled',
+                    status: 'completed',
+                    type: 'stars',
+                    recipient_username: 'emu_scen_c_crash_user',
+                    quantity: 100,
+                    created_at: new Date(Date.now() - 90_000).toISOString(),
+                    updated_at: new Date().toISOString(),
+                  },
+                ],
+                total: 1,
+                page: 1,
+                limit: 50,
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_emu_scen_c_reconciled')) {
+            getDetailCalls += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_emu_scen_c_reconciled',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 'emu_scen_c_crash_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.30',
+                purchase_tx: '0x_emu_scen_c_tx',
+                created_at: new Date(Date.now() - 90_000).toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in CON-09: ${req.method} ${req.url}`);
+        });
+
+        const { bot } = createMockBot();
+        await FulfillmentService.recoverPendingFulfillments(bot);
+
+        assert.equal(listCalls, 1, 'Выполнена сверка GET /v1/orders');
+        assert.equal(getDetailCalls, 1, 'Выполнена проверка GET /v1/orders/{id}');
+        assert.equal(postCalls, 0, 'Повторный POST /v1/orders не вызывался (0 дублей)');
+
+        const afterC = await OrderService.getOrderById(scenCOrder.orderId);
+        assert.equal(afterC?.mystarsOrderId, 'ord_ms_emu_scen_c_reconciled');
+        assert.equal(afterC?.fulfillmentStatus, 'completed');
+        assert.equal(afterC?.mystarsCreateInFlight, false);
+        return 'После падения воркера с mystarsCreateInFlight=true в Emulator выполнена сверка GET /v1/orders и завершение заказа без повторного POST (postCalls=0).';
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+        FulfillmentService.resetMyStarsPollingState();
+      }
+    },
+  );
+
+  await runCheck(
+    'CON-10',
+    'Concurrency',
+    'Stage 2.6.1 Scenario D & S261-01: Cursor transaction behavior and post-POST updateDoc failure on Emulator',
+    'Проверка курсорных транзакций polling и отказа updateDoc в persistMyStarsOrderMetadata (+ отказа Phase 3 runTransaction) на реальном Firestore Emulator',
+    async () => {
+      let postCalls = 0;
+      let getCalls = 0;
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_emu_scen_d_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      const origUpdateDoc = firestoreRepo.updateDoc.bind(firestoreRepo);
+      const origRunTx = firestoreRepo.runTransaction.bind(firestoreRepo);
+
+      try {
+        const scenDOrder: Order = {
+          orderId: 'ord_emu_s261_updatedoc_fail',
+          userId: 'tg_900001001',
+          userTelegramId: 900001001,
+          username: 'syn_alex_buyer',
+          recipientUsername: 'emu_scen_d_user',
+          productId: 'stars_pack_100',
+          productName: '100 Telegram Stars (Synthetic)',
+          category: 'stars',
+          quantity: 100,
+          totalPrice: 100,
+          totalPriceUsdCents: 185,
+          currency: 'XTR',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          telegramPaymentChargeId: 'chg_emu_s261_scen_d',
+          createdAt: '2026-11-22T10:05:00.000Z',
+          paidAt: '2026-11-22T10:05:05.000Z',
+          updatedAt: '2026-11-22T10:05:05.000Z',
+        };
+        await firestoreRepo.setDoc<Order>('orders', scenDOrder.orderId, scenDOrder);
+
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 'emu_scen_d_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCalls += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_emu_s261_d_01',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 'emu_scen_d_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.30',
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_emu_s261_d_01')) {
+            getCalls += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_emu_s261_d_01',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 'emu_scen_d_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.30',
+                purchase_tx: '0x_emu_s261_d_tx',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in CON-10: ${req.method} ${req.url}`);
+        });
+
+        let updateDocFailed = false;
+        let phase3TxFailed = false;
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          async <T extends object>(
+            collectionName: Parameters<typeof origUpdateDoc>[0],
+            docId: string,
+            partialData: Partial<T>,
+          ): Promise<T | null> => {
+            if (
+              collectionName === 'orders' &&
+              docId === scenDOrder.orderId &&
+              !updateDocFailed &&
+              (partialData as Partial<Order>).mystarsOrderId === 'ord_ms_emu_s261_d_01' &&
+              (partialData as Partial<Order>).fulfillmentStatus === undefined
+            ) {
+              updateDocFailed = true;
+              throw new Error('Simulated Emulator updateDoc failure in persistMyStarsOrderMetadata');
+            }
+            return origUpdateDoc<T>(collectionName, docId, partialData);
+          };
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            if (postCalls === 1 && updateDocFailed && !phase3TxFailed) {
+              phase3TxFailed = true;
+              throw new Error('Simulated Emulator Phase 3 runTransaction failure');
+            }
+            return origRunTx(fn);
+          };
+
+        const { bot } = createMockBot();
+        const afterInit = await FulfillmentService.initiateFulfillment(scenDOrder, bot);
+        assert.equal(updateDocFailed, true);
+        assert.equal(phase3TxFailed, true);
+        assert.equal(postCalls, 1);
+        assert.equal(afterInit.mystarsOrderId, 'ord_ms_emu_s261_d_01');
+        assert.equal(afterInit.fulfillmentStatus, 'processing');
+
+        // Next recovery pass polls GET /v1/orders/{id} on Emulator and completes with 0 duplicate POSTs
+        await FulfillmentService.recoverPendingFulfillments(bot);
+        assert.equal(postCalls, 1, 'В Emulator повторный POST /v1/orders не вызывался');
+        assert.equal(getCalls, 1, 'В Emulator выполнен ровно 1 запрос GET /v1/orders/{id}');
+
+        const completedDoc = await OrderService.getOrderById(scenDOrder.orderId);
+        assert.equal(completedDoc?.fulfillmentStatus, 'completed');
+        assert.equal(completedDoc?.mystarsOrderId, 'ord_ms_emu_s261_d_01');
+        return 'В реальном Firestore Emulator сбой updateDoc в persistMyStarsOrderMetadata + сбой Phase 3 runTransaction сохранили mystarsOrderId из памяти и завершили заказ через polling без повторного POST (postCalls=1, getCalls=1).';
+      } finally {
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTx;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+        FulfillmentService.resetMyStarsPollingState();
+      }
+    },
+  );
+
+  await runCheck(
+    'CON-11',
+    'Concurrency',
+    'Stage 2.6.1 Scenario D: Cursor pagination and transaction conflict/retry behavior on Emulator',
+    'Проверка курсорной пагинации polling и устойчивости к конфликту транзакций (ABORTED) на settings/mystars_poll_cursor в реальном Firestore Emulator без дублирования внешних вызовов',
+    async () => {
+      let getCalls = 0;
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_emu_cursor_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+      FulfillmentService.pollBatchBudget = 2;
+      FulfillmentService.pollPageSize = 2;
+
+      const origRunTx = firestoreRepo.runTransaction.bind(firestoreRepo);
+      let injectedAbort = false;
+
+      try {
+        // Ensure all existing orders are non-processing before seeding 4 cursor test orders
+        const existingOrders = await firestoreRepo.listDocs<Order>('orders', 500);
+        for (const o of existingOrders) {
+          if (o.fulfillmentStatus === 'processing') {
+            await firestoreRepo.updateDoc<Order>('orders', o.orderId, {
+              fulfillmentStatus: 'completed',
+              paymentStatus: 'completed',
+            });
+          }
+        }
+
+        for (let i = 1; i <= 4; i++) {
+          const ts = new Date(Date.UTC(2026, 10, 22, 11, 0, i)).toISOString();
+          const ord: Order = {
+            orderId: `ord_emu_s261_cursor_${i}`,
+            userId: 'tg_900001001',
+            userTelegramId: 900001001,
+            username: 'syn_alex_buyer',
+            recipientUsername: `emu_cursor_u_${i}`,
+            productId: 'stars_pack_100',
+            productName: '100 Telegram Stars (Synthetic)',
+            category: 'stars',
+            quantity: 100,
+            totalPrice: 100,
+            totalPriceUsdCents: 185,
+            currency: 'XTR',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: `ord_ms_emu_cur_${i}`,
+            externalExecutionReference: `ord_ms_emu_cur_${i}`,
+            telegramPaymentChargeId: `chg_emu_cur_${i}`,
+            createdAt: ts,
+            paidAt: ts,
+            updatedAt: ts,
+          };
+          await firestoreRepo.setDoc<Order>('orders', ord.orderId, ord);
+        }
+
+        myStarsClient.setHttpTransport(async (req) => {
+          const m = req.url.match(/\/v1\/orders\/(ord_ms_emu_cur_\d+)/);
+          if (req.method === 'GET' && m) {
+            getCalls += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: m[1],
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 'emu_cursor_u',
+                quantity: 100,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in CON-11: ${req.method} ${req.url}`);
+        });
+
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            if (!injectedAbort && getCalls === 2) {
+              injectedAbort = true;
+              const abortErr = new Error('10 ABORTED: Contention on settings/mystars_poll_cursor in Emulator');
+              (abortErr as Error & { code?: string }).code = 'aborted';
+              throw abortErr;
+            }
+            return origRunTx(fn);
+          };
+
+        const { bot } = createMockBot();
+        const tick1 = await FulfillmentService.pollMyStarsOrders(bot);
+        assert.equal(injectedAbort, true);
+        assert.equal(tick1.checkpointSaved, true);
+        assert.equal(tick1.polled, 2);
+        assert.equal(getCalls, 2, 'Конфликт транзакции курсора в Emulator повторен без повторного внешнего API вызова');
+
+        const tick2 = await FulfillmentService.pollMyStarsOrders(bot);
+        assert.equal(tick2.polled, 2);
+        assert.equal(getCalls, 4, 'Второй тик в Emulator продолжил со следующей страницы курсора');
+        return 'В реальном Firestore Emulator курсорные транзакции settings/mystars_poll_cursor и retry после ABORTED работают корректно без повторных внешних API вызовов (getCalls=4 за 2 тика).';
+      } finally {
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTx;
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+        FulfillmentService.resetMyStarsPollingState();
+      }
     },
   );
 

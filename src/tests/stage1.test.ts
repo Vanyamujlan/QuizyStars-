@@ -19153,6 +19153,1089 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  await runTest(
+    'S261-01',
+    'Fulfillment',
+    'Stage 2.6.1 (1/2): Сбой firestoreRepo.updateDoc в persistMyStarsOrderMetadata после успешного POST /v1/orders (+ сбой Phase 3 runTransaction) для статусов completed и awaiting_payment/processing без повторного POST',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s261_secret_token_999',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      const origUpdateDoc = firestoreRepo.updateDoc.bind(firestoreRepo);
+      const origRunTransaction = firestoreRepo.runTransaction.bind(firestoreRepo);
+
+      try {
+        // =====================================================================
+        // SUB-CASE A0: POST /v1/orders returns status='completed',
+        // ONLY firestoreRepo.updateDoc() inside persistMyStarsOrderMetadata() FAILS,
+        // and flow continues normally through requestFulfillment() and initiateFulfillment() Phase 3
+        // =====================================================================
+        let postCallsA0 = 0;
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's261_completed_direct_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCallsA0 += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_completed_direct_00',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_completed_direct_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.35',
+                purchase_tx: '0x_s261_completed_direct_hash',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Sub-case A0: ${req.method} ${req.url}`);
+        });
+
+        const ordA0 = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 100,
+          recipientUsername: 's261_completed_direct_user',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordA0.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          paidAt: new Date().toISOString(),
+        });
+        const readyOrdA0 = (await OrderService.getOrderById(ordA0.orderId))!;
+        let persistMetadataUpdateFailedA0 = false;
+
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          async <T extends object>(
+            collectionName: Parameters<typeof origUpdateDoc>[0],
+            docId: string,
+            partialData: Partial<T>,
+          ): Promise<T | null> => {
+            if (
+              collectionName === 'orders' &&
+              docId === ordA0.orderId &&
+              !persistMetadataUpdateFailedA0 &&
+              (partialData as Partial<Order>).mystarsOrderId === 'ord_ms_s261_completed_direct_00' &&
+              (partialData as Partial<Order>).fulfillmentStatus === undefined
+            ) {
+              persistMetadataUpdateFailedA0 = true;
+              throw new Error('Simulated Firestore updateDoc failure in persistMyStarsOrderMetadata (A0)');
+            }
+            return origUpdateDoc<T>(collectionName, docId, partialData);
+          };
+
+        const resA0 = await FulfillmentService.initiateFulfillment(readyOrdA0, mockBot);
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+
+        assert.equal(persistMetadataUpdateFailedA0, true, 'updateDoc в persistMyStarsOrderMetadata должен был выбросить ошибку (A0)');
+        assert.equal(postCallsA0, 1);
+        assert.equal(resA0.fulfillmentStatus, 'completed');
+        assert.equal(resA0.paymentStatus, 'completed');
+        assert.equal(resA0.mystarsOrderId, 'ord_ms_s261_completed_direct_00');
+        assert.equal(resA0.externalExecutionReference, 'ord_ms_s261_completed_direct_00');
+        assert.equal(resA0.mystarsCreateInFlight, false);
+
+        const storedA0 = (await OrderService.getOrderById(ordA0.orderId))!;
+        assert.equal(storedA0.fulfillmentStatus, 'completed');
+        assert.equal(storedA0.mystarsOrderId, 'ord_ms_s261_completed_direct_00');
+        assert.equal(storedA0.externalExecutionReference, 'ord_ms_s261_completed_direct_00');
+        assert.equal(storedA0.mystarsCreateInFlight, false);
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        await FulfillmentService.initiateFulfillment(storedA0, mockBot);
+        assert.equal(postCallsA0, 1);
+
+        // =====================================================================
+        // SUB-CASE B0: POST /v1/orders returns active status ('awaiting_payment'),
+        // ONLY firestoreRepo.updateDoc() inside persistMyStarsOrderMetadata() FAILS,
+        // and flow continues normally through requestFulfillment() and initiateFulfillment() Phase 3
+        // =====================================================================
+        let postCallsB0 = 0;
+        let getCallsB0 = 0;
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's261_active_direct_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCallsB0 += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_active_direct_00',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's261_active_direct_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.35',
+                pay_to_address: 'UQ_S261_B0_ADDR',
+                payment_memo: 'S261_B0_MEMO',
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_s261_active_direct_00')) {
+            getCallsB0 += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_active_direct_00',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_active_direct_user',
+                quantity: 100,
+                purchase_tx: '0x_s261_b0_done',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Sub-case B0: ${req.method} ${req.url}`);
+        });
+
+        const ordB0 = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 100,
+          recipientUsername: 's261_active_direct_user',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordB0.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          paidAt: new Date().toISOString(),
+        });
+        const readyOrdB0 = (await OrderService.getOrderById(ordB0.orderId))!;
+        let persistMetadataUpdateFailedB0 = false;
+
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          async <T extends object>(
+            collectionName: Parameters<typeof origUpdateDoc>[0],
+            docId: string,
+            partialData: Partial<T>,
+          ): Promise<T | null> => {
+            if (
+              collectionName === 'orders' &&
+              docId === ordB0.orderId &&
+              !persistMetadataUpdateFailedB0 &&
+              (partialData as Partial<Order>).mystarsOrderId === 'ord_ms_s261_active_direct_00' &&
+              (partialData as Partial<Order>).fulfillmentStatus === undefined
+            ) {
+              persistMetadataUpdateFailedB0 = true;
+              throw new Error('Simulated Firestore updateDoc failure in persistMyStarsOrderMetadata (B0)');
+            }
+            return origUpdateDoc<T>(collectionName, docId, partialData);
+          };
+
+        const resB0 = await FulfillmentService.initiateFulfillment(readyOrdB0, mockBot);
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+
+        assert.equal(persistMetadataUpdateFailedB0, true, 'updateDoc в persistMyStarsOrderMetadata должен был выбросить ошибку (B0)');
+        assert.equal(postCallsB0, 1);
+        assert.equal(resB0.fulfillmentStatus, 'processing', 'Активный заказ MyStars остаётся в processing, а не в failed');
+        assert.equal(resB0.paymentStatus, 'paid');
+        assert.equal(resB0.mystarsOrderId, 'ord_ms_s261_active_direct_00');
+        assert.equal(resB0.externalExecutionReference, 'ord_ms_s261_active_direct_00');
+        assert.equal(resB0.mystarsCreateInFlight, false);
+
+        const storedB0 = (await OrderService.getOrderById(ordB0.orderId))!;
+        assert.equal(storedB0.fulfillmentStatus, 'processing');
+        assert.equal(storedB0.mystarsOrderId, 'ord_ms_s261_active_direct_00');
+        assert.equal(storedB0.externalExecutionReference, 'ord_ms_s261_active_direct_00');
+        assert.equal(storedB0.mystarsCreateInFlight, false);
+
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(postCallsB0, 1, 'Повторный POST /v1/orders не вызывается (B0)');
+        assert.equal(getCallsB0, 1, 'Заказ опрашивается через GET /v1/orders/{id} (B0)');
+        const doneB0 = (await OrderService.getOrderById(ordB0.orderId))!;
+        assert.equal(doneB0.fulfillmentStatus, 'completed');
+        assert.equal(doneB0.paymentStatus, 'completed');
+
+        // =====================================================================
+        // SUB-CASE A: POST /v1/orders returns status='completed',
+        // persistMyStarsOrderMetadata updateDoc FAILS, AND Phase 3 runTransaction FAILS
+        // =====================================================================
+        let postCallsA = 0;
+        let getOrderCallsA = 0;
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's261_completed_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCallsA += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_completed_01',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_completed_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.35',
+                purchase_tx: '0x_s261_completed_hash',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_s261_completed_01')) {
+            getOrderCallsA += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_completed_01',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_completed_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.35',
+                purchase_tx: '0x_s261_completed_hash',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Sub-case A: ${req.method} ${req.url}`);
+        });
+
+        const ordA = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 100,
+          recipientUsername: 's261_completed_user',
+        });
+        await firestoreRepo.setDoc<PaymentRecord>('payments', `pay_${ordA.orderId}`, {
+          paymentId: `pay_${ordA.orderId}`,
+          orderId: ordA.orderId,
+          userId: ordA.userId,
+          userTelegramId: ordA.userTelegramId,
+          provider: 'telegram_stars',
+          status: 'paid',
+          totalAmount: ordA.totalPrice,
+          expectedUsdCents: ordA.totalPriceUsdCents ?? 185,
+          feeUsdCents: 0,
+          netUsdCents: ordA.totalPriceUsdCents ?? 185,
+          expectedAmountStr: '1.85',
+          currency: ordA.currency,
+          invoicePayload: ordA.orderId,
+          telegramPaymentChargeId: `chg_${ordA.orderId}`,
+          createdAt: new Date().toISOString(),
+          confirmedAt: new Date().toISOString(),
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordA.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          paidAt: new Date().toISOString(),
+        });
+        const readyOrdA = (await OrderService.getOrderById(ordA.orderId))!;
+
+        let persistMetadataUpdateFailedA = false;
+        let phase3TxFailedA = false;
+
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          async <T extends object>(
+            collectionName: Parameters<typeof origUpdateDoc>[0],
+            docId: string,
+            partialData: Partial<T>,
+          ): Promise<T | null> => {
+            if (
+              collectionName === 'orders' &&
+              docId === ordA.orderId &&
+              !persistMetadataUpdateFailedA &&
+              (partialData as Partial<Order>).mystarsOrderId === 'ord_ms_s261_completed_01' &&
+              (partialData as Partial<Order>).fulfillmentStatus === undefined
+            ) {
+              persistMetadataUpdateFailedA = true;
+              throw new Error('Simulated Firestore updateDoc failure in persistMyStarsOrderMetadata (A)');
+            }
+            return origUpdateDoc<T>(collectionName, docId, partialData);
+          };
+
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            if (postCallsA === 1 && persistMetadataUpdateFailedA && !phase3TxFailedA) {
+              phase3TxFailedA = true;
+              throw new Error('Simulated Firestore Phase 3 runTransaction failure after updateDoc failure (A)');
+            }
+            return origRunTransaction(fn);
+          };
+
+        const recoveredA = await FulfillmentService.initiateFulfillment(readyOrdA, mockBot);
+        assert.equal(persistMetadataUpdateFailedA, true, 'updateDoc в persistMyStarsOrderMetadata должен был упасть');
+        assert.equal(phase3TxFailedA, true, 'Phase 3 runTransaction должен был упасть');
+        assert.equal(postCallsA, 1, 'POST /v1/orders должен быть вызван ровно 1 раз');
+
+        // In-memory order reference and persisted Firestore order both retain mystarsOrderId & completed state
+        assert.equal(readyOrdA.mystarsOrderId, 'ord_ms_s261_completed_01');
+        assert.equal(recoveredA.mystarsOrderId, 'ord_ms_s261_completed_01');
+        assert.equal(recoveredA.externalExecutionReference, 'ord_ms_s261_completed_01');
+        assert.equal(recoveredA.fulfillmentStatus, 'completed');
+        assert.equal(recoveredA.paymentStatus, 'completed');
+        assert.equal(recoveredA.mystarsCreateInFlight, false);
+
+        const storedA = (await OrderService.getOrderById(ordA.orderId))!;
+        assert.equal(storedA.mystarsOrderId, 'ord_ms_s261_completed_01');
+        assert.equal(storedA.externalExecutionReference, 'ord_ms_s261_completed_01');
+        assert.equal(storedA.mystarsOrderStatus, 'completed');
+        assert.equal(storedA.mystarsPurchaseTx, '0x_s261_completed_hash');
+        assert.equal(storedA.fulfillmentStatus, 'completed');
+        assert.equal(storedA.paymentStatus, 'completed');
+        assert.equal(storedA.mystarsCreateInFlight, false);
+        assert.equal(storedA.mystarsCostUsdCents, 135);
+
+        // Next recovery cycles must NOT issue another POST /v1/orders
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        await FulfillmentService.initiateFulfillment(storedA, mockBot);
+        assert.equal(postCallsA, 1, 'Повторный POST /v1/orders после восстановления недопустим');
+        assert.equal(getOrderCallsA, 0);
+
+        const txsA = (await firestoreRepo.listDocs<StoreTransaction>('transactions')).filter(
+          (t) => t.orderId === ordA.orderId && t.type === 'fulfillment_completed',
+        );
+        assert.equal(txsA.length, 1, 'Должна быть ровно 1 транзакция fulfillment_completed');
+        const paymentsA = (await firestoreRepo.listDocs<PaymentRecord>('payments')).filter(
+          (p) => p.orderId === ordA.orderId,
+        );
+        assert.equal(paymentsA.length, 1, 'PaymentRecord не должен дублироваться или повреждаться');
+
+        // =====================================================================
+        // SUB-CASE B: POST /v1/orders returns status='awaiting_payment',
+        // persistMyStarsOrderMetadata updateDoc FAILS, AND Phase 3 runTransaction FAILS,
+        // then subsequent recovery cycle polls GET /v1/orders/{id} to completion with 0 duplicate POSTs
+        // =====================================================================
+        let postCallsB = 0;
+        let getOrderCallsB = 0;
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's261_processing_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCallsB += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_processing_02',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's261_processing_user',
+                quantity: 150,
+                currency: 'usdt_ton',
+                payment_amount: '1.95',
+                pay_to_address: 'UQ_S261_TON_ADDR',
+                payment_memo: 'S261_MEMO_02',
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_s261_processing_02')) {
+            getOrderCallsB += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_processing_02',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_processing_user',
+                quantity: 150,
+                currency: 'usdt_ton',
+                payment_amount: '1.95',
+                purchase_tx: '0x_s261_polled_done_hash',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Sub-case B: ${req.method} ${req.url}`);
+        });
+
+        const ordB = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 150,
+          recipientUsername: 's261_processing_user',
+        });
+        await firestoreRepo.setDoc<PaymentRecord>('payments', `pay_${ordB.orderId}`, {
+          paymentId: `pay_${ordB.orderId}`,
+          orderId: ordB.orderId,
+          userId: ordB.userId,
+          userTelegramId: ordB.userTelegramId,
+          provider: 'telegram_stars',
+          status: 'paid',
+          totalAmount: ordB.totalPrice,
+          expectedUsdCents: ordB.totalPriceUsdCents ?? 275,
+          feeUsdCents: 0,
+          netUsdCents: ordB.totalPriceUsdCents ?? 275,
+          expectedAmountStr: '2.75',
+          currency: ordB.currency,
+          invoicePayload: ordB.orderId,
+          telegramPaymentChargeId: `chg_${ordB.orderId}`,
+          createdAt: new Date().toISOString(),
+          confirmedAt: new Date().toISOString(),
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordB.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          paidAt: new Date().toISOString(),
+        });
+        const readyOrdB = (await OrderService.getOrderById(ordB.orderId))!;
+
+        let persistMetadataUpdateFailedB = false;
+        let phase3TxFailedB = false;
+
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          async <T extends object>(
+            collectionName: Parameters<typeof origUpdateDoc>[0],
+            docId: string,
+            partialData: Partial<T>,
+          ): Promise<T | null> => {
+            if (
+              collectionName === 'orders' &&
+              docId === ordB.orderId &&
+              !persistMetadataUpdateFailedB &&
+              (partialData as Partial<Order>).mystarsOrderId === 'ord_ms_s261_processing_02' &&
+              (partialData as Partial<Order>).fulfillmentStatus === undefined
+            ) {
+              persistMetadataUpdateFailedB = true;
+              throw new Error('Simulated Firestore updateDoc failure in persistMyStarsOrderMetadata (B)');
+            }
+            return origUpdateDoc<T>(collectionName, docId, partialData);
+          };
+
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            if (postCallsB === 1 && persistMetadataUpdateFailedB && !phase3TxFailedB) {
+              phase3TxFailedB = true;
+              throw new Error('Simulated Firestore Phase 3 runTransaction failure after updateDoc failure (B)');
+            }
+            return origRunTransaction(fn);
+          };
+
+        const recoveredB = await FulfillmentService.initiateFulfillment(readyOrdB, mockBot);
+        assert.equal(persistMetadataUpdateFailedB, true);
+        assert.equal(phase3TxFailedB, true);
+        assert.equal(postCallsB, 1);
+
+        // Retained in memory & persisted via fallback recovery as processing (never marked failed!)
+        assert.equal(readyOrdB.mystarsOrderId, 'ord_ms_s261_processing_02');
+        assert.equal(recoveredB.mystarsOrderId, 'ord_ms_s261_processing_02');
+        assert.equal(recoveredB.externalExecutionReference, 'ord_ms_s261_processing_02');
+        assert.equal(recoveredB.fulfillmentStatus, 'processing');
+        assert.equal(recoveredB.paymentStatus, 'paid');
+        assert.equal(recoveredB.mystarsCreateInFlight, false);
+
+        const storedB = (await OrderService.getOrderById(ordB.orderId))!;
+        assert.equal(storedB.mystarsOrderId, 'ord_ms_s261_processing_02');
+        assert.equal(storedB.externalExecutionReference, 'ord_ms_s261_processing_02');
+        assert.equal(storedB.mystarsOrderStatus, 'awaiting_payment');
+        assert.equal(storedB.mystarsPayToAddress, 'UQ_S261_TON_ADDR');
+        assert.equal(storedB.mystarsPaymentMemo, 'S261_MEMO_02');
+        assert.equal(storedB.fulfillmentStatus, 'processing');
+        assert.equal(storedB.paymentStatus, 'paid');
+        assert.equal(storedB.mystarsCreateInFlight, false);
+
+        // Next recovery cycle polls GET /v1/orders/ord_ms_s261_processing_02 without calling POST /v1/orders
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(postCallsB, 1, 'POST /v1/orders не должен вызываться повторно на следующем цикле recovery');
+        assert.equal(getOrderCallsB, 1, 'Фоновый polling должен опросить GET /v1/orders/{id}');
+
+        const completedB = (await OrderService.getOrderById(ordB.orderId))!;
+        assert.equal(completedB.fulfillmentStatus, 'completed');
+        assert.equal(completedB.paymentStatus, 'completed');
+        assert.equal(completedB.mystarsOrderId, 'ord_ms_s261_processing_02');
+        assert.equal(completedB.externalExecutionReference, 'ord_ms_s261_processing_02');
+
+        const txsB = (await firestoreRepo.listDocs<StoreTransaction>('transactions')).filter(
+          (t) => t.orderId === ordB.orderId && t.type === 'fulfillment_completed',
+        );
+        assert.equal(txsB.length, 1);
+
+        // =====================================================================
+        // SUB-CASE C: Total temporary Firestore write outage after POST /v1/orders
+        // (persistMyStarsOrderMetadata updateDoc, Phase 3 runTransaction, AND fallback updateDoc ALL fail),
+        // then Firestore recovers before recoverPendingFulfillments
+        // =====================================================================
+        let postCallsC = 0;
+        let getOrderCallsC = 0;
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's261_outage_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCallsC += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_outage_03',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's261_outage_user',
+                quantity: 200,
+                currency: 'usdt_ton',
+                payment_amount: '2.60',
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_s261_outage_03')) {
+            getOrderCallsC += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s261_outage_03',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_outage_user',
+                quantity: 200,
+                currency: 'usdt_ton',
+                payment_amount: '2.60',
+                purchase_tx: '0x_s261_outage_recovered_hash',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Sub-case C: ${req.method} ${req.url}`);
+        });
+
+        // Restore real methods to seed ordC
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTransaction;
+
+        const ordC = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 200,
+          recipientUsername: 's261_outage_user',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordC.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          paidAt: new Date().toISOString(),
+        });
+        const readyOrdC = (await OrderService.getOrderById(ordC.orderId))!;
+
+        let failAllWritesAfterPostC = true;
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          async <T extends object>(
+            collectionName: Parameters<typeof origUpdateDoc>[0],
+            docId: string,
+            partialData: Partial<T>,
+          ): Promise<T | null> => {
+            if (collectionName === 'orders' && docId === ordC.orderId && postCallsC === 1 && failAllWritesAfterPostC) {
+              throw new Error('Simulated total Firestore updateDoc outage after POST (C)');
+            }
+            return origUpdateDoc<T>(collectionName, docId, partialData);
+          };
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            if (postCallsC === 1 && failAllWritesAfterPostC) {
+              throw new Error('Simulated total Firestore runTransaction outage after POST (C)');
+            }
+            return origRunTransaction(fn);
+          };
+
+        await assert.rejects(
+          async () => {
+            await FulfillmentService.initiateFulfillment(readyOrdC, mockBot);
+          },
+          /Simulated total Firestore runTransaction outage after POST \(C\)/,
+        );
+
+        // Caller's in-memory order object retains mystarsOrderId even when all DB writes failed
+        assert.equal(readyOrdC.mystarsOrderId, 'ord_ms_s261_outage_03');
+        assert.equal(readyOrdC.mystarsOrderStatus, 'awaiting_payment');
+
+        // In Firestore, the order remains in Phase 1 ('processing', mystarsCreateInFlight: true),
+        // NEVER marked 'failed' and NEVER resetting mystarsCreateInFlight=false in an ambiguous unpersisted state
+        const duringOutageC = (await OrderService.getOrderById(ordC.orderId))!;
+        assert.equal(duringOutageC.fulfillmentStatus, 'processing');
+        assert.equal(duringOutageC.mystarsCreateInFlight, true);
+
+        // Firestore recovers -> recoverPendingFulfillments flushes retained provider result and polls GET /v1/orders/{id}
+        failAllWritesAfterPostC = false;
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTransaction;
+
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(postCallsC, 1, 'После восстановления БД повторный POST /v1/orders не вызывается');
+        assert.equal(getOrderCallsC, 1, 'Заказ доводится до completed через GET /v1/orders/{id}');
+
+        const afterRecoveryC = (await OrderService.getOrderById(ordC.orderId))!;
+        assert.equal(afterRecoveryC.mystarsOrderId, 'ord_ms_s261_outage_03');
+        assert.equal(afterRecoveryC.externalExecutionReference, 'ord_ms_s261_outage_03');
+        assert.equal(afterRecoveryC.fulfillmentStatus, 'completed');
+        assert.equal(afterRecoveryC.paymentStatus, 'completed');
+        assert.equal(afterRecoveryC.mystarsCreateInFlight, false);
+      } finally {
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTransaction;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Проверен сбой firestoreRepo.updateDoc в persistMyStarsOrderMetadata (+ сбой Phase 3 runTransaction и полный сбой записи БД) для completed и awaiting_payment: метаданные сохраняются в памяти и восстанавливаются без повторного POST /v1/orders.';
+    },
+  );
+
+  await runTest(
+    'S261-02',
+    'Fulfillment',
+    'Stage 2.6.1 (2/2): Верификация 4 сценариев конкурентности и восстановления (A: Concurrent claim, B: Concurrent polling lease, C: Crash & recovery reconciliation, D: Cursor & transaction contention)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      await UserService.upsertFromTelegram(buyer1);
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s261_concurrency_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      try {
+        // =====================================================================
+        // SCENARIO A: Concurrent fulfillment claim (2 workers on same paid order)
+        // =====================================================================
+        let postCallsScenarioA = 0;
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's261_scen_a_user',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCallsScenarioA += 1;
+            await new Promise((r) => setTimeout(r, 15));
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_scen_a_01',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_scen_a_user',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.30',
+                purchase_tx: '0x_scen_a_tx',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Scenario A: ${req.method} ${req.url}`);
+        });
+
+        const ordScenA = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 100,
+          recipientUsername: 's261_scen_a_user',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordScenA.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          paidAt: new Date().toISOString(),
+        });
+        const freshScenA = (await OrderService.getOrderById(ordScenA.orderId))!;
+
+        const [worker1ResA, worker2ResA] = await Promise.all([
+          FulfillmentService.initiateFulfillment({ ...freshScenA }, mockBot),
+          FulfillmentService.initiateFulfillment({ ...freshScenA }, mockBot),
+        ]);
+        assert.equal(postCallsScenarioA, 1, 'Scenario A: только один воркер должен вызвать POST /v1/orders');
+        assert.ok(
+          worker1ResA.fulfillmentStatus === 'completed' ||
+            worker2ResA.fulfillmentStatus === 'completed',
+        );
+
+        // =====================================================================
+        // SCENARIO B: Concurrent polling lease (2 workers polling same processing order)
+        // =====================================================================
+        let getCallsScenarioB = 0;
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_scen_b_02')) {
+            getCallsScenarioB += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_scen_b_02',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's261_scen_b_user',
+                quantity: 100,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Scenario B: ${req.method} ${req.url}`);
+        });
+
+        const ordScenB = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 100,
+          recipientUsername: 's261_scen_b_user',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordScenB.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ord_ms_scen_b_02',
+          externalExecutionReference: 'ord_ms_scen_b_02',
+          fulfillmentIdempotencyKey: `fulfill_${ordScenB.orderId}`,
+          paidAt: new Date().toISOString(),
+        });
+
+        const nowMsB = Date.now();
+        const [leaseWorker1, leaseWorker2] = await Promise.all([
+          FulfillmentService.acquireOrderPollLease({
+            orderId: ordScenB.orderId,
+            leaseOwner: 'worker_replica_1',
+            operationId: 'op_1',
+            ttlMs: 30_000,
+            nowMs: nowMsB,
+          }),
+          FulfillmentService.acquireOrderPollLease({
+            orderId: ordScenB.orderId,
+            leaseOwner: 'worker_replica_2',
+            operationId: 'op_2',
+            ttlMs: 30_000,
+            nowMs: nowMsB,
+          }),
+        ]);
+        const acquiredLeasesB = [leaseWorker1, leaseWorker2].filter((l) => l.acquired);
+        assert.equal(acquiredLeasesB.length, 1, 'Scenario B: только один воркер может захватить mystarsPollLease');
+
+        // While lease is active, pollMyStarsOrders from another worker skips the leased order
+        const pollWhileLeased = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(pollWhileLeased.polled, 0);
+        assert.equal(getCallsScenarioB, 0);
+
+        // Once lease expires, another worker reclaims and polls exactly once
+        const expiredLeaseClaim = await FulfillmentService.acquireOrderPollLease({
+          orderId: ordScenB.orderId,
+          leaseOwner: 'worker_replica_2',
+          operationId: 'op_2_reclaim',
+          ttlMs: 30_000,
+          nowMs: nowMsB + 31_000,
+        });
+        assert.equal(expiredLeaseClaim.acquired, true, 'Scenario B: истёкший lease безопасно перехватывается');
+        await FulfillmentService.releaseOrderPollLease({
+          orderId: ordScenB.orderId,
+          leaseOwner: 'worker_replica_2',
+          operationId: 'op_2_reclaim',
+        });
+        const pollAfterRelease = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(pollAfterRelease.polled, 1);
+        assert.equal(getCallsScenarioB, 1);
+
+        // Clean up ordScenB so it doesn't interfere with Scenario C
+        await firestoreRepo.updateDoc<Order>('orders', ordScenB.orderId, {
+          fulfillmentStatus: 'completed',
+          paymentStatus: 'completed',
+        });
+
+        // =====================================================================
+        // SCENARIO C: Crash and recovery (order claimed, crashed after ambiguous POST)
+        // =====================================================================
+        let postCallsScenarioC = 0;
+        let listCallsScenarioC = 0;
+        let getDetailCallsScenarioC = 0;
+        const createdAtC = new Date(Date.now() - 120_000).toISOString();
+
+        const ordScenC = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 120,
+          recipientUsername: 's261_scen_c_crash_user',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ordScenC.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: createdAtC, // Expired processing lease (>60s)
+          fulfillmentAttempts: 1,
+          fulfillmentIdempotencyKey: `fulfill_${ordScenC.orderId}`,
+          mystarsCreateInFlight: true,
+          createdAt: createdAtC,
+          paidAt: createdAtC,
+        });
+
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCallsScenarioC += 1;
+            throw new Error('Scenario C: POST /v1/orders MUST NOT be called when reconciliation finds existing order');
+          }
+          if (req.method === 'GET' && /\/v1\/orders(\?|$)/.test(req.url)) {
+            listCallsScenarioC += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                orders: [
+                  {
+                    order_id: 'ord_ms_scen_c_reconciled',
+                    status: 'completed',
+                    type: 'stars',
+                    recipient_username: 's261_scen_c_crash_user',
+                    quantity: 120,
+                    created_at: new Date(Date.now() - 90_000).toISOString(),
+                    updated_at: new Date().toISOString(),
+                  },
+                ],
+                total: 1,
+                page: 1,
+                limit: 50,
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_scen_c_reconciled')) {
+            getDetailCallsScenarioC += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_scen_c_reconciled',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's261_scen_c_crash_user',
+                quantity: 120,
+                payment_currency: 'usdt_ton',
+                payment_amount_usdt: '1.56',
+                purchase_tx: '0x_scen_c_reconciled_tx',
+                created_at: new Date(Date.now() - 90_000).toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request in Scenario C: ${req.method} ${req.url}`);
+        });
+
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(listCallsScenarioC, 1, 'Scenario C: должна выполниться сверка GET /v1/orders');
+        assert.equal(getDetailCallsScenarioC, 1, 'Scenario C: статус найденного заказа проверяется через GET /v1/orders/{id}');
+        assert.equal(postCallsScenarioC, 0, 'Scenario C: повторный POST /v1/orders не вызывается');
+
+        const recoveredScenC = (await OrderService.getOrderById(ordScenC.orderId))!;
+        assert.equal(recoveredScenC.mystarsOrderId, 'ord_ms_scen_c_reconciled');
+        assert.equal(recoveredScenC.fulfillmentStatus, 'completed');
+        assert.equal(recoveredScenC.paymentStatus, 'completed');
+        assert.equal(recoveredScenC.mystarsCreateInFlight, false);
+
+        // =====================================================================
+        // SCENARIO D: Cursor and transaction conflict/retry behavior
+        // =====================================================================
+        FulfillmentService.resetMyStarsPollingState();
+        const prevBudget = FulfillmentService.pollBatchBudget;
+        const prevPageSize = FulfillmentService.pollPageSize;
+        FulfillmentService.pollBatchBudget = 2;
+        FulfillmentService.pollPageSize = 2;
+
+        const origRunTx = firestoreRepo.runTransaction.bind(firestoreRepo);
+        let injectedCheckpointConflict = false;
+        let getCallsScenarioD = 0;
+
+        try {
+          for (let i = 1; i <= 4; i++) {
+            const o = await OrderService.createOrder({
+              telegramUser: buyer1,
+              productId: 'stars_custom',
+              quantity: 50,
+              recipientUsername: `s261_scen_d_u${i}`,
+            });
+            const ts = new Date(Date.UTC(2026, 10, 22, 12, 0, i)).toISOString();
+            await firestoreRepo.updateDoc<Order>('orders', o.orderId, {
+              paymentStatus: 'paid',
+              fulfillmentStatus: 'processing',
+              mystarsOrderId: `ord_ms_scen_d_${i}`,
+              externalExecutionReference: `ord_ms_scen_d_${i}`,
+              createdAt: ts,
+              paidAt: ts,
+            });
+          }
+
+          myStarsClient.setHttpTransport(async (req) => {
+            const m = req.url.match(/\/v1\/orders\/(ord_ms_scen_d_\d+)/);
+            if (req.method === 'GET' && m) {
+              getCallsScenarioD += 1;
+              return {
+                status: 200,
+                ok: true,
+                headers: {},
+                json: {
+                  order_id: m[1],
+                  status: 'awaiting_payment',
+                  type: 'stars',
+                  recipient_username: 's261_scen_d',
+                  quantity: 50,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                },
+              };
+            }
+            throw new Error(`Unexpected request in Scenario D: ${req.method} ${req.url}`);
+          });
+
+          // Inject a transient Firestore transaction conflict (ABORTED) during checkpoint save
+          (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+            async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+              if (!injectedCheckpointConflict && getCallsScenarioD === 2) {
+                injectedCheckpointConflict = true;
+                const conflictErr = new Error('10 ABORTED: Cross-transaction contention on settings/mystars_poll_cursor');
+                (conflictErr as Error & { code?: string }).code = 'aborted';
+                throw conflictErr;
+              }
+              return origRunTx(fn);
+            };
+
+          const tick1D = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(injectedCheckpointConflict, true, 'Scenario D: конфликт транзакции курсора должен быть симулирован');
+          assert.equal(tick1D.checkpointSaved, true, 'Scenario D: транзакция сохранения курсора должна успешно повториться после ABORTED');
+          assert.equal(tick1D.polled, 2);
+          assert.equal(getCallsScenarioD, 2, 'Scenario D: ретрай транзакции курсора не должен вызывать повторные внешние вызовы API');
+
+          const tick2D = await FulfillmentService.pollMyStarsOrders(mockBot);
+          assert.equal(tick2D.polled, 2);
+          assert.equal(getCallsScenarioD, 4, 'Scenario D: второй тик продолжает со сохранённого курсора без пропусков и дублей');
+        } finally {
+          (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+            origRunTx;
+          FulfillmentService.pollBatchBudget = prevBudget;
+          FulfillmentService.pollPageSize = prevPageSize;
+        }
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Все 4 сценария конкурентности и восстановления (A: Concurrent claim, B: Concurrent polling lease, C: Crash & recovery reconciliation, D: Cursor & transaction contention) успешно верифицированы.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {
