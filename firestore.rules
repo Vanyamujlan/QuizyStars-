@@ -44,57 +44,64 @@ service cloud.firestore {
       );
     }
 
-    // Strict ISO-8601 or Firestore Timestamp validation (low CEL footprint; .matches fails closed on non-strings)
+    // Strict Gregorian calendar ISO-8601 (exact month lengths 28/29/30/31, leap years incl. 100/400 rule,
+    // hours 00-23, minutes/seconds 00-59, optional fractional seconds, valid TZ) OR Firestore Timestamp.
     function isDate(v) {
       return v is timestamp ||
-        v.matches('^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?(Z|[+\\-](0\\d|1\\d|2[0-3]):[0-5]\\d)$');
+        v.matches('^((\\d{4}-((0[13578]|1[02])-(0[1-9]|[12]\\d|3[01])|(0[469]|11)-(0[1-9]|[12]\\d|30)|02-(0[1-9]|1\\d|2[0-8])))|((\\d\\d(0[48]|[2468][048]|[13579][26])|([02468][048]|[13579][26])00)-02-29))T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?(Z|[+\\-]([01]\\d|2[0-3]):[0-5]\\d)$');
     }
 
+    // Strict freshness check for client-SDK write timestamps (createdAt on create, updatedAt on create/update, addedAt on create).
+    // Requires a genuine Firestore Timestamp within +/- 5 minutes (300,000 ms) of request.time.
+    // Arbitrary ISO-8601 strings are NEVER accepted as fresh timestamps.
     function isFreshTs(v) {
-      return (v is timestamp && v == request.time) ||
-        v.matches('^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?(Z|[+\\-](0\\d|1\\d|2[0-3]):[0-5]\\d)$');
+      return v is timestamp &&
+        math.abs(v.toMillis() - request.time.toMillis()) <= 300000;
     }
 
     function isIntRange(v, lo, hi) {
       return v is int && v >= lo && v <= hi;
     }
 
-    function isCents(v) {
-      return v is int && v >= 0 && v <= 100000000;
-    }
-
     function isPosCents(v) {
       return v is int && v >= 1 && v <= 100000000;
     }
 
-    function isSignedCents(v) {
-      return v is int && v >= -100000000 && v <= 100000000;
+    // Strict per-element list validators (up to 10 elements):
+    // CEL '+' on strings is strictly typed (fails closed on int, float, bool, null, map, list — zero coercion),
+    // and the anchored 10-line regex enforces exact format/length and rejects embedded newlines at EVERY index 0..9.
+    function isKeyIdList(v) {
+      let okList = v is list && v.size() <= 10;
+      let p = okList ? v.concat(['a', 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a']) : [];
+      return okList && (
+        v.size() == 0 ||
+        (p[0] + '\n' + p[1] + '\n' + p[2] + '\n' + p[3] + '\n' + p[4] + '\n' +
+         p[5] + '\n' + p[6] + '\n' + p[7] + '\n' + p[8] + '\n' + p[9])
+          .matches('^[a-zA-Z0-9_\\-]{1,128}(\\n[a-zA-Z0-9_\\-]{1,128}){9}$')
+      );
     }
 
-    function isPosInt(v) {
-      return v is int && v > 0;
-    }
-
-    function isPollAttempts(v) {
-      return v is int && v >= 0 && v <= 10000;
-    }
-
-    function isFulfillAttempts(v) {
-      return v is int && v >= 0 && v <= 10;
-    }
-
-    function isKeyList(v) {
-      return v is list && v.size() <= 10 && (v.size() == 0 || v[0] is string);
+    function isKeyValueList(v) {
+      let okList = v is list && v.size() <= 10;
+      let p = okList ? v.concat(['a', 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a']) : [];
+      return okList && (
+        v.size() == 0 ||
+        (p[0] + '\n' + p[1] + '\n' + p[2] + '\n' + p[3] + '\n' + p[4] + '\n' +
+         p[5] + '\n' + p[6] + '\n' + p[7] + '\n' + p[8] + '\n' + p[9])
+          .matches('^.{1,256}(\\n.{1,256}){9}$')
+      );
     }
 
     function isValidNotificationState(v) {
-      return [v.status, v.eventId].join('\n').matches('^(pending|sending|sent|partial_sent|no_recipients|delivery_uncertain)\\n.{1,128}$') &&
+      return v.status in ['pending', 'sending', 'sent', 'partial_sent', 'no_recipients', 'delivery_uncertain'] &&
+        v.eventId.matches('^.{1,128}$') &&
         v.attemptCount is int && v.attemptCount >= 0 && v.attemptCount <= 1000;
     }
 
     function isValidPollLease(v) {
       return v.keys().hasOnly(['leaseOwner', 'operationId', 'leaseUntil', 'acquiredAt']) &&
-        [v.leaseOwner, v.operationId].join('\n').matches('^.{1,128}\\n.{1,128}$') &&
+        v.leaseOwner.matches('^.{1,128}$') &&
+        v.operationId.matches('^.{1,128}$') &&
         isDate(v.leaseUntil) &&
         isDate(v.acquiredAt);
     }
@@ -226,9 +233,7 @@ service cloud.firestore {
           d.get('paymentMethod', 'cryptobot'),
           d.get('fulfillmentProvider', 'mystars'),
           d.get('mystarsCurrency', 'usdt_ton'),
-          d.get('refundState', 'refunded')
-        ].join('\n').matches('^[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n.{1,120}\\n(stars|premium|gifts)\\n(USD|XTR)\\n(pending|paid|processing|completed|cancelled|refunded|failed)\\n(pending|paid|processing|completed|cancelled|refunded|failed)\\n(cryptobot|xrocket|balance|internal_balance|stars|telegram_stars)\\n(mystars|manual|fragment)\\n(usdt_ton|ton)\\n(refund_in_progress|telegram_refund_succeeded_pending_commit|refund_failed_needs_reconciliation|refunded)$') &&
-        [
+          d.get('refundState', 'refunded'),
           d.get('activePaymentId', 'a'),
           d.get('externalInvoiceId', 'a'),
           d.get('balancePaymentId', 'a'),
@@ -236,9 +241,7 @@ service cloud.firestore {
           d.get('mystarsOrderId', 'a'),
           d.get('mystarsPayToAddress', 'a'),
           d.get('fulfillmentIdempotencyKey', 'a'),
-          d.get('refundLockToken', 'a')
-        ].join('\n').matches('^.{1,128}(\\n.{1,128}){7}$') &&
-        [
+          d.get('refundLockToken', 'a'),
           d.get('username', ''),
           d.get('recipientUsername', 'a'),
           d.get('mystarsOrderStatus', 'a'),
@@ -248,13 +251,11 @@ service cloud.firestore {
           d.get('mystarsPurchaseTx', ''),
           d.get('mystarsPaymentTx', ''),
           d.get('mystarsReversalTx', ''),
-          d.get('externalExecutionReference', '')
-        ].join('\n').matches('^.{0,64}\\n.{1,64}\\n.{1,64}\\n.{0,128}\\n.{0,128}(\\n.{0,256}){5}$') &&
-        [
+          d.get('externalExecutionReference', ''),
           d.get('mystarsWholesaleCostUsdt', '0'),
           d.get('tonNetworkFeeTon', '0'),
           d.get('mystarsPaymentAmountUsdt', '0')
-        ].join('\n').matches('^[0-9]{1,45}(\\.[0-9]{1,18})?(\\n[0-9]{1,45}(\\.[0-9]{1,18})?){2}$') &&
+        ].join('\n').matches('^[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n.{1,120}\\n(stars|premium|gifts)\\n(USD|XTR)\\n(pending|paid|processing|completed|cancelled|refunded|failed)\\n(pending|paid|processing|completed|cancelled|refunded|failed)\\n(cryptobot|xrocket|balance|internal_balance|stars|telegram_stars)\\n(mystars|manual|fragment)\\n(usdt_ton|ton)\\n(refund_in_progress|telegram_refund_succeeded_pending_commit|refund_failed_needs_reconciliation|refunded)(\\n.{1,128}){8}\\n.{0,64}\\n.{1,64}\\n.{1,64}\\n.{0,128}\\n.{0,128}(\\n.{0,256}){5}(\\n[0-9]{1,45}(\\.[0-9]{1,18})?){3}$') &&
         d.get('mystarsFailureReason', '').matches('(?s)^.{0,500}$') &&
         d.get('mystarsLastPollError', '').matches('(?s)^.{0,500}$') &&
         d.get('fulfillmentNote', '').matches('(?s)^.{0,500}$') &&
@@ -262,32 +263,26 @@ service cloud.firestore {
         d.get('refundLastError', '').matches('(?s)^.{0,500}$');
     }
 
-    function isValidOrderNumbersAndDates(d, ts) {
-      return d.userTelegramId is int && d.userTelegramId > 0 &&
-        d.quantity is int && d.quantity >= 1 && d.quantity <= 100000 &&
-        d.totalPrice is number && d.totalPrice > 0 && d.totalPrice <= 100000000 &&
-        d.get('durationMonths', 3) in [3, 6, 12] &&
-        isPosCents(d.get('unitPriceUsdCents', 1)) &&
-        isPosCents(d.get('totalPriceUsdCents', 1)) &&
-        isCents(d.get('grossRevenueUsdCents', 0)) &&
-        isCents(d.get('providerFeeUsdCents', 0)) &&
-        isCents(d.get('mystarsCostUsdCents', 0)) &&
-        isCents(d.get('tonNetworkFeeUsdCents', 0)) &&
-        isSignedCents(d.get('netProfitUsdCents', 0)) &&
-        isPollAttempts(d.get('mystarsPollAttempts', 0)) &&
-        isFulfillAttempts(d.get('fulfillmentAttempts', 0)) &&
-        isPosInt(d.get('completedByAdminId', 1)) &&
-        d.get('balanceRefunded', false) is bool &&
-        d.get('mystarsCreateInFlight', false) is bool &&
-        d.get('needsManualReconciliation', false) is bool &&
-        d.get('awaitingKeyStock', false) is bool &&
-        d.get('refundStatsAdjusted', false) is bool &&
-        isKeyList(d.get('assignedKeyIds', [])) &&
-        isKeyList(d.get('deliveredKeyValues', [])) &&
-        (!('mystarsPollLease' in d) || isValidPollLease(d.mystarsPollLease)) &&
-        (!('buyerNotificationState' in d) || isValidNotificationState(d.buyerNotificationState)) &&
-        (!('adminNotificationState' in d) || isValidNotificationState(d.adminNotificationState)) &&
-        isDate(d.get('mystarsExpiresAt', ts)) &&
+    // Single-pass Gregorian ISO-8601 batch validator for all 11 optional Order date fields.
+    // Falls back to per-field isDate() only when a Firestore Timestamp is written to an optional date field.
+    function isValidOrderDatesIso(d) {
+      return [
+          d.get('mystarsExpiresAt', '2026-01-01T00:00:00Z'),
+          d.get('mystarsLastPolledAt', '2026-01-01T00:00:00Z'),
+          d.get('mystarsStuckAlertedAt', '2026-01-01T00:00:00Z'),
+          d.get('mystarsAmbiguousPostAt', '2026-01-01T00:00:00Z'),
+          d.get('fulfillmentStartedAt', '2026-01-01T00:00:00Z'),
+          d.get('fulfillmentNextRetryAt', '2026-01-01T00:00:00Z'),
+          d.get('refundStartedAt', '2026-01-01T00:00:00Z'),
+          d.get('adminNotifiedAt', '2026-01-01T00:00:00Z'),
+          d.get('buyerNotifiedAt', '2026-01-01T00:00:00Z'),
+          d.get('paidAt', '2026-01-01T00:00:00Z'),
+          d.get('completedAt', '2026-01-01T00:00:00Z')
+        ].join('\n').matches('^(((\\d{4}-((0[13578]|1[02])-(0[1-9]|[12]\\d|3[01])|(0[469]|11)-(0[1-9]|[12]\\d|30)|02-(0[1-9]|1\\d|2[0-8])))|((\\d\\d(0[48]|[2468][048]|[13579][26])|([02468][048]|[13579][26])00)-02-29))T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?(Z|[+\\-]([01]\\d|2[0-3]):[0-5]\\d)\\n){10}((\\d{4}-((0[13578]|1[02])-(0[1-9]|[12]\\d|3[01])|(0[469]|11)-(0[1-9]|[12]\\d|30)|02-(0[1-9]|1\\d|2[0-8])))|((\\d\\d(0[48]|[2468][048]|[13579][26])|([02468][048]|[13579][26])00)-02-29))T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?(Z|[+\\-]([01]\\d|2[0-3]):[0-5]\\d)$');
+    }
+
+    function isValidOrderDatesAny(d, ts) {
+      return isDate(d.get('mystarsExpiresAt', ts)) &&
         isDate(d.get('mystarsLastPolledAt', ts)) &&
         isDate(d.get('mystarsStuckAlertedAt', ts)) &&
         isDate(d.get('mystarsAmbiguousPostAt', ts)) &&
@@ -298,6 +293,44 @@ service cloud.firestore {
         isDate(d.get('buyerNotifiedAt', ts)) &&
         isDate(d.get('paidAt', ts)) &&
         isDate(d.get('completedAt', ts));
+    }
+
+    // Strict type + exact range validation for all 10 optional Order integer fields in a single pass.
+    // CEL addition of all 10 values produces int IFF every single operand is strictly int (rejecting float/string/bool/null).
+    function isValidOrderInts(d) {
+      let a = d.get('unitPriceUsdCents', 1);
+      let b = d.get('totalPriceUsdCents', 1);
+      let c = d.get('grossRevenueUsdCents', 0);
+      let e = d.get('providerFeeUsdCents', 0);
+      let f = d.get('mystarsCostUsdCents', 0);
+      let g = d.get('tonNetworkFeeUsdCents', 0);
+      let h = d.get('netProfitUsdCents', 0);
+      let i = d.get('mystarsPollAttempts', 0);
+      let j = d.get('fulfillmentAttempts', 0);
+      let k = d.get('completedByAdminId', 1);
+      return (a + b + c + e + f + g + h + i + j + k) is int &&
+        [a, b, c, e, f, g, h, i, j, k].join('\n').matches('^([1-9]\\d{0,7}|100000000)\\n([1-9]\\d{0,7}|100000000)(\\n(0|[1-9]\\d{0,7}|100000000)){4}\\n(-?(0|[1-9]\\d{0,7}|100000000))\\n(0|[1-9]\\d{0,3}|10000)\\n([0-9]|10)\\n[1-9]\\d{0,15}$');
+    }
+
+    function isValidOrderNumbersAndDates(d, ts) {
+      return d.userTelegramId is int && d.userTelegramId > 0 &&
+        d.quantity is int && d.quantity >= 1 && d.quantity <= 100000 &&
+        d.totalPrice is number && d.totalPrice > 0 && d.totalPrice <= 100000000 &&
+        d.get('durationMonths', 3) in [3, 6, 12] &&
+        isValidOrderInts(d) &&
+        [
+          d.get('balanceRefunded', false),
+          d.get('mystarsCreateInFlight', false),
+          d.get('needsManualReconciliation', false),
+          d.get('awaitingKeyStock', false),
+          d.get('refundStatsAdjusted', false)
+        ].toSet().hasOnly([true, false]) &&
+        (!('assignedKeyIds' in d) || isKeyIdList(d.assignedKeyIds)) &&
+        (!('deliveredKeyValues' in d) || isKeyValueList(d.deliveredKeyValues)) &&
+        (!('mystarsPollLease' in d) || isValidPollLease(d.mystarsPollLease)) &&
+        (!('buyerNotificationState' in d) || isValidNotificationState(d.buyerNotificationState)) &&
+        (!('adminNotificationState' in d) || isValidNotificationState(d.adminNotificationState)) &&
+        (isValidOrderDatesIso(d) || isValidOrderDatesAny(d, ts));
     }
 
     function isValidOrder(d, orderId, ts) {
@@ -384,18 +417,20 @@ service cloud.firestore {
     }
 
     function isOrderAdminCreate(d, orderId, ts) {
-      return isFreshTs(d.createdAt) &&
-        isFreshTs(d.updatedAt) &&
-        isValidOrder(d, orderId, ts);
+      let data = d;
+      return isFreshTs(data.createdAt) &&
+        isFreshTs(data.updatedAt) &&
+        isValidOrder(data, orderId, ts);
     }
 
     function isOrderAdminUpdate(d, prev, orderId, ts) {
-      return isFreshTs(d.updatedAt) &&
-        !d.diff(prev).affectedKeys().hasAny([
+      let data = d;
+      return isFreshTs(data.updatedAt) &&
+        !data.diff(prev).affectedKeys().hasAny([
           'orderId', 'userId', 'userTelegramId', 'productId',
           'quantity', 'totalPrice', 'currency', 'createdAt'
         ]) &&
-        isValidOrder(d, orderId, ts);
+        isValidOrder(data, orderId, ts);
     }
 
     function isOrderBuyerCreate(d, orderId) {
@@ -768,18 +803,17 @@ service cloud.firestore {
       allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
       allow create: if isValidId(paymentId) && isValidPayment(incoming(), paymentId) &&
         isFreshTs(incoming().createdAt) &&
+        (!('updatedAt' in incoming()) || isFreshTs(incoming().updatedAt)) &&
         isAdmin() &&
         exists(/databases/$(database)/documents/orders/$(incoming().orderId));
       allow update: if isValidId(paymentId) && isValidPayment(incoming(), paymentId) &&
-        incoming().paymentId == existing().paymentId &&
-        incoming().orderId == existing().orderId &&
-        incoming().userId == existing().userId &&
-        incoming().userTelegramId == existing().userTelegramId &&
-        incoming().totalAmount == existing().totalAmount &&
-        incoming().currency == existing().currency &&
-        incoming().createdAt == existing().createdAt &&
+        !incoming().diff(existing()).affectedKeys().hasAny([
+          'paymentId', 'orderId', 'userId', 'userTelegramId',
+          'totalAmount', 'currency', 'createdAt'
+        ]) &&
         (!('providerPaymentId' in existing()) || incoming().providerPaymentId == existing().providerPaymentId) &&
         (!('telegramPaymentChargeId' in existing()) || incoming().telegramPaymentChargeId == existing().telegramPaymentChargeId) &&
+        (!incoming().diff(existing()).affectedKeys().hasAny(['updatedAt']) || isFreshTs(incoming().updatedAt)) &&
         isAdmin();
       allow delete: if false;
     }

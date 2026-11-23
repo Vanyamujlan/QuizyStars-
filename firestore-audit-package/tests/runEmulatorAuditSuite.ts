@@ -19,6 +19,8 @@ import {
   query,
   where,
   getDocs,
+  serverTimestamp,
+  Timestamp,
 } from 'firebase/firestore';
 import {
   assertEmulatorOnlyEnvironment,
@@ -925,7 +927,7 @@ async function main(): Promise<void> {
         await assertFails(
           updateDoc(doc(buyerCtx.firestore(), 'orders', 'ord_syn_pending_01'), {
             totalPrice: 1,
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -943,8 +945,8 @@ async function main(): Promise<void> {
             currency: 'XTR',
             paymentStatus: 'pending',
             fulfillmentStatus: 'pending',
-            createdAt: nowIso,
-            updatedAt: nowIso,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -962,8 +964,8 @@ async function main(): Promise<void> {
             currency: 'XTR',
             paymentStatus: 'pending',
             fulfillmentStatus: 'pending',
-            createdAt: nowIso,
-            updatedAt: nowIso,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1030,7 +1032,7 @@ async function main(): Promise<void> {
           updateDoc(doc(buyerCtx.firestore(), 'orders', 'ord_syn_paid_02'), {
             paymentStatus: 'completed',
             fulfillmentStatus: 'completed',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1039,7 +1041,7 @@ async function main(): Promise<void> {
           updateDoc(doc(buyerCtx.firestore(), 'orders', 'ord_syn_paid_02'), {
             paymentStatus: 'cancelled',
             fulfillmentStatus: 'cancelled',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1048,7 +1050,7 @@ async function main(): Promise<void> {
           updateDoc(doc(buyerCtx.firestore(), 'orders', 'ord_honest_rule_test'), {
             paymentStatus: 'cancelled',
             fulfillmentStatus: 'cancelled',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1257,7 +1259,7 @@ async function main(): Promise<void> {
             needsManualReconciliation: true,
             adminNotifiedAt: nowIso,
             buyerNotifiedAt: nowIso,
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1265,7 +1267,7 @@ async function main(): Promise<void> {
         await assertFails(
           updateDoc(doc(adminCtx.firestore(), 'orders', 'ord_syn_processing_03'), {
             fulfillmentAttempts: 99,
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1281,7 +1283,7 @@ async function main(): Promise<void> {
               amount: 450,
               currency: 'XTR',
               details: `Rule validation test for ${txType}`,
-              createdAt: nowIso,
+              createdAt: serverTimestamp(),
             }),
           );
         }
@@ -1352,8 +1354,8 @@ async function main(): Promise<void> {
           currency: 'XTR',
           paymentStatus: 'pending',
           fulfillmentStatus: 'pending',
-          createdAt: nowIso,
-          updatedAt: nowIso,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
           ...overrides,
         });
 
@@ -1414,19 +1416,19 @@ async function main(): Promise<void> {
 
         // 3. Invalid updates on existing order (both buyer and admin) must fail AND leave document unchanged
         const invalidUpdates: Array<{ ctx: typeof buyerCtx; patch: Record<string, unknown> }> = [
-          { ctx: buyerCtx, patch: { grossRevenueUsdCents: 1, updatedAt: nowIso } },
-          { ctx: buyerCtx, patch: { providerFeeUsdCents: 0, updatedAt: nowIso } },
-          { ctx: buyerCtx, patch: { mystarsCostUsdCents: 0, updatedAt: nowIso } },
-          { ctx: buyerCtx, patch: { balanceRefunded: true, updatedAt: nowIso } },
-          { ctx: buyerCtx, patch: { ghostField: 'x', updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { paymentStatus: 'unknown_status', updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { fulfillmentStatus: 'unknown_status', updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { grossRevenueUsdCents: -5, updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { providerFeeUsdCents: -1, updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { mystarsCostUsdCents: 'bad', updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { balanceRefunded: 123, updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { mystarsPollAttempts: -1, updatedAt: nowIso } },
-          { ctx: adminCtx, patch: { ghostField: 'admin_extra', updatedAt: nowIso } },
+          { ctx: buyerCtx, patch: { grossRevenueUsdCents: 1, updatedAt: serverTimestamp() } },
+          { ctx: buyerCtx, patch: { providerFeeUsdCents: 0, updatedAt: serverTimestamp() } },
+          { ctx: buyerCtx, patch: { mystarsCostUsdCents: 0, updatedAt: serverTimestamp() } },
+          { ctx: buyerCtx, patch: { balanceRefunded: true, updatedAt: serverTimestamp() } },
+          { ctx: buyerCtx, patch: { ghostField: 'x', updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { paymentStatus: 'unknown_status', updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { fulfillmentStatus: 'unknown_status', updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { grossRevenueUsdCents: -5, updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { providerFeeUsdCents: -1, updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { mystarsCostUsdCents: 'bad', updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { balanceRefunded: 123, updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { mystarsPollAttempts: -1, updatedAt: serverTimestamp() } },
+          { ctx: adminCtx, patch: { ghostField: 'admin_extra', updatedAt: serverTimestamp() } },
           { ctx: adminCtx, patch: { updatedAt: 'not-a-valid-date' } },
         ];
         for (const { ctx, patch } of invalidUpdates) {
@@ -1518,18 +1520,18 @@ async function main(): Promise<void> {
           buyerNotifiedAt: nowIso,
           buyerNotificationState: { status: 'sent', eventId: 'evt_b1', attemptCount: 1 },
           adminNotificationState: { status: 'sent', eventId: 'evt_a1', attemptCount: 1 },
-          createdAt: nowIso,
+          createdAt: serverTimestamp(),
           paidAt: nowIso,
           completedAt: nowIso,
           completedByAdminId: 900000001,
-          updatedAt: nowIso,
+          updatedAt: serverTimestamp(),
         };
         await assertSucceeds(setDoc(doc(adminCtx.firestore(), 'orders', fullOrderId), fullOrderPayload));
         await assertSucceeds(
           updateDoc(doc(adminCtx.firestore(), 'orders', fullOrderId), {
             netProfitUsdCents: -15,
             mystarsPollAttempts: 3,
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1571,8 +1573,8 @@ async function main(): Promise<void> {
           invoicePayload: 'ord_syn_pending_01',
           payUrl: 'https://t.me/CryptoBot?start=IVtest123',
           status: 'pending',
-          createdAt: nowIso,
-          updatedAt: nowIso,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
           ...overrides,
         });
 
@@ -1624,25 +1626,25 @@ async function main(): Promise<void> {
         await assertFails(
           updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
             providerPaymentId: 'hijacked_ext_id',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertFails(
           updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
             telegramPaymentChargeId: 'hijacked_tg_charge',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertFails(
           updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
             providerPaymentChargeId: 'hijacked_prov_charge',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertFails(
           updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
             externalPaymentId: 'hijacked_ext_field',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1650,19 +1652,19 @@ async function main(): Promise<void> {
         await assertFails(
           updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
             telegramPaymentChargeId: 'overwritten_charge_id',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertFails(
           updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
             expectedUsdCents: -1,
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertFails(
           updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
             paidAt: 'bad-date',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1707,14 +1709,14 @@ async function main(): Promise<void> {
         await assertFails(
           updateDoc(doc(adminCtx.firestore(), 'payments', fullPayId), {
             providerPaymentId: 'mutated_provider_id',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertSucceeds(
           updateDoc(doc(adminCtx.firestore(), 'payments', fullPayId), {
             reconciliationState: 'resolved',
             refundRequired: false,
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1731,8 +1733,8 @@ async function main(): Promise<void> {
             expectedAmountStr: '-5.00',
             currency: 'USDT',
             paymentStatus: 'pending',
-            createdAt: nowIso,
-            updatedAt: nowIso,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertSucceeds(
@@ -1747,8 +1749,8 @@ async function main(): Promise<void> {
             expectedAmountStr: '5.00',
             currency: 'USDT',
             paymentStatus: 'pending',
-            createdAt: nowIso,
-            updatedAt: nowIso,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
           }),
         );
 
@@ -1838,32 +1840,32 @@ async function main(): Promise<void> {
         await assertFails(
           updateDoc(doc(buyerMissingOptClaimsCtx.firestore(), 'orders', 'ord_syn_pending_01'), {
             paymentStatus: 'paid',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
         await assertFails(
           updateDoc(doc(buyerMissingOptClaimsCtx.firestore(), 'orders', 'ord_syn_paid_02'), {
             fulfillmentStatus: 'completed',
-            updatedAt: nowIso,
+            updatedAt: serverTimestamp(),
           }),
         );
 
         // 5. Buyer CANNOT modify financial totals on users or orders
         for (const userPatch of [
-          { balanceUsdCents: 999999, updatedAt: nowIso },
-          { totalSpentUsdCents: 999999, updatedAt: nowIso },
-          { totalSpentStars: 999999, updatedAt: nowIso },
-          { totalOrders: 999, updatedAt: nowIso },
-          { balance: 999999, updatedAt: nowIso },
+          { balanceUsdCents: 999999, updatedAt: serverTimestamp() },
+          { totalSpentUsdCents: 999999, updatedAt: serverTimestamp() },
+          { totalSpentStars: 999999, updatedAt: serverTimestamp() },
+          { totalOrders: 999, updatedAt: serverTimestamp() },
+          { balance: 999999, updatedAt: serverTimestamp() },
         ]) {
           await assertFails(
             updateDoc(doc(buyerMissingOptClaimsCtx.firestore(), 'users', 'tg_900001002'), userPatch),
           );
         }
         for (const ordPatch of [
-          { totalPrice: 1, updatedAt: nowIso },
-          { totalPriceUsdCents: 1, updatedAt: nowIso },
-          { grossRevenueUsdCents: 1, updatedAt: nowIso },
+          { totalPrice: 1, updatedAt: serverTimestamp() },
+          { totalPriceUsdCents: 1, updatedAt: serverTimestamp() },
+          { grossRevenueUsdCents: 1, updatedAt: serverTimestamp() },
         ]) {
           await assertFails(
             updateDoc(
@@ -1924,6 +1926,393 @@ async function main(): Promise<void> {
         );
 
         return 'Матрица ролей/claims (unauth, missing optional claims, unverified spoof, custom-claim admin, /admins doc admin) подтверждена; подмена paid/completed и финансовых итогов заблокирована без изменения документов; payment_locks и digital_keys полностью закрыты для всех клиентов включая админов.';
+      },
+    );
+
+    await runCheck(
+      'SEC-14',
+      'SecurityRules',
+      'Stage 2.6.3.1: Строгая проверка свежести isFreshTs() (запрет произвольных ISO-строк, чисел и Timestamp вне окна ±5 мин)',
+      'Проверка отказа при старой ISO-дате, будущей ISO-дате, текущей ISO-строке, невалидной дате, числе и Timestamp вне ±5 мин (с проверкой неизменности документа), а также успешной записи с serverTimestamp() и Timestamp в пределах ±5 мин при сохранении совместимости с существующими ISO-полями',
+      async () => {
+        const buyerCtx = testEnv.authenticatedContext('tg_900001002', {
+          email_verified: true,
+        });
+        const adminCtx = testEnv.authenticatedContext('tg_900000001', {
+          email_verified: true,
+          admin: true,
+        });
+        const nowMs = Date.now();
+        const orderBefore = await firestoreRepo.getDoc<Order>('orders', 'ord_syn_processing_03');
+        assert.ok(orderBefore, 'ord_syn_processing_03 должен существовать до SEC-14');
+
+        const baseFreshOrder = (orderId: string, createdAt: unknown, updatedAt: unknown) => ({
+          orderId,
+          userId: 'tg_900001002',
+          userTelegramId: 900001002,
+          productId: 'stars_pack_100',
+          productName: '100 Telegram Stars (Synthetic)',
+          category: 'stars',
+          quantity: 1,
+          totalPrice: 100,
+          currency: 'XTR',
+          paymentStatus: 'pending',
+          fulfillmentStatus: 'pending',
+          createdAt,
+          updatedAt,
+        });
+
+        // 1. Negative cases on create (must ALL fail and create nothing)
+        const negativeTsValues: Array<[string, unknown]> = [
+          ['old_iso', '2020-01-01T00:00:00.000Z'],
+          ['future_iso', '2099-01-01T00:00:00.000Z'],
+          ['current_iso_string', new Date(nowMs).toISOString()],
+          ['invalid_date_string', 'not-a-date'],
+          ['impossible_iso_date', '2026-02-31T00:00:00Z'],
+          ['number_epoch_ms', nowMs],
+          ['ts_too_old_10m', Timestamp.fromMillis(nowMs - 10 * 60 * 1000)],
+          ['ts_too_future_10m', Timestamp.fromMillis(nowMs + 10 * 60 * 1000)],
+        ];
+
+        for (const [label, badTs] of negativeTsValues) {
+          const docId = `ord_fresh_neg_${label}`;
+          await assertFails(
+            setDoc(
+              doc(adminCtx.firestore(), 'orders', docId),
+              baseFreshOrder(docId, badTs, serverTimestamp()),
+            ),
+          );
+          assert.equal(
+            await firestoreRepo.getDoc<Order>('orders', docId),
+            null,
+            `Заказ ${docId} (createdAt=${label}) не должен был создаться`,
+          );
+
+          const docIdUpd = `ord_fresh_neg_upd_${label}`;
+          await assertFails(
+            setDoc(
+              doc(buyerCtx.firestore(), 'orders', docIdUpd),
+              baseFreshOrder(docIdUpd, serverTimestamp(), badTs),
+            ),
+          );
+          assert.equal(
+            await firestoreRepo.getDoc<Order>('orders', docIdUpd),
+            null,
+            `Заказ покупателя ${docIdUpd} (updatedAt=${label}) не должен был создаться`,
+          );
+
+          // Also reject on update of existing order without modifying it
+          await assertFails(
+            updateDoc(doc(adminCtx.firestore(), 'orders', 'ord_syn_processing_03'), {
+              fulfillmentNote: `Should fail for ${label}`,
+              updatedAt: badTs,
+            }),
+          );
+        }
+
+        // Verify existing order was NOT modified by any rejected update
+        assert.deepEqual(
+          await firestoreRepo.getDoc<Order>('orders', 'ord_syn_processing_03'),
+          orderBefore,
+          'ord_syn_processing_03 не должен был измениться после отклонённых проверок isFreshTs()',
+        );
+
+        // 2. Positive cases: exact serverTimestamp() & Timestamp within +/- 5m window (both past -60s and future +60s)
+        const tsWithinPast = Timestamp.fromMillis(nowMs - 60 * 1000);
+        const tsWithinFuture = Timestamp.fromMillis(nowMs + 60 * 1000);
+
+        await assertSucceeds(
+          setDoc(
+            doc(buyerCtx.firestore(), 'orders', 'ord_fresh_ok_server_ts'),
+            baseFreshOrder('ord_fresh_ok_server_ts', serverTimestamp(), serverTimestamp()),
+          ),
+        );
+        await assertSucceeds(
+          setDoc(
+            doc(adminCtx.firestore(), 'orders', 'ord_fresh_ok_window_past'),
+            {
+              ...baseFreshOrder('ord_fresh_ok_window_past', tsWithinPast, tsWithinPast),
+              // Historical ISO date fields still accepted by isDate() while createdAt/updatedAt require fresh Timestamp
+              paidAt: '2024-02-29T12:00:00.000Z',
+            },
+          ),
+        );
+        await assertSucceeds(
+          setDoc(
+            doc(adminCtx.firestore(), 'orders', 'ord_fresh_ok_window_future'),
+            baseFreshOrder('ord_fresh_ok_window_future', tsWithinFuture, tsWithinFuture),
+          ),
+        );
+
+        // Updating an existing order whose legacy createdAt is an ISO string succeeds when updatedAt is a fresh Timestamp
+        await assertSucceeds(
+          updateDoc(doc(adminCtx.firestore(), 'orders', 'ord_syn_processing_03'), {
+            fulfillmentNote: 'Legacy ISO createdAt preserved with fresh Timestamp updatedAt',
+            updatedAt: tsWithinPast,
+          }),
+        );
+
+        // Payment update with stale updatedAt fails, fresh Timestamp succeeds
+        await assertFails(
+          updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            statusReason: 'Stale ISO updatedAt rejected',
+            updatedAt: '2020-01-01T00:00:00.000Z',
+          }),
+        );
+        await assertSucceeds(
+          updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            statusReason: 'Fresh Timestamp updatedAt accepted',
+            updatedAt: serverTimestamp(),
+          }),
+        );
+
+        return `isFreshTs() отклонил все ${negativeTsValues.length} невалидных/несвежих форматов (старая/будущая/текущая ISO-строка, невалидная дата, число, Timestamp ±10м) без изменения документов; serverTimestamp(), Timestamp в окне ±5м и совместимость с историческими ISO-полями подтверждены.`;
+      },
+    );
+
+    await runCheck(
+      'SEC-15',
+      'SecurityRules',
+      'Stage 2.6.3.1: Полная поэлементная валидация списков isKeyIdList() и isKeyValueList() (assignedKeyIds, deliveredKeyValues)',
+      'Проверка пустого списка, валидного списка до 10 строк, а также отклонения чисел, объектов, null, boolean, вложенных массивов, пустых строк, строк сверх лимита, инъекции переноса строки и превышения размера (>10) на любых позициях списка',
+      async () => {
+        const adminCtx = testEnv.authenticatedContext('tg_900000001', {
+          email_verified: true,
+          admin: true,
+        });
+        const nowIso = new Date().toISOString();
+        const targetId = 'ord_keylist_test_01';
+
+        await assertSucceeds(
+          setDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+            orderId: targetId,
+            userId: 'tg_900001002',
+            userTelegramId: 900001002,
+            productId: 'stars_pack_100',
+            productName: '100 Telegram Stars (Synthetic)',
+            category: 'stars',
+            quantity: 2,
+            totalPrice: 200,
+            currency: 'XTR',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            assignedKeyIds: [],
+            deliveredKeyValues: [],
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+        );
+
+        // Positive: empty list already passed above; now valid lists of 2 strings and 10 strings
+        await assertSucceeds(
+          updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+            assignedKeyIds: ['dkey_0123456789abcdef0123456789abcdef', 'dkey_fedcba9876543210fedcba9876543210'],
+            deliveredKeyValues: ['STARS-GIFT-STAR-AABBCC-DDEEFF-1122-3344', 'STARS-PROMO-STAR-112233-445566-7788-99AA'],
+            updatedAt: serverTimestamp(),
+          }),
+        );
+
+        const maxTenIds = Array.from({ length: 10 }, (_, i) => `dkey_valid_item_${i + 1}`);
+        const maxTenVals = Array.from({ length: 10 }, (_, i) => `STARS-GIFT-KEY-${i + 1}-ABCD`);
+        await assertSucceeds(
+          updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+            assignedKeyIds: maxTenIds,
+            deliveredKeyValues: maxTenVals,
+            updatedAt: serverTimestamp(),
+          }),
+        );
+
+        const snapshotBeforeNeg = await firestoreRepo.getDoc<Order>('orders', targetId);
+        assert.ok(snapshotBeforeNeg, 'ord_keylist_test_01 должен существовать');
+
+        // Negative cases testing EVERY position (including index 1 and last position index 9!)
+        const invalidAssignedKeyIdLists: Array<[string, unknown]> = [
+          ['id_with_number_at_1', ['dkey_ok_01', 12345]],
+          ['id_with_number_at_0', [999]],
+          [
+            'id_with_number_at_9',
+            ['dkey_0', 'dkey_1', 'dkey_2', 'dkey_3', 'dkey_4', 'dkey_5', 'dkey_6', 'dkey_7', 'dkey_8', 999],
+          ],
+          ['id_with_object', ['dkey_ok_01', { bad: true }]],
+          ['id_with_null', ['dkey_ok_01', null]],
+          ['id_with_bool', ['dkey_ok_01', true]],
+          ['id_with_empty_string', ['dkey_ok_01', '']],
+          ['id_only_empty_string', ['']],
+          ['id_too_long_129', ['dkey_ok_01', 'a'.repeat(129)]],
+          ['id_newline_injection', ['dkey_ok_01', 'dkey_a\ndkey_b']],
+          ['id_invalid_charset', ['dkey_ok_01', 'bad key!$']],
+          ['id_too_many_11', Array.from({ length: 11 }, (_, i) => `dkey_over_${i}`)],
+          ['id_not_a_list', 'dkey_single_string'],
+        ];
+
+        for (const [, badList] of invalidAssignedKeyIdLists) {
+          await assertFails(
+            updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+              assignedKeyIds: badList,
+              updatedAt: serverTimestamp(),
+            }),
+          );
+        }
+
+        // Firestore protocol itself forbids nested arrays in lists (throws invalid-argument before write)
+        await assert.rejects(
+          async () =>
+            updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+              assignedKeyIds: ['dkey_ok_01', ['nested']],
+              updatedAt: serverTimestamp(),
+            }),
+          /Nested arrays are not supported|PERMISSION_DENIED/i,
+        );
+
+        const invalidDeliveredKeyValueLists: Array<[string, unknown]> = [
+          ['val_with_number_at_1', ['STARS-GIFT-OK-1', 42]],
+          [
+            'val_with_number_at_9',
+            ['K0', 'K1', 'K2', 'K3', 'K4', 'K5', 'K6', 'K7', 'K8', 999],
+          ],
+          ['val_with_object', ['STARS-GIFT-OK-1', { key: 'x' }]],
+          ['val_with_null', ['STARS-GIFT-OK-1', null]],
+          ['val_with_bool', ['STARS-GIFT-OK-1', false]],
+          ['val_with_empty_string', ['STARS-GIFT-OK-1', '']],
+          ['val_too_long_257', ['STARS-GIFT-OK-1', 'K'.repeat(257)]],
+          ['val_newline_injection', ['STARS-GIFT-OK-1', 'KEY1\nKEY2']],
+          ['val_too_many_11', Array.from({ length: 11 }, (_, i) => `STARS-KEY-${i}`)],
+        ];
+
+        for (const [, badList] of invalidDeliveredKeyValueLists) {
+          await assertFails(
+            updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+              deliveredKeyValues: badList,
+              updatedAt: serverTimestamp(),
+            }),
+          );
+        }
+
+        // Confirm document stayed completely unchanged after all 21 rejected list mutations
+        assert.deepEqual(
+          await firestoreRepo.getDoc<Order>('orders', targetId),
+          snapshotBeforeNeg,
+          'ord_keylist_test_01 не должен был измениться после отклонённых мутаций списков ключей',
+        );
+
+        // Verify CEL budget still passes with 10-element assignedKeyIds AND 10-element deliveredKeyValues on full 75-field Order
+        await assertSucceeds(
+          updateDoc(doc(adminCtx.firestore(), 'orders', 'ord_cel_stress_full_01'), {
+            assignedKeyIds: maxTenIds,
+            deliveredKeyValues: maxTenVals,
+            paidAt: nowIso,
+            updatedAt: serverTimestamp(),
+          }),
+        );
+
+        return `Полная поэлементная валидация списков подтверждена: пустые списки и валидные списки до 10 элементов (включая 75-полевой Order под CEL limit) проходят; все ${invalidAssignedKeyIdLists.length + invalidDeliveredKeyValueLists.length} невалидных/смешанных списков (числа, объекты, null, bool, пустые/длинные строки, \\n-инъекции, >10 элементов) отклонены без изменения документа.`;
+      },
+    );
+
+    await runCheck(
+      'SEC-16',
+      'SecurityRules',
+      'Stage 2.6.3.1: Реальная календарная валидация isDate() с учётом длины месяцев, високосных лет, времени и часового пояса',
+      'Позитивные и негативные тесты календарных дат (2024-02-29, 2028-02-29, 2000-02-29, 2026-02-31, 2026-02-29, 1900-02-29, 2100-02-29, 2026-04-31, 2026-13-01, 2026-01-01T25:00:00Z, некорректные минуты/секунды/TZ) с подтверждением неизменности документа',
+      async () => {
+        const adminCtx = testEnv.authenticatedContext('tg_900000001', {
+          email_verified: true,
+          admin: true,
+        });
+        const targetId = 'ord_date_cal_test_01';
+
+        await assertSucceeds(
+          setDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+            orderId: targetId,
+            userId: 'tg_900001002',
+            userTelegramId: 900001002,
+            productId: 'stars_pack_100',
+            productName: '100 Telegram Stars (Synthetic)',
+            category: 'stars',
+            quantity: 1,
+            totalPrice: 100,
+            currency: 'XTR',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            paidAt: '2024-02-29T12:00:00Z',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          }),
+        );
+
+        // 1. Positive Gregorian dates (leap years 2024, 2028, 2000; 30-day & 31-day month ends; TZ offsets; Firestore Timestamp)
+        const validDates: Array<[string, unknown]> = [
+          ['leap_2024_feb29', '2024-02-29T12:00:00Z'],
+          ['leap_2028_feb29_ns_tz', '2028-02-29T23:59:59.123456789+03:00'],
+          ['leap_century_2000_feb29', '2000-02-29T00:00:00-05:30'],
+          ['nonleap_2026_feb28', '2026-02-28T23:59:59.999Z'],
+          ['month30_apr30', '2026-04-30T10:20:30Z'],
+          ['month31_jan31', '2026-01-31T00:00:00Z'],
+          ['firestore_timestamp', Timestamp.fromDate(new Date('2026-02-28T12:00:00Z'))],
+        ];
+        for (const [, goodDate] of validDates) {
+          await assertSucceeds(
+            updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+              paidAt: goodDate,
+              updatedAt: serverTimestamp(),
+            }),
+          );
+        }
+
+        const beforeInvalidDates = await firestoreRepo.getDoc<Order>('orders', targetId);
+        assert.ok(beforeInvalidDates, 'ord_date_cal_test_01 должен существовать');
+
+        // 2. Negative impossible calendar dates, non-leap Feb 29, invalid time/timezone
+        const invalidDates: Array<[string, unknown]> = [
+          ['feb_31_2026', '2026-02-31T12:00:00Z'],
+          ['feb_29_nonleap_2026', '2026-02-29T12:00:00Z'],
+          ['feb_29_century_nonleap_1900', '1900-02-29T12:00:00Z'],
+          ['feb_29_century_nonleap_2100', '2100-02-29T12:00:00Z'],
+          ['feb_30_leap_2024', '2024-02-30T12:00:00Z'],
+          ['month_13', '2026-13-01T12:00:00Z'],
+          ['month_00', '2026-00-10T12:00:00Z'],
+          ['apr_31', '2026-04-31T12:00:00Z'],
+          ['jun_31', '2026-06-31T12:00:00Z'],
+          ['sep_31', '2026-09-31T12:00:00Z'],
+          ['nov_31', '2026-11-31T12:00:00Z'],
+          ['day_00', '2026-01-00T12:00:00Z'],
+          ['hour_25', '2026-01-01T25:00:00Z'],
+          ['hour_24', '2026-01-01T24:00:00Z'],
+          ['minute_60', '2026-01-01T12:60:00Z'],
+          ['second_60', '2026-01-01T12:00:60Z'],
+          ['tz_hour_25', '2026-01-01T12:00:00+25:00'],
+          ['tz_missing', '2026-01-01T12:00:00'],
+          ['number_type', 1700000000],
+        ];
+        for (const [, badDate] of invalidDates) {
+          await assertFails(
+            updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+              paidAt: badDate,
+              updatedAt: serverTimestamp(),
+            }),
+          );
+        }
+
+        // Also check invalid date inside nested mystarsPollLease
+        await assertFails(
+          updateDoc(doc(adminCtx.firestore(), 'orders', targetId), {
+            mystarsPollLease: {
+              leaseOwner: 'worker_1',
+              operationId: 'op_1',
+              leaseUntil: '2026-02-31T12:00:00Z',
+              acquiredAt: '2026-02-28T12:00:00Z',
+            },
+            updatedAt: serverTimestamp(),
+          }),
+        );
+
+        assert.deepEqual(
+          await firestoreRepo.getDoc<Order>('orders', targetId),
+          beforeInvalidDates,
+          'ord_date_cal_test_01 не должен был измениться после отклонённых невозможных дат',
+        );
+
+        return `isDate() принял все ${validDates.length} валидных календарных дат (включая високосные 2024/2028/2000-02-29, TZ и Timestamp) и отклонил все ${invalidDates.length + 1} невозможных дат (2026-02-31, 2026-02-29, 1900/2100-02-29, 2026-04-31, 2026-13-01, 25:00:00Z, вложенный lease) без изменения документа.`;
       },
     );
   } finally {
@@ -3259,13 +3648,42 @@ async function main(): Promise<void> {
   const gitStatusPorcelain = execFileSync('git', ['status', '--short'], {
     encoding: 'utf-8',
   }).trim();
-  const gitWorkingTreeDirty = gitStatusPorcelain.length > 0;
+  const nonArtifactStatusLines = gitStatusPorcelain
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(
+      (line) =>
+        line.length > 0 &&
+        !line.endsWith(' .aistudio/') &&
+        !line.includes('firestore-audit-package/export/'),
+    );
+  const gitWorkingTreeDirty = nonArtifactStatusLines.length > 0;
+  const gitDiffCommand = "git diff HEAD -- . ':!firestore-audit-package/export'";
   const gitDiffRaw = execFileSync(
     'git',
-    ['diff', 'HEAD', '--', 'firestore.rules', 'DRAFT_firestore.rules', 'firestore-audit-package/tests', 'firestore-audit-package/scripts'],
-    { encoding: 'utf-8' },
+    ['diff', 'HEAD', '--', '.', ':!firestore-audit-package/export'],
+    { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 },
   );
   const gitDiffSha256 = createHash('sha256').update(gitDiffRaw).digest('hex');
+
+  // Include untracked repo files (e.g. new CI workflow) in a combined reproducible hash
+  const untrackedFiles = execFileSync(
+    'git',
+    ['ls-files', '--others', '--exclude-standard', '--', '.', ':!.aistudio', ':!firestore-audit-package/export'],
+    { encoding: 'utf-8' },
+  )
+    .split('\n')
+    .map((f) => f.trim())
+    .filter((f) => f.length > 0)
+    .sort();
+  const combinedHasher = createHash('sha256');
+  combinedHasher.update(gitDiffRaw);
+  for (const relPath of untrackedFiles) {
+    combinedHasher.update(`\n--- UNTRACKED FILE: ${relPath} ---\n`);
+    combinedHasher.update(fs.readFileSync(path.resolve(process.cwd(), relPath)));
+  }
+  const fullTreeDiffSha256 = combinedHasher.digest('hex');
+
   const javaInfo = verifyJavaRuntime('java', 21);
   const firebaseCmd = process.platform === 'win32' ? 'firebase.cmd' : 'firebase';
   const fbRes = spawnSync(firebaseCmd, ['--version'], {
@@ -3288,7 +3706,10 @@ async function main(): Promise<void> {
         gitSha,
         gitBranch,
         gitWorkingTreeDirty,
+        gitDiffCommand,
         gitDiffSha256,
+        untrackedFiles,
+        fullTreeDiffSha256,
         executedAt: new Date().toISOString(),
         nodeVersion: process.version,
         javaVersion: javaInfo.firstLine,

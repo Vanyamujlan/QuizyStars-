@@ -1,0 +1,90 @@
+name: Exact-HEAD Security Rules & Emulator Audit
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-head-audit:
+    name: Build, Lint, Unit Tests & Firestore Emulator Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
+      GCLOUD_PROJECT: demo-stars-shop-audit
+      GOOGLE_CLOUD_PROJECT: demo-stars-shop-audit
+
+    steps:
+      - name: Checkout exact commit SHA
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify clean exact-HEAD checkout
+        run: |
+          HEAD_SHA="$(git rev-parse HEAD)"
+          echo "Auditing exact commit SHA: ${HEAD_SHA}"
+          test -z "$(git status --porcelain)" || (echo "Working tree is not clean!" && git status --short && exit 1)
+
+      - name: Verify firestore.rules and DRAFT_firestore.rules parity
+        run: diff -u firestore.rules DRAFT_firestore.rules
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup OpenJDK 21 (for Firestore Emulator)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (TypeScript typecheck)
+        run: npm run build
+
+      - name: Lint (ESLint + Firebase Security Rules plugin)
+        run: npm run lint
+
+      - name: Run Unit & Integration Tests
+        run: npm test
+
+      - name: Run Full Local Firestore Emulator Audit
+        run: npm run audit:emulator
+
+      - name: Assert exact-HEAD audit provenance & zero failures
+        run: |
+          node -e "
+            const fs = require('fs');
+            const { execFileSync } = require('child_process');
+            const r = JSON.parse(fs.readFileSync('firestore-audit-package/export/audit-test-results.json', 'utf8'));
+            const expectedSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+            if (r.gitSha !== expectedSha) throw new Error('gitSha mismatch: ' + r.gitSha + ' !== ' + expectedSha);
+            if (r.gitWorkingTreeDirty !== false) throw new Error('Expected clean working tree on CI exact-HEAD run');
+            if (r.emulatorUsed !== true) throw new Error('Expected emulatorUsed=true');
+            if (r.projectId !== 'demo-stars-shop-audit') throw new Error('Unexpected projectId: ' + r.projectId);
+            if (r.failed !== 0) throw new Error('Audit failed count: ' + r.failed);
+            console.log('Verified exact-HEAD audit:', { gitSha: r.gitSha, passed: r.passed, failed: r.failed, projectId: r.projectId });
+          "
+
+      - name: Upload Exact-HEAD Audit Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-head-audit-${{ github.sha }}
+          path: |
+            firestore-audit-package/export/audit-test-results.json
+            firestore-audit-package/export/firestore-collections-dump.json
+          retention-days: 30
