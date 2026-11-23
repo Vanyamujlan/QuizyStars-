@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -1322,6 +1323,607 @@ async function main(): Promise<void> {
           }
         }
         return `Все ${DIRTY_DOZEN_TESTS.length}/12 атакующих векторов Dirty Dozen заблокированы эмулятором (PERMISSION_DENIED).`;
+      },
+    );
+
+    await runCheck(
+      'SEC-11',
+      'SecurityRules',
+      'Orders: негативная валидация типов, диапазонов, дат, статусов, финансовых полей, неизвестных полей и CEL-лимит',
+      'Проверка отклонения невалидных/поддельных Order-полей (отрицательные/строковые суммы, невалидные quantity/userTelegramId/даты/статусы, финансовые/MyStars поля, лишние поля) с проверкой неизменности состояния + стресс-тест полного документа под CEL limit 1000',
+      async () => {
+        const buyerCtx = testEnv.authenticatedContext('tg_900001002', {
+          email_verified: true,
+        });
+        const adminCtx = testEnv.authenticatedContext('tg_900000001', {
+          email_verified: true,
+          admin: true,
+        });
+        const nowIso = new Date().toISOString();
+        const baseOrder = (orderId: string, overrides: Record<string, unknown> = {}) => ({
+          orderId,
+          userId: 'tg_900001002',
+          userTelegramId: 900001002,
+          productId: 'stars_pack_100',
+          productName: '100 Telegram Stars (Synthetic)',
+          category: 'stars',
+          quantity: 1,
+          totalPrice: 100,
+          currency: 'XTR',
+          paymentStatus: 'pending',
+          fulfillmentStatus: 'pending',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          ...overrides,
+        });
+
+        const existingBefore = await firestoreRepo.getDoc<Order>('orders', 'ord_syn_processing_03');
+        assert.ok(existingBefore, 'ord_syn_processing_03 должен существовать до тестов SEC-11');
+
+        // 1. Negative / string totalPrice, negative / zero quantity, invalid userTelegramId, invalid dates, unknown statuses, unknown fields
+        const invalidAdminCreateCases: Array<[string, Record<string, unknown>]> = [
+          ['ord_neg_totalprice', baseOrder('ord_neg_totalprice', { totalPrice: -100 })],
+          ['ord_str_totalprice', baseOrder('ord_str_totalprice', { totalPrice: '100' })],
+          ['ord_neg_qty', baseOrder('ord_neg_qty', { quantity: -1 })],
+          ['ord_zero_qty', baseOrder('ord_zero_qty', { quantity: 0 })],
+          ['ord_float_qty', baseOrder('ord_float_qty', { quantity: 1.5 })],
+          ['ord_zero_tgid', baseOrder('ord_zero_tgid', { userTelegramId: 0 })],
+          ['ord_neg_tgid', baseOrder('ord_neg_tgid', { userTelegramId: -900001002 })],
+          ['ord_float_tgid', baseOrder('ord_float_tgid', { userTelegramId: 900001002.5 })],
+          ['ord_str_tgid', baseOrder('ord_str_tgid', { userTelegramId: '900001002' })],
+          ['ord_bad_createdat', baseOrder('ord_bad_createdat', { createdAt: 'not-a-date' })],
+          ['ord_bad_cal_date', baseOrder('ord_bad_cal_date', { createdAt: '2026-13-45T99:99:99Z' })],
+          ['ord_bad_updatedat', baseOrder('ord_bad_updatedat', { updatedAt: 1700000000 })],
+          ['ord_bad_paidat', baseOrder('ord_bad_paidat', { paidAt: 'invalid-iso' })],
+          ['ord_bad_paystatus', baseOrder('ord_bad_paystatus', { paymentStatus: 'hacked_paid' })],
+          ['ord_bad_fulstatus', baseOrder('ord_bad_fulstatus', { fulfillmentStatus: 'force_shipped' })],
+          ['ord_neg_grossrev', baseOrder('ord_neg_grossrev', { grossRevenueUsdCents: -1 })],
+          ['ord_str_provfee', baseOrder('ord_str_provfee', { providerFeeUsdCents: '15' })],
+          ['ord_neg_mscost', baseOrder('ord_neg_mscost', { mystarsCostUsdCents: -50 })],
+          ['ord_str_balref', baseOrder('ord_str_balref', { balanceRefunded: 'true' })],
+          ['ord_bad_ms_dec', baseOrder('ord_bad_ms_dec', { mystarsWholesaleCostUsdt: '-1.50' })],
+          ['ord_float_profit', baseOrder('ord_float_profit', { netProfitUsdCents: 12.5 })],
+          ['ord_bad_duration', baseOrder('ord_bad_duration', { durationMonths: 99 })],
+          ['ord_bad_method', baseOrder('ord_bad_method', { paymentMethod: 'fake_gateway' })],
+          ['ord_ghost_field', baseOrder('ord_ghost_field', { ghostField: 'injected' })],
+        ];
+
+        for (const [docId, payload] of invalidAdminCreateCases) {
+          await assertFails(setDoc(doc(adminCtx.firestore(), 'orders', docId), payload));
+          const created = await firestoreRepo.getDoc<Order>('orders', docId);
+          assert.equal(created, null, `Невалидный заказ ${docId} не должен был записаться`);
+        }
+
+        // 2. Buyer tampering on create: financial/accounting fields, invalid buyer-optional fields, extra fields
+        const invalidBuyerCreateCases: Array<[string, Record<string, unknown>]> = [
+          ['ord_buy_grossrev', baseOrder('ord_buy_grossrev', { grossRevenueUsdCents: 9999 })],
+          ['ord_buy_provfee', baseOrder('ord_buy_provfee', { providerFeeUsdCents: 0 })],
+          ['ord_buy_mscost', baseOrder('ord_buy_mscost', { mystarsCostUsdCents: 0 })],
+          ['ord_buy_balref', baseOrder('ord_buy_balref', { balanceRefunded: true })],
+          ['ord_buy_neg_cents', baseOrder('ord_buy_neg_cents', { totalPriceUsdCents: -100 })],
+          ['ord_buy_bad_dur', baseOrder('ord_buy_bad_dur', { durationMonths: 24 })],
+          ['ord_buy_bad_method', baseOrder('ord_buy_bad_method', { paymentMethod: 'free_money' })],
+          ['ord_buy_ghost', baseOrder('ord_buy_ghost', { ghostField: 'buyer_inject' })],
+        ];
+
+        for (const [docId, payload] of invalidBuyerCreateCases) {
+          await assertFails(setDoc(doc(buyerCtx.firestore(), 'orders', docId), payload));
+          const created = await firestoreRepo.getDoc<Order>('orders', docId);
+          assert.equal(created, null, `Поддельный заказ покупателя ${docId} не должен был создаться`);
+        }
+
+        // 3. Invalid updates on existing order (both buyer and admin) must fail AND leave document unchanged
+        const invalidUpdates: Array<{ ctx: typeof buyerCtx; patch: Record<string, unknown> }> = [
+          { ctx: buyerCtx, patch: { grossRevenueUsdCents: 1, updatedAt: nowIso } },
+          { ctx: buyerCtx, patch: { providerFeeUsdCents: 0, updatedAt: nowIso } },
+          { ctx: buyerCtx, patch: { mystarsCostUsdCents: 0, updatedAt: nowIso } },
+          { ctx: buyerCtx, patch: { balanceRefunded: true, updatedAt: nowIso } },
+          { ctx: buyerCtx, patch: { ghostField: 'x', updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { paymentStatus: 'unknown_status', updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { fulfillmentStatus: 'unknown_status', updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { grossRevenueUsdCents: -5, updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { providerFeeUsdCents: -1, updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { mystarsCostUsdCents: 'bad', updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { balanceRefunded: 123, updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { mystarsPollAttempts: -1, updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { ghostField: 'admin_extra', updatedAt: nowIso } },
+          { ctx: adminCtx, patch: { updatedAt: 'not-a-valid-date' } },
+        ];
+        for (const { ctx, patch } of invalidUpdates) {
+          await assertFails(updateDoc(doc(ctx.firestore(), 'orders', 'ord_syn_processing_03'), patch));
+        }
+
+        const existingAfter = await firestoreRepo.getDoc<Order>('orders', 'ord_syn_processing_03');
+        assert.deepEqual(
+          existingAfter,
+          existingBefore,
+          'После всех отклонённых мутаций документ ord_syn_processing_03 должен остаться полностью неизменным',
+        );
+
+        // 4. Positive CEL expression budget stress test: full-field Order create + update under 1000 CEL limit
+        const fullOrderId = 'ord_cel_stress_full_01';
+        const fullOrderPayload: Record<string, unknown> = {
+          orderId: fullOrderId,
+          userId: 'tg_900001002',
+          userTelegramId: 900001002,
+          username: 'syn_multi_buyer',
+          recipientUsername: 'syn_multi_buyer',
+          productId: 'stars_pack_100',
+          productName: '100 Telegram Stars (Synthetic)',
+          category: 'stars',
+          quantity: 100,
+          durationMonths: 3,
+          unitPriceUsdCents: 2,
+          totalPriceUsdCents: 200,
+          totalPrice: 200,
+          currency: 'USD',
+          paymentMethod: 'cryptobot',
+          activePaymentId: 'ordpay_cel_01',
+          externalInvoiceId: 'ext_inv_cel_01',
+          balancePaymentId: 'balpay_cel_01',
+          balanceRefunded: false,
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          telegramPaymentChargeId: 'chg_cel_01',
+          providerPaymentChargeId: 'prov_cel_01',
+          fulfillmentProvider: 'mystars',
+          grossRevenueUsdCents: 200,
+          providerFeeUsdCents: 6,
+          mystarsCurrency: 'usdt_ton',
+          mystarsWholesaleCostUsdt: '1.500000',
+          mystarsCostUsdCents: 150,
+          tonNetworkFeeTon: '0.005',
+          tonNetworkFeeUsdCents: 3,
+          netProfitUsdCents: 41,
+          mystarsOrderId: 'ms_ord_cel_01',
+          mystarsOrderStatus: 'awaiting_payment',
+          mystarsPayToAddress: 'EQC_synthetic_ton_address_0001',
+          mystarsPaymentMemo: 'memo_cel_01',
+          mystarsPaymentAmountUsdt: '1.500000',
+          mystarsPurchaseTx: 'tx_purchase_cel_01',
+          mystarsPaymentTx: 'tx_payment_cel_01',
+          mystarsReversalTx: 'tx_rev_cel_01',
+          mystarsFailureReason: 'none',
+          mystarsExpiresAt: nowIso,
+          mystarsLastPolledAt: nowIso,
+          mystarsPollAttempts: 2,
+          mystarsLastPollError: 'transient',
+          mystarsPollLease: {
+            leaseOwner: 'worker_1',
+            operationId: 'op_1',
+            leaseUntil: nowIso,
+            acquiredAt: nowIso,
+          },
+          mystarsStuckAlertedAt: nowIso,
+          mystarsUnknownStatusSeen: 'none',
+          mystarsCreateInFlight: false,
+          mystarsAmbiguousPostAt: nowIso,
+          fulfillmentNote: 'Full CEL stress test order',
+          fulfillmentStartedAt: nowIso,
+          fulfillmentAttempts: 1,
+          fulfillmentLastError: 'none',
+          fulfillmentNextRetryAt: nowIso,
+          fulfillmentIdempotencyKey: 'fulfill_ord_cel_stress_full_01',
+          externalExecutionReference: 'ms_ord_cel_01',
+          needsManualReconciliation: false,
+          assignedKeyIds: ['key_01'],
+          deliveredKeyValues: ['VAL-01'],
+          awaitingKeyStock: false,
+          refundState: 'refund_in_progress',
+          refundLockToken: 'lock_tok_01',
+          refundStartedAt: nowIso,
+          refundLastError: 'none',
+          refundStatsAdjusted: false,
+          adminNotifiedAt: nowIso,
+          buyerNotifiedAt: nowIso,
+          buyerNotificationState: { status: 'sent', eventId: 'evt_b1', attemptCount: 1 },
+          adminNotificationState: { status: 'sent', eventId: 'evt_a1', attemptCount: 1 },
+          createdAt: nowIso,
+          paidAt: nowIso,
+          completedAt: nowIso,
+          completedByAdminId: 900000001,
+          updatedAt: nowIso,
+        };
+        await assertSucceeds(setDoc(doc(adminCtx.firestore(), 'orders', fullOrderId), fullOrderPayload));
+        await assertSucceeds(
+          updateDoc(doc(adminCtx.firestore(), 'orders', fullOrderId), {
+            netProfitUsdCents: -15,
+            mystarsPollAttempts: 3,
+            updatedAt: nowIso,
+          }),
+        );
+
+        return `Отклонены все ${invalidAdminCreateCases.length + invalidBuyerCreateCases.length + invalidUpdates.length} негативных кейсов по Orders (состояние ord_syn_processing_03 не изменилось); полный 75-полевой Order успешно прошёл create и update без превышения CEL expression limit (1000).`;
+      },
+    );
+
+    await runCheck(
+      'SEC-12',
+      'SecurityRules',
+      'Payments & BalanceTopUps: негативная валидация сумм, комиссий, decimal-строк, дат, провайдеров, статусов и защита external payment ID',
+      'Проверка отклонения отрицательных/строковых сумм и комиссий, битых expectedAmountStr/actualAmountStr, невалидных дат/provider/status, попыток изменения external payment ID пользователем и админом с подтверждением неизменности документа',
+      async () => {
+        const buyerCtx = testEnv.authenticatedContext('tg_900001002', {
+          email_verified: true,
+        });
+        const adminCtx = testEnv.authenticatedContext('tg_900000001', {
+          email_verified: true,
+          admin: true,
+        });
+        const nowIso = new Date().toISOString();
+
+        const basePayment = (paymentId: string, overrides: Record<string, unknown> = {}) => ({
+          paymentId,
+          kind: 'order',
+          provider: 'cryptobot',
+          providerPaymentId: `inv_${paymentId}`,
+          orderId: 'ord_syn_pending_01',
+          userId: 'tg_900001002',
+          userTelegramId: 900001002,
+          totalAmount: 100,
+          expectedUsdCents: 100,
+          feeUsdCents: 3,
+          netUsdCents: 97,
+          expectedAmountStr: '1.00',
+          actualAmountStr: '1.00',
+          currency: 'USDT',
+          network: 'TON',
+          invoicePayload: 'ord_syn_pending_01',
+          payUrl: 'https://t.me/CryptoBot?start=IVtest123',
+          status: 'pending',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          ...overrides,
+        });
+
+        const existingPayBefore = await firestoreRepo.getDoc<PaymentRecord>(
+          'payments',
+          'pay_chg_syn_paid_02',
+        );
+        assert.ok(existingPayBefore, 'pay_chg_syn_paid_02 должен существовать до SEC-12');
+
+        const invalidPaymentCreates: Array<[string, Record<string, unknown>]> = [
+          ['pay_neg_exp_cents', basePayment('pay_neg_exp_cents', { expectedUsdCents: -100 })],
+          ['pay_str_total', basePayment('pay_str_total', { totalAmount: '100' })],
+          ['pay_str_exp_cents', basePayment('pay_str_exp_cents', { expectedUsdCents: '100' })],
+          ['pay_neg_fee', basePayment('pay_neg_fee', { feeUsdCents: -5 })],
+          ['pay_float_fee', basePayment('pay_float_fee', { feeUsdCents: 3.5 })],
+          ['pay_str_fee', basePayment('pay_str_fee', { feeUsdCents: '3' })],
+          ['pay_neg_net', basePayment('pay_neg_net', { netUsdCents: -1 })],
+          ['pay_float_net', basePayment('pay_float_net', { netUsdCents: 96.5 })],
+          ['pay_str_net', basePayment('pay_str_net', { netUsdCents: '97' })],
+          ['pay_bad_exp_str_abc', basePayment('pay_bad_exp_str_abc', { expectedAmountStr: 'abc' })],
+          ['pay_bad_exp_str_neg', basePayment('pay_bad_exp_str_neg', { expectedAmountStr: '-1.00' })],
+          ['pay_bad_exp_str_zero', basePayment('pay_bad_exp_str_zero', { expectedAmountStr: '0.00' })],
+          ['pay_bad_exp_str_empty', basePayment('pay_bad_exp_str_empty', { expectedAmountStr: '' })],
+          ['pay_bad_exp_str_num', basePayment('pay_bad_exp_str_num', { expectedAmountStr: 1.0 })],
+          ['pay_bad_act_str_abc', basePayment('pay_bad_act_str_abc', { actualAmountStr: 'NaN' })],
+          ['pay_bad_act_str_neg', basePayment('pay_bad_act_str_neg', { actualAmountStr: '-0.50' })],
+          ['pay_bad_act_str_null', basePayment('pay_bad_act_str_null', { actualAmountStr: null })],
+          ['pay_bad_ver_str', basePayment('pay_bad_ver_str', { verifiedAmountStr: '1.2.3' })],
+          ['pay_bad_rate_str', basePayment('pay_bad_rate_str', { exchangeRateUsdStr: '0' })],
+          ['pay_bad_payurl', basePayment('pay_bad_payurl', { payUrl: 'javascript:alert(1)' })],
+          ['pay_bad_expiresat', basePayment('pay_bad_expiresat', { expiresAt: 'invalid-date' })],
+          ['pay_bad_paidat', basePayment('pay_bad_paidat', { paidAt: '2026-13-01T00:00:00Z' })],
+          ['pay_bad_confirmedat', basePayment('pay_bad_confirmedat', { confirmedAt: 1700000000 })],
+          ['pay_bad_updatedat', basePayment('pay_bad_updatedat', { updatedAt: 'bad-ts' })],
+          ['pay_bad_refundedat', basePayment('pay_bad_refundedat', { refundedAt: 'tomorrow' })],
+          ['pay_bad_createdat', basePayment('pay_bad_createdat', { createdAt: 'not-iso' })],
+          ['pay_unknown_provider', basePayment('pay_unknown_provider', { provider: 'fragment' })],
+          ['pay_unknown_status', basePayment('pay_unknown_status', { status: 'force_settled' })],
+          ['pay_unknown_field', basePayment('pay_unknown_field', { externalPaymentId: 'spoof_ext' })],
+        ];
+
+        for (const [payId, payload] of invalidPaymentCreates) {
+          await assertFails(setDoc(doc(adminCtx.firestore(), 'payments', payId), payload));
+          const created = await firestoreRepo.getDoc<PaymentRecord>('payments', payId);
+          assert.equal(created, null, `Невалидный платёж ${payId} не должен был создаться`);
+        }
+
+        // User attempts to modify external payment IDs or inject externalPaymentId -> DENIED
+        await assertFails(
+          updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            providerPaymentId: 'hijacked_ext_id',
+            updatedAt: nowIso,
+          }),
+        );
+        await assertFails(
+          updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            telegramPaymentChargeId: 'hijacked_tg_charge',
+            updatedAt: nowIso,
+          }),
+        );
+        await assertFails(
+          updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            providerPaymentChargeId: 'hijacked_prov_charge',
+            updatedAt: nowIso,
+          }),
+        );
+        await assertFails(
+          updateDoc(doc(buyerCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            externalPaymentId: 'hijacked_ext_field',
+            updatedAt: nowIso,
+          }),
+        );
+
+        // Even Admin cannot overwrite an already-bound telegramPaymentChargeId or set invalid fields on existing payment
+        await assertFails(
+          updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            telegramPaymentChargeId: 'overwritten_charge_id',
+            updatedAt: nowIso,
+          }),
+        );
+        await assertFails(
+          updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            expectedUsdCents: -1,
+            updatedAt: nowIso,
+          }),
+        );
+        await assertFails(
+          updateDoc(doc(adminCtx.firestore(), 'payments', 'pay_chg_syn_paid_02'), {
+            paidAt: 'bad-date',
+            updatedAt: nowIso,
+          }),
+        );
+
+        const existingPayAfter = await firestoreRepo.getDoc<PaymentRecord>(
+          'payments',
+          'pay_chg_syn_paid_02',
+        );
+        assert.deepEqual(
+          existingPayAfter,
+          existingPayBefore,
+          'После всех отклонённых мутаций документ pay_chg_syn_paid_02 должен остаться неизменным',
+        );
+
+        // Positive full-field Payment create & update (CEL budget check) + providerPaymentId immutability
+        const fullPayId = 'pay_cel_stress_full_01';
+        await assertSucceeds(
+          setDoc(doc(adminCtx.firestore(), 'payments', fullPayId), {
+            ...basePayment(fullPayId),
+            telegramPaymentChargeId: 'chg_full_cel_01',
+            providerPaymentChargeId: 'prov_full_cel_01',
+            topUpId: 'topup_ref_01',
+            verifiedAmountStr: '1.00',
+            verifiedCurrency: 'USDT',
+            verifiedNetwork: 'TON',
+            exchangeRateUsdStr: '1.000000',
+            status: 'refund_required',
+            statusReason: 'Late payment after cancellation',
+            failureReason: 'SUPERSEDED_BY_NEW_INVOICE',
+            needsManualReconciliation: true,
+            refundRequired: true,
+            reconciliationState: 'refund_required',
+            reconciliationReason: 'LATE_PAYMENT_ORDER_CANCELLED',
+            conflictingOrderStatus: 'cancelled',
+            conflictingFulfillmentStatus: 'cancelled',
+            supersededByPaymentId: 'pay_newer_01',
+            expiresAt: nowIso,
+            paidAt: nowIso,
+            confirmedAt: nowIso,
+            refundedAt: nowIso,
+          }),
+        );
+        await assertFails(
+          updateDoc(doc(adminCtx.firestore(), 'payments', fullPayId), {
+            providerPaymentId: 'mutated_provider_id',
+            updatedAt: nowIso,
+          }),
+        );
+        await assertSucceeds(
+          updateDoc(doc(adminCtx.firestore(), 'payments', fullPayId), {
+            reconciliationState: 'resolved',
+            refundRequired: false,
+            updatedAt: nowIso,
+          }),
+        );
+
+        // BalanceTopUp negative & positive checks
+        await assertFails(
+          setDoc(doc(adminCtx.firestore(), 'balance_topups', 'topup_neg_bad_01'), {
+            paymentId: 'topup_neg_bad_01',
+            userId: 'tg_900001002',
+            userTelegramId: 900001002,
+            provider: 'cryptobot',
+            amountUsdCents: -500,
+            feeUsdCents: 15,
+            amountCreditedUsdCents: 485,
+            expectedAmountStr: '-5.00',
+            currency: 'USDT',
+            paymentStatus: 'pending',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          }),
+        );
+        await assertSucceeds(
+          setDoc(doc(adminCtx.firestore(), 'balance_topups', 'topup_valid_sec12_01'), {
+            paymentId: 'topup_valid_sec12_01',
+            userId: 'tg_900001002',
+            userTelegramId: 900001002,
+            provider: 'cryptobot',
+            amountUsdCents: 500,
+            feeUsdCents: 15,
+            amountCreditedUsdCents: 485,
+            expectedAmountStr: '5.00',
+            currency: 'USDT',
+            paymentStatus: 'pending',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          }),
+        );
+
+        return `Отклонены все ${invalidPaymentCreates.length} невалидных Payment-кейсов, все попытки изменения external payment ID (пользователем и админом) и невалидный balance_topup (pay_chg_syn_paid_02 не изменился); полный 40-полевой Payment и валидный balance_topup успешно прошли под CEL limit.`;
+      },
+    );
+
+    await runCheck(
+      'SEC-13',
+      'SecurityRules',
+      'Access Control: матрица ролей/claims, запрет подмены финансовых итогов, статусов и полная изоляция payment_locks/digital_keys',
+      'Проверка неавторизованного пользователя, пользователя с неполными claims, пользователя без admin claim, админа с валидными claims, попыток покупателя поставить paid/completed или изменить финансовые поля, и полной блокировки payment_locks/digital_keys даже для админа',
+      async () => {
+        const nowIso = new Date().toISOString();
+        const unauthCtx = testEnv.unauthenticatedContext();
+        // Regular user with ONLY email_verified (missing optional admin & telegram_verified claims)
+        const buyerMissingOptClaimsCtx = testEnv.authenticatedContext('tg_900001002', {
+          email_verified: true,
+        });
+        // Regular user with ONLY telegram_verified (missing email_verified & admin claims)
+        const buyerTgClaimOnlyCtx = testEnv.authenticatedContext('tg_900001002', {
+          telegram_verified: true,
+        });
+        // Authenticated but unverified user (even with spoofed admin: true)
+        const unverifiedAdminSpoofCtx = testEnv.authenticatedContext('tg_900001002', {
+          admin: true,
+        });
+        // Valid custom-claim admin (UID not present in /admins collection, proving claim-only admin RBAC)
+        const claimAdminCtx = testEnv.authenticatedContext('adm_claim_only_999', {
+          email_verified: true,
+          admin: true,
+        });
+        // Admin via /admins/{uid} doc
+        const docAdminCtx = testEnv.authenticatedContext('tg_900000001', {
+          email_verified: true,
+        });
+
+        // Seed a payment_locks document via Admin SDK to verify complete client lockdown
+        const lockDoc: PaymentLockRecord = {
+          lockId: 'cryptobot_inv_sec13_lock',
+          provider: 'cryptobot',
+          providerPaymentId: 'inv_sec13_lock',
+          targetType: 'order',
+          targetId: 'ord_syn_pending_01',
+          paymentId: 'pay_sec13_lock',
+          userId: 'tg_900001002',
+          amountUsdCents: 100,
+          claimedAt: nowIso,
+        };
+        await firestoreRepo.setDoc<PaymentLockRecord>('payment_locks', lockDoc.lockId, lockDoc);
+
+        const pendingOrderBefore = await firestoreRepo.getDoc<Order>('orders', 'ord_syn_pending_01');
+        const paidOrderBefore = await firestoreRepo.getDoc<Order>('orders', 'ord_syn_paid_02');
+        const userBefore = await firestoreRepo.getDoc<StoreUser>('users', 'tg_900001002');
+        assert.ok(pendingOrderBefore && paidOrderBefore && userBefore);
+
+        // 1. Unauthenticated user blocked across private collections
+        await assertFails(getDoc(doc(unauthCtx.firestore(), 'orders', 'ord_syn_pending_01')));
+        await assertFails(getDoc(doc(unauthCtx.firestore(), 'payments', 'pay_chg_syn_paid_02')));
+        await assertFails(getDoc(doc(unauthCtx.firestore(), 'admins', 'tg_900000001')));
+        await assertFails(getDoc(doc(unauthCtx.firestore(), 'payment_locks', lockDoc.lockId)));
+
+        // 2. Missing optional custom claims work cleanly without rule runtime errors
+        await assertSucceeds(
+          getDoc(doc(buyerMissingOptClaimsCtx.firestore(), 'orders', 'ord_syn_pending_01')),
+        );
+        await assertSucceeds(
+          getDoc(doc(buyerTgClaimOnlyCtx.firestore(), 'orders', 'ord_syn_pending_01')),
+        );
+        // Unverified token (even with admin: true) is strictly rejected
+        await assertFails(
+          getDoc(doc(unverifiedAdminSpoofCtx.firestore(), 'orders', 'ord_syn_pending_01')),
+        );
+        await assertFails(
+          getDoc(doc(unverifiedAdminSpoofCtx.firestore(), 'transactions', 'tx_syn_001_invoice')),
+        );
+
+        // 3. Valid custom-claim admin CAN read admin collections & update orders
+        await assertSucceeds(
+          getDoc(doc(claimAdminCtx.firestore(), 'transactions', 'tx_syn_001_invoice')),
+        );
+        await assertSucceeds(
+          getDoc(doc(claimAdminCtx.firestore(), 'orders', 'ord_syn_paid_02')),
+        );
+
+        // 4. Buyer without admin claim CANNOT set paymentStatus='paid' or fulfillmentStatus='completed'
+        await assertFails(
+          updateDoc(doc(buyerMissingOptClaimsCtx.firestore(), 'orders', 'ord_syn_pending_01'), {
+            paymentStatus: 'paid',
+            updatedAt: nowIso,
+          }),
+        );
+        await assertFails(
+          updateDoc(doc(buyerMissingOptClaimsCtx.firestore(), 'orders', 'ord_syn_paid_02'), {
+            fulfillmentStatus: 'completed',
+            updatedAt: nowIso,
+          }),
+        );
+
+        // 5. Buyer CANNOT modify financial totals on users or orders
+        for (const userPatch of [
+          { balanceUsdCents: 999999, updatedAt: nowIso },
+          { totalSpentUsdCents: 999999, updatedAt: nowIso },
+          { totalSpentStars: 999999, updatedAt: nowIso },
+          { totalOrders: 999, updatedAt: nowIso },
+          { balance: 999999, updatedAt: nowIso },
+        ]) {
+          await assertFails(
+            updateDoc(doc(buyerMissingOptClaimsCtx.firestore(), 'users', 'tg_900001002'), userPatch),
+          );
+        }
+        for (const ordPatch of [
+          { totalPrice: 1, updatedAt: nowIso },
+          { totalPriceUsdCents: 1, updatedAt: nowIso },
+          { grossRevenueUsdCents: 1, updatedAt: nowIso },
+        ]) {
+          await assertFails(
+            updateDoc(
+              doc(buyerMissingOptClaimsCtx.firestore(), 'orders', 'ord_syn_pending_01'),
+              ordPatch,
+            ),
+          );
+        }
+
+        // Verify all protected documents remain strictly unchanged
+        assert.deepEqual(
+          await firestoreRepo.getDoc<Order>('orders', 'ord_syn_pending_01'),
+          pendingOrderBefore,
+          'ord_syn_pending_01 не должен был измениться',
+        );
+        assert.deepEqual(
+          await firestoreRepo.getDoc<Order>('orders', 'ord_syn_paid_02'),
+          paidOrderBefore,
+          'ord_syn_paid_02 не должен был измениться',
+        );
+        assert.deepEqual(
+          await firestoreRepo.getDoc<StoreUser>('users', 'tg_900001002'),
+          userBefore,
+          'users/tg_900001002 не должен был измениться',
+        );
+
+        // 6. payment_locks & digital_keys strictly denied for ALL client contexts (including admins!)
+        const allClientCtxs = [unauthCtx, buyerMissingOptClaimsCtx, docAdminCtx, claimAdminCtx];
+        for (const ctx of allClientCtxs) {
+          const db = ctx.firestore();
+          await assertFails(getDoc(doc(db, 'payment_locks', lockDoc.lockId)));
+          await assertFails(getDocs(collection(db, 'payment_locks')));
+          await assertFails(
+            setDoc(doc(db, 'payment_locks', 'rogue_lock_01'), {
+              ...lockDoc,
+              lockId: 'rogue_lock_01',
+            }),
+          );
+          await assertFails(
+            updateDoc(doc(db, 'payment_locks', lockDoc.lockId), { amountUsdCents: 0 }),
+          );
+          await assertFails(deleteDoc(doc(db, 'payment_locks', lockDoc.lockId)));
+
+          await assertFails(getDocs(collection(db, 'digital_keys')));
+          await assertFails(setDoc(doc(db, 'digital_keys', 'rogue_key_01'), { keyValue: 'X' }));
+        }
+
+        // Confirm payment_locks document untouched and no rogue lock created
+        const lockAfter = await firestoreRepo.getDoc<PaymentLockRecord>(
+          'payment_locks',
+          lockDoc.lockId,
+        );
+        assert.deepEqual(lockAfter, lockDoc, 'payment_locks документ не должен был измениться');
+        assert.equal(
+          await firestoreRepo.getDoc<PaymentLockRecord>('payment_locks', 'rogue_lock_01'),
+          null,
+          'rogue_lock_01 не должен существовать',
+        );
+
+        return 'Матрица ролей/claims (unauth, missing optional claims, unverified spoof, custom-claim admin, /admins doc admin) подтверждена; подмена paid/completed и финансовых итогов заблокирована без изменения документов; payment_locks и digital_keys полностью закрыты для всех клиентов включая админов.';
       },
     );
   } finally {
@@ -2654,6 +3256,16 @@ async function main(): Promise<void> {
   const gitBranch = execFileSync('git', ['branch', '--show-current'], {
     encoding: 'utf-8',
   }).trim();
+  const gitStatusPorcelain = execFileSync('git', ['status', '--short'], {
+    encoding: 'utf-8',
+  }).trim();
+  const gitWorkingTreeDirty = gitStatusPorcelain.length > 0;
+  const gitDiffRaw = execFileSync(
+    'git',
+    ['diff', 'HEAD', '--', 'firestore.rules', 'DRAFT_firestore.rules', 'firestore-audit-package/tests', 'firestore-audit-package/scripts'],
+    { encoding: 'utf-8' },
+  );
+  const gitDiffSha256 = createHash('sha256').update(gitDiffRaw).digest('hex');
   const javaInfo = verifyJavaRuntime('java', 21);
   const firebaseCmd = process.platform === 'win32' ? 'firebase.cmd' : 'firebase';
   const fbRes = spawnSync(firebaseCmd, ['--version'], {
@@ -2675,6 +3287,8 @@ async function main(): Promise<void> {
       {
         gitSha,
         gitBranch,
+        gitWorkingTreeDirty,
+        gitDiffSha256,
         executedAt: new Date().toISOString(),
         nodeVersion: process.version,
         javaVersion: javaInfo.firstLine,

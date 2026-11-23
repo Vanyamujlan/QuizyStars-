@@ -9,7 +9,7 @@ service cloud.firestore {
 
     // Global Primitives
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.matches('^[a-zA-Z0-9_\\-]{1,128}$');
     }
 
     function incoming() {
@@ -25,9 +25,9 @@ service cloud.firestore {
     }
 
     function isVerified() {
-      return isSignedIn() && request.auth.token != null && (
-        ('email_verified' in request.auth.token && request.auth.token.email_verified == true) ||
-        ('telegram_verified' in request.auth.token && request.auth.token.telegram_verified == true)
+      return request.auth != null && (
+        request.auth.token.get('email_verified', false) == true ||
+        request.auth.token.get('telegram_verified', false) == true
       );
     }
 
@@ -39,32 +39,70 @@ service cloud.firestore {
     // Verifies admin status only via custom claims (admin == true) or /admins/{uid} document.
     function isAdmin() {
       return isVerified() && (
-        ('admin' in request.auth.token && request.auth.token.admin == true) ||
+        request.auth.token.get('admin', false) == true ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
 
-    // Supports both Firestore native Timestamp and ISO-8601 strings from src/types.ts
-    function isValidDateVal(val) {
-      return val is timestamp || (
-        val is string &&
-        val.size() <= 40 &&
-        val.matches('^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+\\-]\\d{2}:\\d{2})$')
-      );
+    // Strict ISO-8601 or Firestore Timestamp validation (low CEL footprint; .matches fails closed on non-strings)
+    function isDate(v) {
+      return v is timestamp ||
+        v.matches('^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?(Z|[+\\-](0\\d|1\\d|2[0-3]):[0-5]\\d)$');
     }
 
-    function isFreshTimestamp(val) {
-      return (val is timestamp && val == request.time) || (
-        val is string &&
-        val.size() <= 40 &&
-        val.matches('^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+\\-]\\d{2}:\\d{2})$')
-      );
+    function isFreshTs(v) {
+      return (v is timestamp && v == request.time) ||
+        v.matches('^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?(Z|[+\\-](0\\d|1\\d|2[0-3]):[0-5]\\d)$');
+    }
+
+    function isIntRange(v, lo, hi) {
+      return v is int && v >= lo && v <= hi;
+    }
+
+    function isCents(v) {
+      return v is int && v >= 0 && v <= 100000000;
+    }
+
+    function isPosCents(v) {
+      return v is int && v >= 1 && v <= 100000000;
+    }
+
+    function isSignedCents(v) {
+      return v is int && v >= -100000000 && v <= 100000000;
+    }
+
+    function isPosInt(v) {
+      return v is int && v > 0;
+    }
+
+    function isPollAttempts(v) {
+      return v is int && v >= 0 && v <= 10000;
+    }
+
+    function isFulfillAttempts(v) {
+      return v is int && v >= 0 && v <= 10;
+    }
+
+    function isKeyList(v) {
+      return v is list && v.size() <= 10 && (v.size() == 0 || v[0] is string);
+    }
+
+    function isValidNotificationState(v) {
+      return [v.status, v.eventId].join('\n').matches('^(pending|sending|sent|partial_sent|no_recipients|delivery_uncertain)\\n.{1,128}$') &&
+        v.attemptCount is int && v.attemptCount >= 0 && v.attemptCount <= 1000;
+    }
+
+    function isValidPollLease(v) {
+      return v.keys().hasOnly(['leaseOwner', 'operationId', 'leaseUntil', 'acquiredAt']) &&
+        [v.leaseOwner, v.operationId].join('\n').matches('^.{1,128}\\n.{1,128}$') &&
+        isDate(v.leaseUntil) &&
+        isDate(v.acquiredAt);
     }
 
     // Entity Blueprints synchronized with src/types.ts
-    function isValidUser(data, userId) {
-      return data.keys().hasAll(['userId', 'telegramId', 'firstName', 'isBlocked', 'totalOrders', 'totalSpentStars', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly([
+    function isValidUser(d, userId) {
+      return d.keys().hasAll(['userId', 'telegramId', 'firstName', 'isBlocked', 'totalOrders', 'totalSpentStars', 'createdAt', 'updatedAt']) &&
+        d.keys().hasOnly([
           'userId',
           'telegramId',
           'username',
@@ -80,25 +118,25 @@ service cloud.firestore {
           'createdAt',
           'updatedAt'
         ]) &&
-        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && data.userId == userId &&
-        data.telegramId is number && data.telegramId > 0 &&
-        (!('username' in data) || (data.username is string && data.username.size() <= 64)) &&
-        data.firstName is string && data.firstName.size() >= 1 && data.firstName.size() <= 128 &&
-        (!('lastName' in data) || (data.lastName is string && data.lastName.size() <= 128)) &&
-        (!('languageCode' in data) || (data.languageCode is string && data.languageCode.size() <= 16)) &&
-        data.isBlocked is bool &&
-        data.totalOrders is number && data.totalOrders >= 0 &&
-        (!('balanceUsdCents' in data) || (data.balanceUsdCents is int && data.balanceUsdCents >= 0)) &&
-        (!('totalSpentUsdCents' in data) || (data.totalSpentUsdCents is int && data.totalSpentUsdCents >= 0)) &&
-        data.totalSpentStars is number && data.totalSpentStars >= 0 &&
-        (!('balance' in data) || (data.balance is number && data.balance >= 0)) &&
-        isValidDateVal(data.createdAt) &&
-        isValidDateVal(data.updatedAt);
+        d.userId == userId && d.userId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.telegramId is int && d.telegramId > 0 &&
+        d.get('username', '').matches('^.{0,64}$') &&
+        d.firstName.matches('^.{1,128}$') &&
+        d.get('lastName', '').matches('^.{0,128}$') &&
+        d.get('languageCode', '').matches('^.{0,16}$') &&
+        d.isBlocked is bool &&
+        isIntRange(d.totalOrders, 0, 10000000) &&
+        isIntRange(d.get('balanceUsdCents', 0), 0, 1000000000) &&
+        isIntRange(d.get('totalSpentUsdCents', 0), 0, 1000000000) &&
+        d.totalSpentStars is number && d.totalSpentStars >= 0 && d.totalSpentStars <= 1000000000 &&
+        d.get('balance', 0) is number && d.get('balance', 0) >= 0 && d.get('balance', 0) <= 1000000000 &&
+        isDate(d.createdAt) &&
+        isDate(d.updatedAt);
     }
 
-    function isValidProduct(data, productId) {
-      return data.keys().hasAll(['id', 'name', 'category', 'description', 'price', 'currency', 'imageUrl', 'isActive', 'fulfillmentType', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly([
+    function isValidProduct(d, productId) {
+      return d.keys().hasAll(['id', 'name', 'category', 'description', 'price', 'currency', 'imageUrl', 'isActive', 'fulfillmentType', 'createdAt', 'updatedAt']) &&
+        d.keys().hasOnly([
           'id',
           'name',
           'category',
@@ -117,65 +155,154 @@ service cloud.firestore {
           'createdAt',
           'updatedAt'
         ]) &&
-        data.id is string && data.id.size() >= 1 && data.id.size() <= 64 && data.id == productId &&
-        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
-        data.category is string && data.category.size() <= 32 && data.category in ['stars', 'premium', 'gifts'] &&
-        data.description is string && data.description.size() >= 1 && data.description.size() <= 1000 &&
-        data.price is number && data.price > 0 && data.price <= 10000000 &&
-        (!('priceUsdCents' in data) || (data.priceUsdCents is int && data.priceUsdCents > 0 && data.priceUsdCents <= 10000000)) &&
-        (!('unitPriceUsdCents' in data) || (data.unitPriceUsdCents is int && data.unitPriceUsdCents > 0 && data.unitPriceUsdCents <= 1000000)) &&
-        data.currency is string && data.currency.size() <= 8 && data.currency in ['USD', 'XTR'] &&
-        (!('minQuantity' in data) || (data.minQuantity is int && data.minQuantity >= 1 && data.minQuantity <= 100000)) &&
-        (!('maxQuantity' in data) || (data.maxQuantity is int && data.maxQuantity >= 1 && data.maxQuantity <= 100000)) &&
-        (!('durationMonths' in data) || data.durationMonths in [3, 6, 12]) &&
-        data.imageUrl is string && data.imageUrl.size() <= 500 &&
-        data.isActive is bool &&
-        data.fulfillmentType is string && data.fulfillmentType.size() <= 32 && data.fulfillmentType in ['manual', 'provider_adapter', 'mystars'] &&
-        (!('keyGeneratorAlgorithm' in data) || (data.keyGeneratorAlgorithm is string && data.keyGeneratorAlgorithm.size() <= 32 && data.keyGeneratorAlgorithm in ['none', 'stars_promo_v1', 'gift_voucher_v1'])) &&
-        isValidDateVal(data.createdAt) &&
-        isValidDateVal(data.updatedAt);
+        d.id == productId && d.id.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.name.matches('^.{1,120}$') &&
+        d.category in ['stars', 'premium', 'gifts'] &&
+        d.description.matches('(?s)^.{1,1000}$') &&
+        d.price is number && d.price > 0 && d.price <= 10000000 &&
+        isIntRange(d.get('priceUsdCents', 1), 1, 10000000) &&
+        isIntRange(d.get('unitPriceUsdCents', 1), 1, 1000000) &&
+        d.currency in ['USD', 'XTR'] &&
+        isIntRange(d.get('minQuantity', 1), 1, 100000) &&
+        isIntRange(d.get('maxQuantity', 1), 1, 100000) &&
+        d.get('durationMonths', 3) in [3, 6, 12] &&
+        d.imageUrl.matches('^.{0,500}$') &&
+        d.isActive is bool &&
+        d.fulfillmentType in ['manual', 'provider_adapter', 'mystars'] &&
+        d.get('keyGeneratorAlgorithm', 'none') in ['none', 'stars_promo_v1', 'gift_voucher_v1'] &&
+        isDate(d.createdAt) &&
+        isDate(d.updatedAt);
     }
 
-    function isValidOrderCore(data, orderId) {
-      return data.keys().hasAll(['orderId', 'userId', 'userTelegramId', 'productId', 'productName', 'category', 'quantity', 'totalPrice', 'currency', 'paymentStatus', 'fulfillmentStatus', 'createdAt', 'updatedAt']) &&
-        data.orderId is string && data.orderId.size() <= 64 && data.orderId == orderId &&
-        isValidId(data.userId) &&
-        data.userTelegramId is number && data.userTelegramId > 0 &&
-        isValidId(data.productId) &&
-        data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 120 &&
-        data.category in ['stars', 'premium', 'gifts'] &&
-        data.quantity is int && data.quantity >= 1 && data.quantity <= 100000 &&
-        data.totalPrice is number && data.totalPrice > 0 &&
-        data.currency in ['USD', 'XTR'] &&
-        data.paymentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
-        data.fulfillmentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
-        isValidDateVal(data.createdAt) &&
-        isValidDateVal(data.updatedAt);
-    }
-
-    function isValidBuyerOrderCreate(data, orderId) {
-      return isValidOrderCore(data, orderId) &&
-        data.keys().hasOnly([
+    // Order Validators (uses Map.get + List.join single-pass RE2 for 100% strict validation under 1000 CEL limit)
+    function isValidBuyerOrderCreate(d, orderId) {
+      return d.orderId == orderId &&
+        d.keys().hasOnly([
           'orderId', 'userId', 'userTelegramId', 'username', 'recipientUsername',
           'productId', 'productName', 'category', 'quantity', 'durationMonths',
           'unitPriceUsdCents', 'totalPriceUsdCents', 'totalPrice', 'currency',
           'paymentMethod', 'paymentStatus', 'fulfillmentStatus',
           'fulfillmentAttempts', 'needsManualReconciliation', 'createdAt', 'updatedAt'
         ]) &&
-        data.paymentStatus == 'pending' &&
-        data.fulfillmentStatus == 'pending' &&
-        (!('needsManualReconciliation' in data) || data.needsManualReconciliation == false) &&
-        (!('fulfillmentAttempts' in data) || data.fulfillmentAttempts == 0);
+        [
+          d.orderId,
+          d.userId,
+          d.productId,
+          d.productName,
+          d.category,
+          d.currency,
+          d.get('username', ''),
+          d.get('recipientUsername', 'a'),
+          d.get('paymentMethod', 'cryptobot')
+        ].join('\n').matches('^[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n.{1,120}\\n(stars|premium|gifts)\\n(USD|XTR)\\n.{0,64}\\n.{1,64}\\n(cryptobot|xrocket|balance|internal_balance|stars|telegram_stars)$') &&
+        d.userTelegramId is int && d.userTelegramId > 0 &&
+        d.quantity is int && d.quantity >= 1 && d.quantity <= 100000 &&
+        d.totalPrice is number && d.totalPrice > 0 && d.totalPrice <= 100000000 &&
+        d.get('durationMonths', 3) in [3, 6, 12] &&
+        isPosCents(d.get('unitPriceUsdCents', 1)) &&
+        isPosCents(d.get('totalPriceUsdCents', 1)) &&
+        d.paymentStatus == 'pending' &&
+        d.fulfillmentStatus == 'pending' &&
+        d.get('needsManualReconciliation', false) == false &&
+        d.get('fulfillmentAttempts', 0) == 0;
     }
 
-    function isBuyerProductValid(productData, data) {
+    function isBuyerProductValid(productData, d) {
       return productData.isActive == true &&
-        productData.price * data.quantity == data.totalPrice;
+        productData.price * d.quantity == d.totalPrice &&
+        d.get('totalPriceUsdCents', d.totalPrice) == d.totalPrice;
     }
 
-    function isValidOrder(data, orderId) {
-      return isValidOrderCore(data, orderId) &&
-        data.keys().hasOnly([
+    function isValidOrderStrings(d) {
+      return [
+          d.orderId,
+          d.userId,
+          d.productId,
+          d.productName,
+          d.category,
+          d.currency,
+          d.paymentStatus,
+          d.fulfillmentStatus,
+          d.get('paymentMethod', 'cryptobot'),
+          d.get('fulfillmentProvider', 'mystars'),
+          d.get('mystarsCurrency', 'usdt_ton'),
+          d.get('refundState', 'refunded')
+        ].join('\n').matches('^[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n[a-zA-Z0-9_\\-]{1,64}\\n.{1,120}\\n(stars|premium|gifts)\\n(USD|XTR)\\n(pending|paid|processing|completed|cancelled|refunded|failed)\\n(pending|paid|processing|completed|cancelled|refunded|failed)\\n(cryptobot|xrocket|balance|internal_balance|stars|telegram_stars)\\n(mystars|manual|fragment)\\n(usdt_ton|ton)\\n(refund_in_progress|telegram_refund_succeeded_pending_commit|refund_failed_needs_reconciliation|refunded)$') &&
+        [
+          d.get('activePaymentId', 'a'),
+          d.get('externalInvoiceId', 'a'),
+          d.get('balancePaymentId', 'a'),
+          d.get('telegramPaymentChargeId', 'a'),
+          d.get('mystarsOrderId', 'a'),
+          d.get('mystarsPayToAddress', 'a'),
+          d.get('fulfillmentIdempotencyKey', 'a'),
+          d.get('refundLockToken', 'a')
+        ].join('\n').matches('^.{1,128}(\\n.{1,128}){7}$') &&
+        [
+          d.get('username', ''),
+          d.get('recipientUsername', 'a'),
+          d.get('mystarsOrderStatus', 'a'),
+          d.get('providerPaymentChargeId', ''),
+          d.get('mystarsUnknownStatusSeen', ''),
+          d.get('mystarsPaymentMemo', ''),
+          d.get('mystarsPurchaseTx', ''),
+          d.get('mystarsPaymentTx', ''),
+          d.get('mystarsReversalTx', ''),
+          d.get('externalExecutionReference', '')
+        ].join('\n').matches('^.{0,64}\\n.{1,64}\\n.{1,64}\\n.{0,128}\\n.{0,128}(\\n.{0,256}){5}$') &&
+        [
+          d.get('mystarsWholesaleCostUsdt', '0'),
+          d.get('tonNetworkFeeTon', '0'),
+          d.get('mystarsPaymentAmountUsdt', '0')
+        ].join('\n').matches('^[0-9]{1,45}(\\.[0-9]{1,18})?(\\n[0-9]{1,45}(\\.[0-9]{1,18})?){2}$') &&
+        d.get('mystarsFailureReason', '').matches('(?s)^.{0,500}$') &&
+        d.get('mystarsLastPollError', '').matches('(?s)^.{0,500}$') &&
+        d.get('fulfillmentNote', '').matches('(?s)^.{0,500}$') &&
+        d.get('fulfillmentLastError', '').matches('(?s)^.{0,500}$') &&
+        d.get('refundLastError', '').matches('(?s)^.{0,500}$');
+    }
+
+    function isValidOrderNumbersAndDates(d, ts) {
+      return d.userTelegramId is int && d.userTelegramId > 0 &&
+        d.quantity is int && d.quantity >= 1 && d.quantity <= 100000 &&
+        d.totalPrice is number && d.totalPrice > 0 && d.totalPrice <= 100000000 &&
+        d.get('durationMonths', 3) in [3, 6, 12] &&
+        isPosCents(d.get('unitPriceUsdCents', 1)) &&
+        isPosCents(d.get('totalPriceUsdCents', 1)) &&
+        isCents(d.get('grossRevenueUsdCents', 0)) &&
+        isCents(d.get('providerFeeUsdCents', 0)) &&
+        isCents(d.get('mystarsCostUsdCents', 0)) &&
+        isCents(d.get('tonNetworkFeeUsdCents', 0)) &&
+        isSignedCents(d.get('netProfitUsdCents', 0)) &&
+        isPollAttempts(d.get('mystarsPollAttempts', 0)) &&
+        isFulfillAttempts(d.get('fulfillmentAttempts', 0)) &&
+        isPosInt(d.get('completedByAdminId', 1)) &&
+        d.get('balanceRefunded', false) is bool &&
+        d.get('mystarsCreateInFlight', false) is bool &&
+        d.get('needsManualReconciliation', false) is bool &&
+        d.get('awaitingKeyStock', false) is bool &&
+        d.get('refundStatsAdjusted', false) is bool &&
+        isKeyList(d.get('assignedKeyIds', [])) &&
+        isKeyList(d.get('deliveredKeyValues', [])) &&
+        (!('mystarsPollLease' in d) || isValidPollLease(d.mystarsPollLease)) &&
+        (!('buyerNotificationState' in d) || isValidNotificationState(d.buyerNotificationState)) &&
+        (!('adminNotificationState' in d) || isValidNotificationState(d.adminNotificationState)) &&
+        isDate(d.get('mystarsExpiresAt', ts)) &&
+        isDate(d.get('mystarsLastPolledAt', ts)) &&
+        isDate(d.get('mystarsStuckAlertedAt', ts)) &&
+        isDate(d.get('mystarsAmbiguousPostAt', ts)) &&
+        isDate(d.get('fulfillmentStartedAt', ts)) &&
+        isDate(d.get('fulfillmentNextRetryAt', ts)) &&
+        isDate(d.get('refundStartedAt', ts)) &&
+        isDate(d.get('adminNotifiedAt', ts)) &&
+        isDate(d.get('buyerNotifiedAt', ts)) &&
+        isDate(d.get('paidAt', ts)) &&
+        isDate(d.get('completedAt', ts));
+    }
+
+    function isValidOrder(d, orderId, ts) {
+      return d.orderId == orderId &&
+        d.keys().hasOnly([
           'orderId',
           'userId',
           'userTelegramId',
@@ -252,23 +379,51 @@ service cloud.firestore {
           'completedByAdminId',
           'updatedAt'
         ]) &&
-        (!('fulfillmentAttempts' in data) || (data.fulfillmentAttempts is number && data.fulfillmentAttempts >= 0 && data.fulfillmentAttempts <= 10)) &&
-        (!('fulfillmentNote' in data) || (data.fulfillmentNote is string && data.fulfillmentNote.size() <= 500)) &&
-        (!('fulfillmentLastError' in data) || (data.fulfillmentLastError is string && data.fulfillmentLastError.size() <= 500)) &&
-        (!('fulfillmentIdempotencyKey' in data) || (data.fulfillmentIdempotencyKey is string && data.fulfillmentIdempotencyKey.size() >= 1 && data.fulfillmentIdempotencyKey.size() <= 128)) &&
-        (!('needsManualReconciliation' in data) || data.needsManualReconciliation is bool) &&
-        (!('assignedKeyIds' in data) || (data.assignedKeyIds is list && data.assignedKeyIds.size() <= 10)) &&
-        (!('deliveredKeyValues' in data) || (data.deliveredKeyValues is list && data.deliveredKeyValues.size() <= 10)) &&
-        (!('refundState' in data) || data.refundState in ['refund_in_progress', 'telegram_refund_succeeded_pending_commit', 'refund_failed_needs_reconciliation', 'refunded']) &&
-        (!('fulfillmentStartedAt' in data) || isValidDateVal(data.fulfillmentStartedAt)) &&
-        (!('fulfillmentNextRetryAt' in data) || isValidDateVal(data.fulfillmentNextRetryAt)) &&
-        (!('paidAt' in data) || isValidDateVal(data.paidAt)) &&
-        (!('completedAt' in data) || isValidDateVal(data.completedAt));
+        isValidOrderStrings(d) &&
+        isValidOrderNumbersAndDates(d, ts);
     }
 
-    function isValidPayment(data, paymentId) {
-      return data.keys().hasAll(['paymentId', 'orderId', 'userId', 'userTelegramId', 'totalAmount', 'currency', 'invoicePayload', 'status', 'createdAt']) &&
-        data.keys().hasOnly([
+    function isOrderAdminCreate(d, orderId, ts) {
+      return isFreshTs(d.createdAt) &&
+        isFreshTs(d.updatedAt) &&
+        isValidOrder(d, orderId, ts);
+    }
+
+    function isOrderAdminUpdate(d, prev, orderId, ts) {
+      return isFreshTs(d.updatedAt) &&
+        !d.diff(prev).affectedKeys().hasAny([
+          'orderId', 'userId', 'userTelegramId', 'productId',
+          'quantity', 'totalPrice', 'currency', 'createdAt'
+        ]) &&
+        isValidOrder(d, orderId, ts);
+    }
+
+    function isOrderBuyerCreate(d, orderId) {
+      return isOwner(d.userId) &&
+        isFreshTs(d.createdAt) &&
+        isFreshTs(d.updatedAt) &&
+        isValidBuyerOrderCreate(d, orderId) &&
+        exists(/databases/$(database)/documents/users/$(d.userId)) &&
+        get(/databases/$(database)/documents/users/$(d.userId)).data.isBlocked == false &&
+        exists(/databases/$(database)/documents/products/$(d.productId)) &&
+        isBuyerProductValid(get(/databases/$(database)/documents/products/$(d.productId)).data, d);
+    }
+
+    function isOrderBuyerCancel(d, prev, orderId) {
+      return isValidId(orderId) &&
+        isOwner(prev.userId) &&
+        isFreshTs(d.updatedAt) &&
+        prev.paymentStatus == 'pending' &&
+        prev.fulfillmentStatus == 'pending' &&
+        d.paymentStatus == 'cancelled' &&
+        d.fulfillmentStatus == 'cancelled' &&
+        d.diff(prev).affectedKeys().hasOnly(['paymentStatus', 'fulfillmentStatus', 'updatedAt']);
+    }
+
+    // Payment Validator (100% strict field validation under CEL budget)
+    function isValidPayment(d, paymentId) {
+      return d.keys().hasAll(['paymentId', 'orderId', 'userId', 'userTelegramId', 'totalAmount', 'currency', 'invoicePayload', 'status', 'createdAt']) &&
+        d.keys().hasOnly([
           'paymentId',
           'kind',
           'provider',
@@ -310,23 +465,154 @@ service cloud.firestore {
           'updatedAt',
           'refundedAt'
         ]) &&
-        data.paymentId is string && data.paymentId.size() >= 1 && data.paymentId.size() <= 128 && data.paymentId == paymentId &&
-        (!('kind' in data) || data.kind in ['order', 'topup']) &&
-        (!('provider' in data) || data.provider in ['cryptobot', 'xrocket', 'balance', 'telegram_stars']) &&
-        isValidId(data.orderId) && data.orderId.size() <= 64 &&
-        isValidId(data.userId) && data.userId.size() <= 64 &&
-        data.userTelegramId is number && data.userTelegramId > 0 &&
-        data.totalAmount is number && data.totalAmount > 0 &&
-        data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
-        data.invoicePayload is string && data.invoicePayload.size() >= 1 && data.invoicePayload.size() <= 256 &&
-        data.status in ['pending', 'paid', 'underpaid', 'overpaid', 'expired', 'cancelled', 'failed', 'refunded', 'refund_required'] &&
-        (!('statusReason' in data) || (data.statusReason is string && data.statusReason.size() <= 500)) &&
-        isValidDateVal(data.createdAt);
+        d.paymentId == paymentId && d.paymentId.matches('^[a-zA-Z0-9_\\-]{1,128}$') &&
+        d.get('kind', 'order') in ['order', 'topup'] &&
+        d.get('provider', 'cryptobot') in ['cryptobot', 'xrocket', 'balance', 'telegram_stars'] &&
+        d.get('providerPaymentId', 'a').matches('^.{1,128}$') &&
+        d.get('telegramPaymentChargeId', 'a').matches('^.{1,128}$') &&
+        d.get('providerPaymentChargeId', '').matches('^.{0,128}$') &&
+        d.orderId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.get('topUpId', 'a').matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.userId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.userTelegramId is int && d.userTelegramId > 0 &&
+        d.totalAmount is number && d.totalAmount > 0 && d.totalAmount <= 100000000 &&
+        isIntRange(d.get('expectedUsdCents', 0), 0, 100000000) &&
+        isIntRange(d.get('feeUsdCents', 0), 0, 100000000) &&
+        isIntRange(d.get('netUsdCents', 0), 0, 100000000) &&
+        d.get('expectedAmountStr', '1').matches('^(0\\.[0-9]{0,17}[1-9][0-9]{0,17}|[1-9][0-9]{0,44}(\\.[0-9]{1,18})?)$') &&
+        d.get('actualAmountStr', '0').matches('^[0-9]{1,45}(\\.[0-9]{1,18})?$') &&
+        d.get('verifiedAmountStr', '0').matches('^[0-9]{1,45}(\\.[0-9]{1,18})?$') &&
+        d.get('verifiedCurrency', 'USD').matches('^.{1,16}$') &&
+        d.get('verifiedNetwork', 'TON').matches('^.{1,32}$') &&
+        d.get('exchangeRateUsdStr', '1').matches('^(0\\.[0-9]{0,17}[1-9][0-9]{0,17}|[1-9][0-9]{0,44}(\\.[0-9]{1,18})?)$') &&
+        d.currency.matches('^.{1,16}$') &&
+        d.get('network', 'TON').matches('^.{1,32}$') &&
+        d.invoicePayload.matches('^.{1,256}$') &&
+        d.get('payUrl', 'https://t.me').matches('^https?://.{1,504}$') &&
+        d.status in ['pending', 'paid', 'underpaid', 'overpaid', 'expired', 'cancelled', 'failed', 'refunded', 'refund_required'] &&
+        d.get('statusReason', '').matches('(?s)^.{0,500}$') &&
+        d.get('failureReason', '').matches('(?s)^.{0,500}$') &&
+        d.get('needsManualReconciliation', false) is bool &&
+        d.get('refundRequired', false) is bool &&
+        d.get('reconciliationState', 'resolved') in ['refund_required', 'manual_reconciliation', 'resolved'] &&
+        d.get('reconciliationReason', 'a').matches('^.{1,128}$') &&
+        d.get('conflictingOrderStatus', 'pending') in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        d.get('conflictingFulfillmentStatus', 'pending') in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        d.get('supersededByPaymentId', 'a').matches('^.{1,128}$') &&
+        isDate(d.get('expiresAt', request.time)) &&
+        isDate(d.get('paidAt', request.time)) &&
+        isDate(d.get('confirmedAt', request.time)) &&
+        isDate(d.createdAt) &&
+        isDate(d.get('updatedAt', request.time)) &&
+        isDate(d.get('refundedAt', request.time));
     }
 
-    function isValidTransaction(data, transactionId) {
-      return data.keys().hasAll(['transactionId', 'orderId', 'userId', 'type', 'amount', 'currency', 'details', 'createdAt']) &&
-        data.keys().hasOnly([
+    function isValidBalanceTopUp(d, paymentId) {
+      return d.keys().hasAll([
+          'paymentId',
+          'userId',
+          'userTelegramId',
+          'provider',
+          'amountUsdCents',
+          'feeUsdCents',
+          'amountCreditedUsdCents',
+          'expectedAmountStr',
+          'currency',
+          'paymentStatus',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'paymentId',
+          'userId',
+          'userTelegramId',
+          'username',
+          'provider',
+          'providerPaymentId',
+          'amountUsdCents',
+          'feeUsdCents',
+          'amountCreditedUsdCents',
+          'expectedUsdCents',
+          'feeBps',
+          'feePercent',
+          'expectedAmountStr',
+          'actualAmountStr',
+          'verifiedAmountStr',
+          'verifiedCurrency',
+          'verifiedNetwork',
+          'amountUsd',
+          'amountPaid',
+          'feeAmount',
+          'amountCredited',
+          'currency',
+          'originalCurrency',
+          'originalAmountPaid',
+          'exchangeRateUsdStr',
+          'exchangeRateUsd',
+          'network',
+          'paymentStatus',
+          'statusReason',
+          'externalInvoiceId',
+          'payUrl',
+          'recipientMerchantId',
+          'failureReason',
+          'needsManualReconciliation',
+          'refundRequired',
+          'reconciliationState',
+          'reconciliationReason',
+          'expiresAt',
+          'createdAt',
+          'paidAt',
+          'confirmedAt',
+          'updatedAt'
+        ]) &&
+        d.paymentId == paymentId && d.paymentId.matches('^[a-zA-Z0-9_\\-]{1,128}$') &&
+        d.userId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.userTelegramId is int && d.userTelegramId > 0 &&
+        d.get('username', '').matches('^.{0,64}$') &&
+        d.provider in ['cryptobot', 'xrocket'] &&
+        d.get('providerPaymentId', 'a').matches('^.{1,128}$') &&
+        isIntRange(d.amountUsdCents, 1, 100000000) &&
+        isIntRange(d.feeUsdCents, 0, 100000000) &&
+        isIntRange(d.amountCreditedUsdCents, 0, 100000000) &&
+        isIntRange(d.get('expectedUsdCents', 0), 0, 100000000) &&
+        isIntRange(d.get('feeBps', 0), 0, 10000) &&
+        d.get('feePercent', 0) is number && d.get('feePercent', 0) >= 0 && d.get('feePercent', 0) <= 100 &&
+        d.expectedAmountStr.matches('^(0\\.[0-9]{0,17}[1-9][0-9]{0,17}|[1-9][0-9]{0,44}(\\.[0-9]{1,18})?)$') &&
+        d.get('actualAmountStr', '0').matches('^[0-9]{1,45}(\\.[0-9]{1,18})?$') &&
+        d.get('verifiedAmountStr', '0').matches('^[0-9]{1,45}(\\.[0-9]{1,18})?$') &&
+        d.get('verifiedCurrency', 'USD').matches('^.{1,16}$') &&
+        d.get('verifiedNetwork', 'TON').matches('^.{1,32}$') &&
+        d.get('amountUsd', 0) is number && d.get('amountUsd', 0) >= 0 &&
+        d.get('amountPaid', 0) is number && d.get('amountPaid', 0) >= 0 &&
+        d.get('feeAmount', 0) is number && d.get('feeAmount', 0) >= 0 &&
+        d.get('amountCredited', 0) is number && d.get('amountCredited', 0) >= 0 &&
+        d.currency.matches('^.{1,16}$') &&
+        d.get('originalCurrency', 'USD').matches('^.{1,16}$') &&
+        d.get('originalAmountPaid', 0) is number && d.get('originalAmountPaid', 0) >= 0 &&
+        d.get('exchangeRateUsdStr', '1').matches('^(0\\.[0-9]{0,17}[1-9][0-9]{0,17}|[1-9][0-9]{0,44}(\\.[0-9]{1,18})?)$') &&
+        d.get('exchangeRateUsd', 1) is number && d.get('exchangeRateUsd', 1) > 0 &&
+        d.get('network', 'TON').matches('^.{1,32}$') &&
+        d.paymentStatus in ['pending', 'paid', 'underpaid', 'overpaid', 'expired', 'cancelled', 'failed', 'refunded', 'refund_required'] &&
+        d.get('statusReason', '').matches('(?s)^.{0,500}$') &&
+        d.get('externalInvoiceId', 'a').matches('^.{1,128}$') &&
+        d.get('payUrl', 'https://t.me').matches('^https?://.{1,504}$') &&
+        d.get('recipientMerchantId', 'a').matches('^.{1,128}$') &&
+        d.get('failureReason', '').matches('(?s)^.{0,500}$') &&
+        d.get('needsManualReconciliation', false) is bool &&
+        d.get('refundRequired', false) is bool &&
+        d.get('reconciliationState', 'resolved') in ['refund_required', 'manual_reconciliation', 'resolved'] &&
+        d.get('reconciliationReason', 'a').matches('^.{1,128}$') &&
+        isDate(d.get('expiresAt', request.time)) &&
+        isDate(d.createdAt) &&
+        isDate(d.get('paidAt', request.time)) &&
+        isDate(d.get('confirmedAt', request.time)) &&
+        isDate(d.updatedAt);
+    }
+
+    function isValidTransaction(d, transactionId) {
+      return d.keys().hasAll(['transactionId', 'orderId', 'userId', 'type', 'amount', 'currency', 'details', 'createdAt']) &&
+        d.keys().hasOnly([
           'transactionId',
           'orderId',
           'userId',
@@ -346,10 +632,19 @@ service cloud.firestore {
           'details',
           'createdAt'
         ]) &&
-        data.transactionId is string && data.transactionId.size() >= 1 && data.transactionId.size() <= 64 && data.transactionId == transactionId &&
-        isValidId(data.orderId) && data.orderId.size() <= 64 &&
-        isValidId(data.userId) && data.userId.size() <= 64 &&
-        data.type in [
+        d.transactionId == transactionId && d.transactionId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.orderId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.userId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.get('paymentId', 'a').matches('^.{1,128}$') &&
+        d.get('supersededByPaymentId', 'a').matches('^.{1,128}$') &&
+        d.get('provider', 'cryptobot') in ['cryptobot', 'xrocket', 'balance', 'telegram_stars'] &&
+        d.get('externalInvoiceId', 'a').matches('^.{1,128}$') &&
+        d.get('verifiedAmountStr', '0').matches('^[0-9]{1,45}(\\.[0-9]{1,18})?$') &&
+        d.get('verifiedCurrency', 'USD').matches('^.{1,16}$') &&
+        d.get('network', 'TON').matches('^.{1,32}$') &&
+        d.get('reconciliationReason', 'a').matches('^.{1,128}$') &&
+        isDate(d.get('confirmedAt', request.time)) &&
+        d.type in [
           'invoice_created',
           'pre_checkout_ok',
           'payment_received',
@@ -379,30 +674,30 @@ service cloud.firestore {
           'admin_action',
           'error'
         ] &&
-        data.amount is number && data.amount >= 0 &&
-        (!('amountUsdCents' in data) || (data.amountUsdCents is int && data.amountUsdCents >= 0)) &&
-        data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
-        data.details is string && data.details.size() >= 1 && data.details.size() <= 500 &&
-        isValidDateVal(data.createdAt);
+        d.amount is number && d.amount >= 0 && d.amount <= 100000000 &&
+        isIntRange(d.get('amountUsdCents', 0), 0, 100000000) &&
+        d.currency.matches('^.{1,16}$') &&
+        d.details.matches('(?s)^.{1,500}$') &&
+        isDate(d.createdAt);
     }
 
-    function isValidAdmin(data, adminId) {
-      return data.keys().hasAll(['adminId', 'telegramId', 'role', 'addedAt']) &&
-        data.keys().hasOnly(['adminId', 'telegramId', 'role', 'addedAt']) &&
-        data.adminId is string && data.adminId.size() >= 1 && data.adminId.size() <= 64 && data.adminId == adminId &&
-        data.telegramId is number && data.telegramId > 0 &&
-        data.role is string && data.role.size() <= 32 && data.role in ['admin', 'superadmin'] &&
-        isValidDateVal(data.addedAt);
+    function isValidAdmin(d, adminId) {
+      return d.keys().hasAll(['adminId', 'telegramId', 'role', 'addedAt']) &&
+        d.keys().hasOnly(['adminId', 'telegramId', 'role', 'addedAt']) &&
+        d.adminId == adminId && d.adminId.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.telegramId is int && d.telegramId > 0 &&
+        d.role in ['admin', 'superadmin'] &&
+        isDate(d.addedAt);
     }
 
-    function isValidSetting(data, settingKey) {
-      return data.keys().hasAll(['key', 'storeName', 'supportUsername', 'maintenanceMode', 'updatedAt']) &&
-        data.keys().hasOnly(['key', 'storeName', 'supportUsername', 'maintenanceMode', 'updatedAt']) &&
-        data.key is string && data.key.size() >= 1 && data.key.size() <= 64 && data.key == settingKey &&
-        data.storeName is string && data.storeName.size() >= 1 && data.storeName.size() <= 120 &&
-        data.supportUsername is string && data.supportUsername.size() >= 1 && data.supportUsername.size() <= 64 &&
-        data.maintenanceMode is bool &&
-        isValidDateVal(data.updatedAt);
+    function isValidSetting(d, settingKey) {
+      return d.keys().hasAll(['key', 'storeName', 'supportUsername', 'maintenanceMode', 'updatedAt']) &&
+        d.keys().hasOnly(['key', 'storeName', 'supportUsername', 'maintenanceMode', 'updatedAt']) &&
+        d.key == settingKey && d.key.matches('^[a-zA-Z0-9_\\-]{1,64}$') &&
+        d.storeName.matches('^.{1,120}$') &&
+        d.supportUsername.matches('^.{1,64}$') &&
+        d.maintenanceMode is bool &&
+        isDate(d.updatedAt);
     }
 
     // 1. /users/{userId}
@@ -410,22 +705,22 @@ service cloud.firestore {
       allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
       allow create: if isValidId(userId) && isValidUser(incoming(), userId) &&
-        isFreshTimestamp(incoming().createdAt) &&
-        isFreshTimestamp(incoming().updatedAt) && (
+        isFreshTs(incoming().createdAt) &&
+        isFreshTs(incoming().updatedAt) && (
           isAdmin() ||
           (isOwner(userId) &&
             incoming().isBlocked == false &&
             incoming().totalOrders == 0 &&
             incoming().totalSpentStars == 0 &&
-            (!('balanceUsdCents' in incoming()) || incoming().balanceUsdCents == 0) &&
-            (!('totalSpentUsdCents' in incoming()) || incoming().totalSpentUsdCents == 0) &&
-            (!('balance' in incoming()) || incoming().balance == 0))
+            incoming().get('balanceUsdCents', 0) == 0 &&
+            incoming().get('totalSpentUsdCents', 0) == 0 &&
+            incoming().get('balance', 0) == 0)
         );
       allow update: if isValidId(userId) && isValidUser(incoming(), userId) &&
         incoming().userId == existing().userId &&
         incoming().telegramId == existing().telegramId &&
         incoming().createdAt == existing().createdAt &&
-        isFreshTimestamp(incoming().updatedAt) && (
+        isFreshTs(incoming().updatedAt) && (
           isAdmin() ||
           (isOwner(userId) &&
             existing().isBlocked == false &&
@@ -434,6 +729,7 @@ service cloud.firestore {
             incoming().totalSpentStars == existing().totalSpentStars &&
             (!('balanceUsdCents' in existing()) || incoming().balanceUsdCents == existing().balanceUsdCents) &&
             (!('totalSpentUsdCents' in existing()) || incoming().totalSpentUsdCents == existing().totalSpentUsdCents) &&
+            (!('balance' in existing()) || incoming().balance == existing().balance) &&
             incoming().diff(existing()).affectedKeys().hasOnly(['username', 'firstName', 'lastName', 'languageCode', 'updatedAt']))
         );
       allow delete: if isValidId(userId) && isAdmin();
@@ -444,13 +740,13 @@ service cloud.firestore {
       allow get: if isValidId(productId) && (existing().isActive == true || isAdmin());
       allow list: if existing().isActive == true || isAdmin();
       allow create: if isValidId(productId) && isValidProduct(incoming(), productId) &&
-        isFreshTimestamp(incoming().createdAt) &&
-        isFreshTimestamp(incoming().updatedAt) &&
+        isFreshTs(incoming().createdAt) &&
+        isFreshTs(incoming().updatedAt) &&
         isAdmin();
       allow update: if isValidId(productId) && isValidProduct(incoming(), productId) &&
         incoming().id == existing().id &&
         incoming().createdAt == existing().createdAt &&
-        isFreshTimestamp(incoming().updatedAt) &&
+        isFreshTs(incoming().updatedAt) &&
         isAdmin();
       allow delete: if isValidId(productId) && isAdmin();
     }
@@ -459,36 +755,10 @@ service cloud.firestore {
     match /orders/{orderId} {
       allow get: if isValidId(orderId) && (isOwner(existing().userId) || isAdmin());
       allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
-      allow create: if isValidId(orderId) &&
-        isFreshTimestamp(incoming().createdAt) &&
-        isFreshTimestamp(incoming().updatedAt) && (
-          (isAdmin() && isValidOrder(incoming(), orderId)) ||
-          (isOwner(incoming().userId) &&
-            isValidBuyerOrderCreate(incoming(), orderId) &&
-            exists(/databases/$(database)/documents/users/$(incoming().userId)) &&
-            get(/databases/$(database)/documents/users/$(incoming().userId)).data.isBlocked == false &&
-            exists(/databases/$(database)/documents/products/$(incoming().productId)) &&
-            isBuyerProductValid(get(/databases/$(database)/documents/products/$(incoming().productId)).data, incoming()))
-        );
-      allow update: if isValidId(orderId) &&
-        isFreshTimestamp(incoming().updatedAt) && (
-          (isAdmin() &&
-            isValidOrder(incoming(), orderId) &&
-            incoming().orderId == existing().orderId &&
-            incoming().userId == existing().userId &&
-            incoming().userTelegramId == existing().userTelegramId &&
-            incoming().productId == existing().productId &&
-            incoming().quantity == existing().quantity &&
-            incoming().totalPrice == existing().totalPrice &&
-            incoming().currency == existing().currency &&
-            incoming().createdAt == existing().createdAt) ||
-          (isOwner(existing().userId) &&
-            existing().paymentStatus == 'pending' &&
-            existing().fulfillmentStatus == 'pending' &&
-            incoming().paymentStatus == 'cancelled' &&
-            incoming().fulfillmentStatus == 'cancelled' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['paymentStatus', 'fulfillmentStatus', 'updatedAt']))
-        );
+      allow create: if (isAdmin() && isOrderAdminCreate(request.resource.data, orderId, request.time)) ||
+        isOrderBuyerCreate(request.resource.data, orderId);
+      allow update: if (isAdmin() && isOrderAdminUpdate(request.resource.data, resource.data, orderId, request.time)) ||
+        isOrderBuyerCancel(request.resource.data, resource.data, orderId);
       allow delete: if isValidId(orderId) && isAdmin();
     }
 
@@ -497,16 +767,19 @@ service cloud.firestore {
       allow get: if isValidId(paymentId) && (isOwner(existing().userId) || isAdmin());
       allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
       allow create: if isValidId(paymentId) && isValidPayment(incoming(), paymentId) &&
-        isFreshTimestamp(incoming().createdAt) &&
+        isFreshTs(incoming().createdAt) &&
         isAdmin() &&
         exists(/databases/$(database)/documents/orders/$(incoming().orderId));
       allow update: if isValidId(paymentId) && isValidPayment(incoming(), paymentId) &&
         incoming().paymentId == existing().paymentId &&
         incoming().orderId == existing().orderId &&
         incoming().userId == existing().userId &&
+        incoming().userTelegramId == existing().userTelegramId &&
         incoming().totalAmount == existing().totalAmount &&
         incoming().currency == existing().currency &&
         incoming().createdAt == existing().createdAt &&
+        (!('providerPaymentId' in existing()) || incoming().providerPaymentId == existing().providerPaymentId) &&
+        (!('telegramPaymentChargeId' in existing()) || incoming().telegramPaymentChargeId == existing().telegramPaymentChargeId) &&
         isAdmin();
       allow delete: if false;
     }
@@ -515,7 +788,17 @@ service cloud.firestore {
     match /balance_topups/{paymentId} {
       allow get: if isValidId(paymentId) && (isOwner(existing().userId) || isAdmin());
       allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
-      allow create, update: if isValidId(paymentId) && isAdmin();
+      allow create: if isValidId(paymentId) && isValidBalanceTopUp(incoming(), paymentId) &&
+        isFreshTs(incoming().createdAt) &&
+        isFreshTs(incoming().updatedAt) &&
+        isAdmin();
+      allow update: if isValidId(paymentId) && isValidBalanceTopUp(incoming(), paymentId) &&
+        incoming().paymentId == existing().paymentId &&
+        incoming().userId == existing().userId &&
+        incoming().userTelegramId == existing().userTelegramId &&
+        incoming().createdAt == existing().createdAt &&
+        isFreshTs(incoming().updatedAt) &&
+        isAdmin();
       allow delete: if false;
     }
 
@@ -534,7 +817,7 @@ service cloud.firestore {
       allow get: if isValidId(transactionId) && isAdmin();
       allow list: if isAdmin();
       allow create: if isValidId(transactionId) && isValidTransaction(incoming(), transactionId) &&
-        isFreshTimestamp(incoming().createdAt) &&
+        isFreshTs(incoming().createdAt) &&
         isAdmin();
       allow update, delete: if false;
     }
@@ -544,7 +827,7 @@ service cloud.firestore {
       allow get: if isValidId(adminId) && (isOwner(adminId) || isAdmin());
       allow list: if isAdmin();
       allow create: if isValidId(adminId) && isValidAdmin(incoming(), adminId) &&
-        isFreshTimestamp(incoming().addedAt) &&
+        isFreshTs(incoming().addedAt) &&
         isAdmin();
       allow update: if isValidId(adminId) && isValidAdmin(incoming(), adminId) &&
         incoming().adminId == existing().adminId &&
@@ -558,11 +841,11 @@ service cloud.firestore {
       allow get: if isValidId(settingKey) && (isAdmin() || (isSignedIn() && settingKey == 'global'));
       allow list: if isAdmin();
       allow create: if isValidId(settingKey) && isValidSetting(incoming(), settingKey) &&
-        isFreshTimestamp(incoming().updatedAt) &&
+        isFreshTs(incoming().updatedAt) &&
         isAdmin();
       allow update: if isValidId(settingKey) && isValidSetting(incoming(), settingKey) &&
         incoming().key == existing().key &&
-        isFreshTimestamp(incoming().updatedAt) &&
+        isFreshTs(incoming().updatedAt) &&
         isAdmin();
       allow delete: if isValidId(settingKey) && isAdmin();
     }
