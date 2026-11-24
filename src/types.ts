@@ -360,6 +360,10 @@ export interface AdminRecipientDeliveryRecord {
   lastAttemptAt?: string;
   lastError?: string;
   operationId?: string;
+  nextRetryAt?: string;
+  retryAfterSeconds?: number;
+  lastHttpStatus?: number;
+  permanentFailure?: boolean;
 }
 
 export interface NotificationDeliveryState {
@@ -375,6 +379,10 @@ export interface NotificationDeliveryState {
   acknowledgedByAdminId?: number;
   acknowledgedAt?: string;
   lastError?: string;
+  nextRetryAt?: string;
+  retryAfterSeconds?: number;
+  lastHttpStatus?: number;
+  permanentFailure?: boolean;
   /** Per-admin delivery breakdown keyed by String(adminTelegramId) */
   recipientDeliveries?: Record<string, AdminRecipientDeliveryRecord>;
 }

@@ -105,6 +105,8 @@ export class OrderService {
     quantity?: number;
     recipientUsername?: string;
     requireRecipient?: boolean;
+    orderId?: string;
+    idempotencyKey?: string;
   }): Promise<Order> {
     firestoreRepo.assertReadyForOrdersAndPayments();
 
@@ -154,9 +156,12 @@ export class OrderService {
     }
 
     const now = new Date().toISOString();
-    const orderId = sanitizeDocId(
-      `ord_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-    );
+    const rawOrderId = params.orderId
+      ? params.orderId
+      : params.idempotencyKey
+        ? `ord_idem_${params.idempotencyKey}`
+        : `ord_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const orderId = sanitizeDocId(rawOrderId);
 
     const order: Order = {
       orderId,
@@ -186,18 +191,31 @@ export class OrderService {
       updatedAt: now,
     };
 
-    await firestoreRepo.setDoc<Order>('orders', order.orderId, order);
-    await this.logTransaction({
-      orderId: order.orderId,
-      userId: order.userId,
-      type: 'invoice_created',
-      amount: order.totalPriceUsdCents,
-      amountUsdCents: order.totalPriceUsdCents,
-      currency: 'USD',
-      details: `Создан заказ #${order.orderId} на «${order.productName}» x${order.quantity} (${formatUsdCents(order.totalPriceUsdCents)})${normalizedRecipient ? ` для @${normalizedRecipient}` : ''}`,
-    });
+    const txId = sanitizeDocId(`tx_inv_created_${order.orderId}`);
+    const txDetails = `Создан заказ #${order.orderId} на «${order.productName}» x${order.quantity} (${formatUsdCents(order.totalPriceUsdCents)})${normalizedRecipient ? ` для @${normalizedRecipient}` : ''}`.slice(
+      0,
+      500,
+    );
 
-    return order;
+    return firestoreRepo.runTransaction<Order>(async (tx) => {
+      const existing = await tx.get<Order>('orders', order.orderId);
+      if (existing) {
+        return existing;
+      }
+      tx.set<Order>('orders', order.orderId, order);
+      tx.set<StoreTransaction>('transactions', txId, {
+        transactionId: txId,
+        orderId: order.orderId,
+        userId: order.userId,
+        type: 'invoice_created',
+        amount: order.totalPriceUsdCents,
+        amountUsdCents: order.totalPriceUsdCents,
+        currency: 'USD',
+        details: txDetails,
+        createdAt: now,
+      });
+      return order;
+    });
   }
 
   public static async setOrderRecipientUsername(

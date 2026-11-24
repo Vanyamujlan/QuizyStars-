@@ -88,6 +88,11 @@ export class FulfillmentService {
   public static checkpointTransactionMaxAttempts = 4;
   public static checkpointConflictRetryDelayMs = 25;
   public static notificationRecoveryBatchLimit = 50;
+  public static maxNotificationAttempts = 5;
+  public static notificationRetryBaseDelayMs = 0;
+  public static notificationRetryMaxDelayMs = 60_000;
+  public static notificationRetryJitterRatio = 0.2;
+  public static maxInlineRateLimitWaitMs = 1_500;
   public static workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 
   private static manualAdapter = new ManualAdminFulfillmentAdapter();
@@ -120,6 +125,11 @@ export class FulfillmentService {
     this.buyerPendingCursorOrderId = null;
     this.adminPendingCursorOrderId = null;
     this.adminPartialCursorOrderId = null;
+    this.maxNotificationAttempts = 5;
+    this.notificationRetryBaseDelayMs = 0;
+    this.notificationRetryMaxDelayMs = 60_000;
+    this.notificationRetryJitterRatio = 0.2;
+    this.maxInlineRateLimitWaitMs = 1_500;
   }
 
   private static extractMyStarsMetadataFromOrder(source: Order): Partial<Order> {
@@ -976,13 +986,21 @@ export class FulfillmentService {
     forceResend = false,
     leaseOwnerOverride?: string,
   ): Promise<Order> {
-    if (
-      !forceResend &&
-      (order.adminNotifiedAt ||
+    if (!forceResend) {
+      if (
+        order.adminNotifiedAt ||
         order.adminNotificationState?.status === 'sent' ||
-        order.adminNotificationState?.status === 'delivery_uncertain')
-    ) {
-      return order;
+        order.adminNotificationState?.status === 'delivery_uncertain' ||
+        order.adminNotificationState?.permanentFailure === true
+      ) {
+        return order;
+      }
+      if (order.adminNotificationState?.nextRetryAt) {
+        const nextRetryMs = Date.parse(order.adminNotificationState.nextRetryAt);
+        if (Number.isFinite(nextRetryMs) && nextRetryMs > Date.now()) {
+          return order;
+        }
+      }
     }
     if (!bot) {
       return order;
@@ -1069,6 +1087,8 @@ export class FulfillmentService {
     type AdminNotifyClaim =
       | { action: 'already_sent'; order: Order }
       | { action: 'delivery_uncertain'; order: Order }
+      | { action: 'permanent_failure'; order: Order }
+      | { action: 'backoff_active'; order: Order }
       | { action: 'in_flight'; order: Order }
       | { action: 'recovered_uncertain'; order: Order }
       | {
@@ -1102,6 +1122,15 @@ export class FulfillmentService {
         }
         if (state?.status === 'delivery_uncertain') {
           return { action: 'delivery_uncertain', order: current };
+        }
+        if (state?.permanentFailure === true) {
+          return { action: 'permanent_failure', order: current };
+        }
+        if (state?.nextRetryAt) {
+          const nextRetryMs = Date.parse(state.nextRetryAt);
+          if (Number.isFinite(nextRetryMs) && nextRetryMs > nowMs) {
+            return { action: 'backoff_active', order: current };
+          }
         }
         if (state?.status === 'sending') {
           // Previous worker crashed during `sending` and its lease expired:
@@ -1170,6 +1199,9 @@ export class FulfillmentService {
             attemptCount: state?.attemptCount ?? 1,
             sentAt: state?.sentAt || nowIso,
             deliveryUncertainAfterCrash: false,
+            permanentFailure: false,
+            nextRetryAt: undefined,
+            retryAfterSeconds: undefined,
             lastError: undefined,
             recipientDeliveries: existingDeliveries,
           };
@@ -1184,10 +1216,36 @@ export class FulfillmentService {
         }
       }
 
+      const retryableUndeliveredAdminIds = forceResend
+        ? undeliveredAdminIds
+        : undeliveredAdminIds.filter((id) => {
+            const rec = existingDeliveries[String(id)];
+            if (rec?.permanentFailure === true) {
+              return false;
+            }
+            if (rec?.nextRetryAt) {
+              const recNextMs = Date.parse(rec.nextRetryAt);
+              if (Number.isFinite(recNextMs) && recNextMs > nowMs) {
+                return false;
+              }
+            }
+            return true;
+          });
+
+      if (!forceResend && undeliveredAdminIds.length > 0 && retryableUndeliveredAdminIds.length === 0) {
+        const allPerm = undeliveredAdminIds.every(
+          (id) => existingDeliveries[String(id)]?.permanentFailure === true,
+        );
+        return {
+          action: allPerm ? 'permanent_failure' : 'backoff_active',
+          order: current,
+        };
+      }
+
       const targetAdminIds =
         isExplicitResendOfCompletedOrder || undeliveredAdminIds.length === 0
           ? uniqueAdminIds
-          : undeliveredAdminIds;
+          : retryableUndeliveredAdminIds;
 
       const wasUncertainBeforeClaim = state?.status === 'delivery_uncertain';
       const claimingState: NotificationDeliveryState = {
@@ -1199,6 +1257,7 @@ export class FulfillmentService {
         leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
         attemptCount: (state?.attemptCount ?? 0) + 1,
         deliveryUncertainAfterCrash: false,
+        ...(forceResend ? { permanentFailure: false, nextRetryAt: undefined } : {}),
         recipientDeliveries: existingDeliveries,
       };
       const claimedOrder: Order = {
@@ -1253,6 +1312,10 @@ export class FulfillmentService {
           lastAttemptAt: attemptIso,
           lastError: undefined,
           operationId,
+          permanentFailure: false,
+          nextRetryAt: undefined,
+          retryAfterSeconds: undefined,
+          lastHttpStatus: undefined,
         };
       } else if (sendResult.ambiguous) {
         updatedDeliveries[key] = {
@@ -1265,16 +1328,37 @@ export class FulfillmentService {
             sendResult.error ||
             'Неопределённый результат доставки в Telegram (таймаут/обрыв сети)',
           operationId,
+          ...(sendResult.httpStatus !== undefined
+            ? { lastHttpStatus: sendResult.httpStatus }
+            : {}),
         };
       } else {
+        const recAttemptCount = (prev?.attemptCount ?? 0) + 1;
+        const recPermanent =
+          Boolean(sendResult.permanent) || recAttemptCount >= this.maxNotificationAttempts;
+        const recBackoffMs = recPermanent
+          ? 0
+          : this.computeNotificationBackoffMs(recAttemptCount, sendResult.retryAfterSeconds);
+        const recNextRetryAt =
+          !recPermanent && recBackoffMs > 0
+            ? new Date(Date.now() + recBackoffMs).toISOString()
+            : undefined;
         updatedDeliveries[key] = {
           adminTelegramId: adminId,
           status: prev?.status === 'delivery_uncertain' ? 'delivery_uncertain' : 'failed',
-          attemptCount: (prev?.attemptCount ?? 0) + 1,
+          attemptCount: recAttemptCount,
           sentAt: prev?.sentAt,
           lastAttemptAt: attemptIso,
           lastError: sendResult.error || 'Ошибка отправки в Telegram',
           operationId,
+          permanentFailure: recPermanent,
+          ...(recNextRetryAt ? { nextRetryAt: recNextRetryAt } : {}),
+          ...(sendResult.retryAfterSeconds !== undefined
+            ? { retryAfterSeconds: sendResult.retryAfterSeconds }
+            : {}),
+          ...(sendResult.httpStatus !== undefined
+            ? { lastHttpStatus: sendResult.httpStatus }
+            : {}),
         };
       }
     }
@@ -1318,6 +1402,10 @@ export class FulfillmentService {
           attemptCount: latestState.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
+          permanentFailure: false,
+          nextRetryAt: undefined,
+          retryAfterSeconds: undefined,
+          lastHttpStatus: undefined,
           lastError: undefined,
           recipientDeliveries: mergedDeliveries,
         };
@@ -1357,6 +1445,44 @@ export class FulfillmentService {
         return updated;
       }
 
+      const overallAttemptCount = latestState.attemptCount ?? 1;
+      const allUndeliveredPermanent =
+        undeliveredIds.every((id) => mergedDeliveries[String(id)]?.permanentFailure === true) ||
+        overallAttemptCount >= this.maxNotificationAttempts;
+
+      let earliestNextRetryMs = Infinity;
+      let maxRetryAfterSec: number | undefined;
+      let latestHttpCode: number | undefined;
+      let firstSpecificError: string | undefined;
+
+      for (const id of undeliveredIds) {
+        const rec = mergedDeliveries[String(id)];
+        if (!rec) continue;
+        if (rec.lastError && !firstSpecificError) {
+          firstSpecificError = rec.lastError;
+        }
+        if (rec.lastHttpStatus !== undefined) {
+          latestHttpCode = rec.lastHttpStatus;
+        }
+        if (rec.retryAfterSeconds !== undefined) {
+          maxRetryAfterSec =
+            maxRetryAfterSec === undefined
+              ? rec.retryAfterSeconds
+              : Math.max(maxRetryAfterSec, rec.retryAfterSeconds);
+        }
+        if (!rec.permanentFailure && rec.nextRetryAt) {
+          const parsedMs = Date.parse(rec.nextRetryAt);
+          if (Number.isFinite(parsedMs) && parsedMs < earliestNextRetryMs) {
+            earliestNextRetryMs = parsedMs;
+          }
+        }
+      }
+
+      const nextRetryAtIso =
+        !allUndeliveredPermanent && Number.isFinite(earliestNextRetryMs)
+          ? new Date(earliestNextRetryMs).toISOString()
+          : undefined;
+
       if (deliveredIds.length > 0) {
         const partialState: NotificationDeliveryState = {
           status: 'partial_sent',
@@ -1364,10 +1490,17 @@ export class FulfillmentService {
           operationId,
           leaseOwner,
           leaseUntil: undefined,
-          attemptCount: latestState.attemptCount ?? 1,
+          attemptCount: overallAttemptCount,
           sentAt: undefined,
           deliveryUncertainAfterCrash: false,
-          lastError: `Частичная доставка администраторам (${deliveredIds.length}/${uniqueAdminIds.length}); не доставлено: ${undeliveredIds.join(', ')}`,
+          permanentFailure: allUndeliveredPermanent,
+          ...(nextRetryAtIso ? { nextRetryAt: nextRetryAtIso } : {}),
+          ...(maxRetryAfterSec !== undefined ? { retryAfterSeconds: maxRetryAfterSec } : {}),
+          ...(latestHttpCode !== undefined ? { lastHttpStatus: latestHttpCode } : {}),
+          lastError: `Частичная доставка администраторам (${deliveredIds.length}/${uniqueAdminIds.length}); не доставлено: ${undeliveredIds.join(', ')}${firstSpecificError ? ` (${firstSpecificError})` : ''}`.slice(
+            0,
+            300,
+          ),
           recipientDeliveries: mergedDeliveries,
         };
         const updated: Order = {
@@ -1385,10 +1518,17 @@ export class FulfillmentService {
         operationId,
         leaseOwner,
         leaseUntil: undefined,
-        attemptCount: latestState.attemptCount ?? 1,
+        attemptCount: overallAttemptCount,
         sentAt: undefined,
         deliveryUncertainAfterCrash: false,
-        lastError: `Не удалось доставить уведомление ни одному администратору (${undeliveredIds.join(', ')})`,
+        permanentFailure: allUndeliveredPermanent,
+        ...(nextRetryAtIso ? { nextRetryAt: nextRetryAtIso } : {}),
+        ...(maxRetryAfterSec !== undefined ? { retryAfterSeconds: maxRetryAfterSec } : {}),
+        ...(latestHttpCode !== undefined ? { lastHttpStatus: latestHttpCode } : {}),
+        lastError: `Не удалось доставить уведомление ни одному администратору (${undeliveredIds.join(', ')})${firstSpecificError ? `: ${firstSpecificError}` : ''}`.slice(
+          0,
+          300,
+        ),
         recipientDeliveries: mergedDeliveries,
       };
       const updated: Order = {
@@ -1419,13 +1559,21 @@ export class FulfillmentService {
     forceResend = false,
     leaseOwnerOverride?: string,
   ): Promise<Order> {
-    if (
-      !forceResend &&
-      (order.buyerNotifiedAt ||
+    if (!forceResend) {
+      if (
+        order.buyerNotifiedAt ||
         order.buyerNotificationState?.status === 'sent' ||
-        order.buyerNotificationState?.status === 'delivery_uncertain')
-    ) {
-      return order;
+        order.buyerNotificationState?.status === 'delivery_uncertain' ||
+        order.buyerNotificationState?.permanentFailure === true
+      ) {
+        return order;
+      }
+      if (order.buyerNotificationState?.nextRetryAt) {
+        const nextRetryMs = Date.parse(order.buyerNotificationState.nextRetryAt);
+        if (Number.isFinite(nextRetryMs) && nextRetryMs > Date.now()) {
+          return order;
+        }
+      }
     }
     if (!bot) {
       return order;
@@ -1442,6 +1590,8 @@ export class FulfillmentService {
     type BuyerNotifyClaim =
       | { action: 'already_sent'; order: Order }
       | { action: 'delivery_uncertain'; order: Order }
+      | { action: 'permanent_failure'; order: Order }
+      | { action: 'backoff_active'; order: Order }
       | { action: 'in_flight'; order: Order }
       | { action: 'recovered_uncertain'; order: Order }
       | { action: 'claimed'; order: Order; wasUncertainBeforeClaim: boolean };
@@ -1462,6 +1612,15 @@ export class FulfillmentService {
         }
         if (state?.status === 'delivery_uncertain') {
           return { action: 'delivery_uncertain', order: current };
+        }
+        if (state?.permanentFailure === true) {
+          return { action: 'permanent_failure', order: current };
+        }
+        if (state?.nextRetryAt) {
+          const nextRetryMs = Date.parse(state.nextRetryAt);
+          if (Number.isFinite(nextRetryMs) && nextRetryMs > nowMs) {
+            return { action: 'backoff_active', order: current };
+          }
         }
         if (state?.status === 'sending') {
           // Previous worker crashed during `sending` and its lease expired:
@@ -1492,6 +1651,7 @@ export class FulfillmentService {
         leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
         attemptCount: (state?.attemptCount ?? 0) + 1,
         deliveryUncertainAfterCrash: false,
+        ...(forceResend ? { permanentFailure: false, nextRetryAt: undefined } : {}),
       };
       const claimedOrder: Order = {
         ...current,
@@ -1547,6 +1707,10 @@ export class FulfillmentService {
           attemptCount: latestState.attemptCount ?? 1,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
+          permanentFailure: false,
+          nextRetryAt: undefined,
+          retryAfterSeconds: undefined,
+          lastHttpStatus: undefined,
           lastError: undefined,
         };
         const updated: Order = {
@@ -1570,6 +1734,9 @@ export class FulfillmentService {
           sentAt: undefined,
           uncertainSince: latestState.uncertainSince || finIso,
           deliveryUncertainAfterCrash: false,
+          ...(sendResult.httpStatus !== undefined
+            ? { lastHttpStatus: sendResult.httpStatus }
+            : {}),
           lastError:
             sendResult.error ||
             'Неопределённый результат доставки покупателю (таймаут/обрыв сети Telegram API)',
@@ -1583,15 +1750,34 @@ export class FulfillmentService {
         return updated;
       }
 
+      const attemptCount = latestState.attemptCount ?? 1;
+      const isPermanent =
+        Boolean(sendResult.permanent) || attemptCount >= this.maxNotificationAttempts;
+      const backoffMs = isPermanent
+        ? 0
+        : this.computeNotificationBackoffMs(attemptCount, sendResult.retryAfterSeconds);
+      const nextRetryAtIso =
+        !isPermanent && backoffMs > 0
+          ? new Date(Date.now() + backoffMs).toISOString()
+          : undefined;
+
       const pendingState: NotificationDeliveryState = {
         status: 'pending',
         eventId: latestState.eventId || eventId,
         operationId,
         leaseOwner,
         leaseUntil: undefined,
-        attemptCount: latestState.attemptCount ?? 1,
+        attemptCount,
         sentAt: undefined,
         deliveryUncertainAfterCrash: false,
+        permanentFailure: isPermanent,
+        ...(nextRetryAtIso ? { nextRetryAt: nextRetryAtIso } : {}),
+        ...(sendResult.retryAfterSeconds !== undefined
+          ? { retryAfterSeconds: sendResult.retryAfterSeconds }
+          : {}),
+        ...(sendResult.httpStatus !== undefined
+          ? { lastHttpStatus: sendResult.httpStatus }
+          : {}),
         lastError:
           sendResult.error ||
           'Не удалось доставить уведомление покупателю в Telegram',
@@ -1806,26 +1992,210 @@ export class FulfillmentService {
     );
   }
 
+  /**
+   * Extracts HTTP status code from a Telegram Bot API error if present.
+   */
+  public static extractTelegramHttpStatus(error: unknown): number | undefined {
+    if (error && typeof error === 'object') {
+      const errRecord = error as {
+        code?: unknown;
+        status?: unknown;
+        statusCode?: unknown;
+        response?: { error_code?: unknown; statusCode?: unknown };
+      };
+      const candidates = [
+        errRecord.response?.error_code,
+        errRecord.response?.statusCode,
+        errRecord.statusCode,
+        errRecord.status,
+        typeof errRecord.code === 'number' ? errRecord.code : undefined,
+      ];
+      for (const c of candidates) {
+        const n = Number(c);
+        if (Number.isInteger(n) && n >= 100 && n <= 599) {
+          return n;
+        }
+      }
+    }
+    const text =
+      error instanceof Error ? error.message : String(error ?? '');
+    const match = text.match(/\b(400|401|403|404|409|429|500|502|503|504)\b/);
+    return match ? Number(match[1]) : undefined;
+  }
+
+  /**
+   * Extracts Telegram `retry_after` seconds from an HTTP 429 rate-limit error.
+   */
+  public static extractTelegramRetryAfterSeconds(error: unknown): number | undefined {
+    if (error && typeof error === 'object') {
+      const errRecord = error as {
+        retry_after?: unknown;
+        retryAfter?: unknown;
+        parameters?: { retry_after?: unknown };
+        response?: { parameters?: { retry_after?: unknown } };
+      };
+      const rawCandidates = [
+        errRecord.response?.parameters?.retry_after,
+        errRecord.parameters?.retry_after,
+        errRecord.retry_after,
+        errRecord.retryAfter,
+      ];
+      for (const c of rawCandidates) {
+        const n = Number(c);
+        if (Number.isFinite(n) && n > 0) {
+          return Math.ceil(n);
+        }
+      }
+    }
+    const text =
+      error instanceof Error ? error.message : String(error ?? '');
+    const match =
+      text.match(/retry[_ -]?after[:= ]+(\d+(?:\.\d+)?)/i) ||
+      text.match(/Too Many Requests:\s*retry after\s+(\d+(?:\.\d+)?)/i);
+    if (match) {
+      const n = Number(match[1]);
+      if (Number.isFinite(n) && n > 0) {
+        return Math.ceil(n);
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Classifies whether a Telegram delivery failure is permanent and non-retryable
+   * (e.g. bot blocked by user, user deactivated, chat not found, invalid token).
+   */
+  public static isPermanentTelegramDeliveryError(error: unknown): boolean {
+    if (error && typeof error === 'object') {
+      const errRecord = error as {
+        permanent?: unknown;
+        retryable?: unknown;
+      };
+      if (errRecord.permanent === true || errRecord.retryable === false) {
+        return true;
+      }
+      if (errRecord.retryable === true) {
+        return false;
+      }
+    }
+
+    const httpStatus = this.extractTelegramHttpStatus(error);
+    if (httpStatus === 429 || (httpStatus !== undefined && httpStatus >= 500)) {
+      return false;
+    }
+    if (httpStatus === 401) {
+      return true;
+    }
+
+    const text = (
+      error instanceof Error ? error.message : String(error ?? '')
+    ).toLowerCase();
+
+    if (
+      text.includes('bot was blocked by the user') ||
+      text.includes('user is deactivated') ||
+      text.includes('chat not found') ||
+      text.includes('user not found') ||
+      text.includes('peer_id_invalid') ||
+      text.includes('chat_id is empty') ||
+      text.includes("bot can't initiate conversation") ||
+      text.includes('have no rights to send a message') ||
+      text.includes('chat_write_forbidden') ||
+      text.includes('forbidden:') ||
+      text.includes('unauthorized')
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Computes bounded notification retry delay in milliseconds using Telegram `retry_after`
+   * when present, or exponential backoff with bounded jitter when `notificationRetryBaseDelayMs > 0`.
+   */
+  public static computeNotificationBackoffMs(
+    attemptCount: number,
+    retryAfterSeconds?: number,
+  ): number {
+    if (retryAfterSeconds !== undefined && retryAfterSeconds > 0) {
+      return Math.min(this.notificationRetryMaxDelayMs, Math.ceil(retryAfterSeconds * 1000));
+    }
+    if (this.notificationRetryBaseDelayMs <= 0) {
+      return 0;
+    }
+    const exp = Math.min(
+      this.notificationRetryMaxDelayMs,
+      this.notificationRetryBaseDelayMs * Math.pow(2, Math.max(0, attemptCount - 1)),
+    );
+    const jitterRatio = Math.max(0, Math.min(1, this.notificationRetryJitterRatio));
+    const jitter = jitterRatio > 0 ? Math.floor(Math.random() * exp * jitterRatio) : 0;
+    return Math.min(this.notificationRetryMaxDelayMs, exp + jitter);
+  }
+
   private static async sendTelegramMessageWithResult(
     bot: Telegraf,
     chatId: number | string,
     htmlText: string,
     extra: Record<string, unknown>,
     maxAttempts = 2,
-  ): Promise<{ ok: boolean; error?: string; ambiguous?: boolean }> {
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    ambiguous?: boolean;
+    httpStatus?: number;
+    retryAfterSeconds?: number;
+    permanent?: boolean;
+    attempts?: number;
+  }> {
     let lastError: unknown;
     let ambiguous = false;
+    let permanent = false;
+    let httpStatus: number | undefined;
+    let retryAfterSeconds: number | undefined;
+    let attemptsExecuted = 0;
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      attemptsExecuted = attempt;
       try {
         await bot.telegram.sendMessage(chatId, htmlText, extra);
-        return { ok: true };
+        return { ok: true, attempts: attempt };
       } catch (error) {
         lastError = error;
+        httpStatus = this.extractTelegramHttpStatus(error);
+        retryAfterSeconds = this.extractTelegramRetryAfterSeconds(error);
+
         if (this.isAmbiguousTelegramDeliveryError(error)) {
           // Stop immediately: Telegram may already have delivered the message before timeout/drop.
           ambiguous = true;
           break;
         }
+        if (this.isPermanentTelegramDeliveryError(error)) {
+          // Stop immediately: non-retryable permanent Telegram error (e.g. 403 blocked, 400 chat not found).
+          permanent = true;
+          break;
+        }
+
+        const isRateLimit =
+          httpStatus === 429 ||
+          retryAfterSeconds !== undefined ||
+          String(error instanceof Error ? error.message : error)
+            .toLowerCase()
+            .includes('too many requests');
+
+        if (isRateLimit) {
+          httpStatus = 429;
+          const waitSec = retryAfterSeconds ?? 1;
+          retryAfterSeconds = waitSec;
+          const waitMs = waitSec * 1000;
+          if (attempt < maxAttempts && waitMs <= this.maxInlineRateLimitWaitMs) {
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
+            continue;
+          }
+          // Rate-limit wait exceeds inline threshold or maxAttempts reached -> defer to persisted nextRetryAt
+          break;
+        }
+
         if (attempt < maxAttempts) {
           await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
         }
@@ -1836,10 +2206,18 @@ export class FulfillmentService {
       lastError instanceof Error ? lastError.message : String(lastError),
     );
     console.warn(
-      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}${ambiguous ? ' [ambiguous/delivery_uncertain]' : ''}:`,
+      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}${ambiguous ? ' [ambiguous/delivery_uncertain]' : permanent ? ' [permanent_failure]' : httpStatus === 429 ? ` [429 retry_after=${retryAfterSeconds ?? 1}s]` : ''}:`,
       errMsg,
     );
-    return { ok: false, ambiguous, error: errMsg.slice(0, 300) };
+    return {
+      ok: false,
+      ambiguous,
+      permanent,
+      httpStatus,
+      retryAfterSeconds,
+      attempts: attemptsExecuted,
+      error: errMsg.slice(0, 300),
+    };
   }
 
   private static async sendTelegramMessageWithRetry(
@@ -1985,9 +2363,17 @@ export class FulfillmentService {
           return { action: 'already_processing', order: current };
         }
 
-        // Stale processing state: server crashed after claiming 'processing' before saving adapter result
+        // Stale processing state: server crashed after claiming 'processing' before saving adapter result.
+        // Atomically refresh fulfillmentStartedAt inside the transaction so only one concurrent recovery worker
+        // wins the reconciliation lease.
         if ((current.fulfillmentAttempts ?? 0) >= 1) {
-          return { action: 'needs_reconciliation_check', order: current };
+          const reclaimedStaleOrder: Order = {
+            ...current,
+            fulfillmentStartedAt: nowIso,
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', reclaimedStaleOrder.orderId, reclaimedStaleOrder);
+          return { action: 'needs_reconciliation_check', order: reclaimedStaleOrder };
         }
       }
 
@@ -2526,7 +2912,7 @@ export class FulfillmentService {
     });
 
     const refreshed = (await OrderService.getOrderById(staleOrder.orderId)) || staleOrder;
-    return this.initiateFulfillment(refreshed, bot, { allowStaleTakeover: true });
+    return this.initiateFulfillment(refreshed, bot);
   }
 
   private static needsBuyerNotificationRecovery(
@@ -2540,12 +2926,19 @@ export class FulfillmentService {
     if (
       order.buyerNotifiedAt ||
       state?.status === 'sent' ||
-      state?.status === 'delivery_uncertain'
+      state?.status === 'delivery_uncertain' ||
+      state?.permanentFailure === true
     ) {
       return false;
     }
     if (state?.status === 'sending') {
       return this.timestampToMillis(state.leaseUntil) <= nowMs;
+    }
+    if (state?.nextRetryAt) {
+      const nextRetryMs = Date.parse(state.nextRetryAt);
+      if (Number.isFinite(nextRetryMs) && nextRetryMs > nowMs) {
+        return false;
+      }
     }
     return true;
   }
@@ -2558,7 +2951,8 @@ export class FulfillmentService {
     if (
       order.adminNotifiedAt ||
       state?.status === 'sent' ||
-      state?.status === 'delivery_uncertain'
+      state?.status === 'delivery_uncertain' ||
+      state?.permanentFailure === true
     ) {
       return false;
     }
@@ -2568,7 +2962,49 @@ export class FulfillmentService {
     if (state?.status === 'no_recipients') {
       return getEnvConfig().adminIds.length > 0;
     }
+    if (state?.nextRetryAt) {
+      const nextRetryMs = Date.parse(state.nextRetryAt);
+      if (Number.isFinite(nextRetryMs) && nextRetryMs > nowMs) {
+        return false;
+      }
+    }
     return true;
+  }
+
+  /**
+   * Returns orders whose buyer or admin notifications require admin review or intervention
+   * (permanent delivery failures, exhausted retry budgets, delivery_uncertain, partial_sent, or no_recipients).
+   */
+  public static async getOrdersNeedingNotificationAttention(
+    limit = 50,
+  ): Promise<Order[]> {
+    const allOrders = await OrderService.getAllOrders(undefined, Math.max(limit * 4, 200));
+    const needsAttention = (state?: NotificationDeliveryState): boolean => {
+      if (!state) return false;
+      if (state.permanentFailure === true) return true;
+      if (
+        state.status === 'delivery_uncertain' ||
+        state.status === 'partial_sent' ||
+        state.status === 'no_recipients'
+      ) {
+        return true;
+      }
+      if (
+        state.status !== 'sent' &&
+        (state.attemptCount ?? 0) >= this.maxNotificationAttempts
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    return allOrders
+      .filter(
+        (ord) =>
+          needsAttention(ord.buyerNotificationState) ||
+          needsAttention(ord.adminNotificationState),
+      )
+      .slice(0, limit);
   }
 
   private static countSentAdminRecipients(

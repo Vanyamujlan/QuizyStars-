@@ -943,14 +943,18 @@ export function formatAdminOrderCard(order: Order): string {
       : '',
     order.buyerNotificationState?.status === 'delivery_uncertain'
       ? `${oe('warning')} Уведомление покупателю: <b>delivery_uncertain</b> (event: <code>${escapeHtml(order.buyerNotificationState.eventId)}</code>, попыток: ${order.buyerNotificationState.attemptCount}) — результат доставки не подтверждён после сбоя`
-      : '',
+      : order.buyerNotificationState?.permanentFailure
+        ? `🚨 Уведомление покупателю: <b>постоянный сбой доставки</b> (попыток: ${order.buyerNotificationState.attemptCount}${order.buyerNotificationState.lastError ? `, ошибка: ${escapeHtml(order.buyerNotificationState.lastError)}` : ''}) — автоповтор остановлен, требуется проверка админом`
+        : '',
     order.adminNotificationState?.status === 'delivery_uncertain'
       ? `${oe('warning')} Уведомление админам: <b>delivery_uncertain</b> (event: <code>${escapeHtml(order.adminNotificationState.eventId)}</code>, попыток: ${order.adminNotificationState.attemptCount}) — результат доставки не подтверждён после сбоя`
-      : order.adminNotificationState?.status === 'partial_sent'
-        ? `${oe('warning')} Уведомление админам: <b>partial_sent</b> (${escapeHtml(order.adminNotificationState.lastError || 'часть администраторов не получила сообщение')})`
-        : order.adminNotificationState?.status === 'no_recipients'
-          ? `${oe('warning')} Уведомление админам: <b>no_recipients</b> (не настроены ADMIN_IDS / OWNER_TELEGRAM_ID)`
-          : '',
+      : order.adminNotificationState?.permanentFailure
+        ? `🚨 Уведомление админам: <b>постоянный сбой доставки</b> (попыток: ${order.adminNotificationState.attemptCount}${order.adminNotificationState.lastError ? `, ошибка: ${escapeHtml(order.adminNotificationState.lastError)}` : ''}) — автоповтор остановлен, требуется проверка админом`
+        : order.adminNotificationState?.status === 'partial_sent'
+          ? `${oe('warning')} Уведомление админам: <b>partial_sent</b> (${escapeHtml(order.adminNotificationState.lastError || 'часть администраторов не получила сообщение')})`
+          : order.adminNotificationState?.status === 'no_recipients'
+            ? `${oe('warning')} Уведомление админам: <b>no_recipients</b> (не настроены ADMIN_IDS / OWNER_TELEGRAM_ID)`
+            : '',
     order.fulfillmentNote
       ? `${oe('edit')} Примечание: ${escapeHtml(order.fulfillmentNote)}`
       : '',
@@ -977,11 +981,14 @@ export function formatAdminNotificationReviewMessage(order: Order): string {
       ];
     }
     const statusLabel: Record<string, string> = {
-      pending: '⏳ pending (ожидает отправки)',
+      pending: state.permanentFailure
+        ? '🚨 pending [permanent_failure] (исчерпаны попытки / невосстановимая ошибка Telegram; автоповтор остановлен)'
+        : '⏳ pending (ожидает отправки)',
       sending: '🔄 sending (активный lease отправки)',
       sent: '✅ sent (подтверждено)',
-      partial_sent:
-        '⚠️ partial_sent (доставлено не всем администраторам; уже получившие не будут дублироваться при повторе)',
+      partial_sent: state.permanentFailure
+        ? '🚨 partial_sent [permanent_failure] (доставлено не всем админам; для оставшихся невосстановимая ошибка)'
+        : '⚠️ partial_sent (доставлено не всем администраторам; уже получившие не будут дублироваться при повторе)',
       no_recipients:
         '⚠️ no_recipients (не настроены получатели ADMIN_IDS / OWNER_TELEGRAM_ID; уведомление не отправлялось)',
       delivery_uncertain:
@@ -990,7 +997,7 @@ export function formatAdminNotificationReviewMessage(order: Order): string {
     const recipientEntries = state.recipientDeliveries
       ? Object.values(state.recipientDeliveries).map(
           (rec) =>
-            `  ↳ Админ <code>${rec.adminTelegramId}</code>: <b>${escapeHtml(rec.status)}</b> (попыток: ${rec.attemptCount}${rec.sentAt ? `, доставлено: ${formatDateRu(rec.sentAt)}` : ''}${rec.lastError ? `, ошибка: ${escapeHtml(rec.lastError.slice(0, 120))}` : ''})`,
+            `  ↳ Админ <code>${rec.adminTelegramId}</code>: <b>${escapeHtml(rec.status)}${rec.permanentFailure ? ' [permanent_failure]' : ''}</b> (попыток: ${rec.attemptCount}${rec.sentAt ? `, доставлено: ${formatDateRu(rec.sentAt)}` : ''}${rec.lastError ? `, ошибка: ${escapeHtml(rec.lastError.slice(0, 120))}` : ''})`,
         )
       : [];
     const lines = [
@@ -999,6 +1006,10 @@ export function formatAdminNotificationReviewMessage(order: Order): string {
       state.operationId ? `• operationId: <code>${escapeHtml(state.operationId)}</code>` : '',
       state.leaseOwner ? `• leaseOwner: <code>${escapeHtml(state.leaseOwner)}</code>` : '',
       `• Попыток: <b>${state.attemptCount}</b>`,
+      state.permanentFailure ? '• Статус повторов: <b>🚨 Постоянный сбой (автоповтор остановлен)</b>' : '',
+      state.lastHttpStatus !== undefined ? `• HTTP код Telegram: <code>${state.lastHttpStatus}</code>` : '',
+      state.retryAfterSeconds !== undefined ? `• Telegram retry_after: <code>${state.retryAfterSeconds} сек.</code>` : '',
+      state.nextRetryAt ? `• Следующий автоповтор: <code>${formatDateRu(state.nextRetryAt)}</code>` : '',
       state.uncertainSince ? `• Неопределённость с: <code>${formatDateRu(state.uncertainSince)}</code>` : '',
       state.sentAt ? `• Зафиксировано отправленным: <code>${formatDateRu(state.sentAt)}</code>` : '',
       state.acknowledgedAt

@@ -20236,6 +20236,1230 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  // =========================================================================
+  // STAGE 2.7 — FIRESTORE & NOTIFICATION RECOVERY (15 REQUIRED SCENARIOS)
+  // =========================================================================
+
+  const resetS27TestState = async (): Promise<void> => {
+    firestoreRepo.enableIsolatedTestMode(true);
+    await UserService.upsertFromTelegram(buyer1);
+    FulfillmentService.resetNotificationRecoveryState();
+  };
+
+  await runTest(
+    'S27-01',
+    'Database',
+    '1. Firestore unavailable before order persistence',
+    async () => {
+      await resetS27TestState();
+      const origAssertReady = firestoreRepo.assertReadyForOrdersAndPayments.bind(firestoreRepo);
+      const beforeOrders = await OrderService.getAllOrders(undefined, 500);
+      try {
+        (firestoreRepo as unknown as { assertReadyForOrdersAndPayments: () => void }).assertReadyForOrdersAndPayments =
+          () => {
+            throw new StorageUnavailableError(
+              'Firestore временно недоступен перед записью заказа (503 Service Unavailable).',
+            );
+          };
+
+        await assert.rejects(
+          async () => {
+            await OrderService.createOrder({
+              telegramUser: buyer1,
+              productId: 'stars_custom',
+              quantity: 50,
+              recipientUsername: 's27_01_buyer',
+            });
+          },
+          (err: unknown) => err instanceof StorageUnavailableError,
+        );
+
+        const afterOrders = await OrderService.getAllOrders(undefined, 500);
+        assert.equal(
+          afterOrders.length,
+          beforeOrders.length,
+          'При недоступности Firestore до записи не должно оставаться частично созданных заказов',
+        );
+      } finally {
+        (firestoreRepo as unknown as { assertReadyForOrdersAndPayments: () => void }).assertReadyForOrdersAndPayments =
+          origAssertReady;
+      }
+
+      return 'Недоступность Firestore перед созданием заказа детерминированно блокирует операцию (StorageUnavailableError) без создания сиротских документов.';
+    },
+  );
+
+  await runTest(
+    'S27-02',
+    'Database',
+    '2. Firestore timeout after a potentially successful write',
+    async () => {
+      await resetS27TestState();
+      const origRunTx = firestoreRepo.runTransaction.bind(firestoreRepo);
+      let failAfterCommitOnce = true;
+      const idemKey = `s27_02_timeout_${Date.now()}`;
+
+      try {
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            const committedResult = await origRunTx(fn);
+            if (failAfterCommitOnce) {
+              failAfterCommitOnce = false;
+              const timeoutErr = new Error('4 DEADLINE_EXCEEDED: Client timed out waiting for commit response');
+              (timeoutErr as Error & { code?: string }).code = 'deadline-exceeded';
+              throw timeoutErr;
+            }
+            return committedResult;
+          };
+
+        await assert.rejects(
+          async () => {
+            await OrderService.createOrder({
+              telegramUser: buyer1,
+              productId: 'stars_custom',
+              quantity: 75,
+              recipientUsername: 's27_02_buyer',
+              idempotencyKey: idemKey,
+            });
+          },
+          /DEADLINE_EXCEEDED/,
+        );
+
+        // Client retries with the same idempotencyKey after receiving timeout
+        const recoveredOrder = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 75,
+          recipientUsername: 's27_02_buyer',
+          idempotencyKey: idemKey,
+        });
+
+        assert.ok(recoveredOrder.orderId.includes(idemKey));
+        assert.equal(recoveredOrder.quantity, 75);
+
+        const orderTxs = (await OrderService.getRecentTransactions(200)).filter(
+          (t) => t.orderId === recoveredOrder.orderId && t.type === 'invoice_created',
+        );
+        assert.equal(
+          orderTxs.length,
+          1,
+          'Повторный вызов createOrder с тем же idempotencyKey после таймаута коммита не должен создавать дубликат заказа или транзакции',
+        );
+      } finally {
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTx;
+      }
+
+      return 'Таймаут клиента после успешной записи на стороне Firestore безопасно разрешается идемпотентным повтором по idempotencyKey без дублирования заказа и транзакции.';
+    },
+  );
+
+  await runTest(
+    'S27-03',
+    'Database',
+    '3. Transaction retry',
+    async () => {
+      await resetS27TestState();
+      const bs = new BalanceService();
+      await firestoreRepo.runTransaction(async (tx) => {
+        const u = await tx.get<StoreUser>('users', `tg_${buyer1.id}`);
+        const now = new Date().toISOString();
+        tx.set<StoreUser>('users', `tg_${buyer1.id}`, {
+          ...(u || {
+            userId: `tg_${buyer1.id}`,
+            telegramId: buyer1.id,
+            firstName: buyer1.first_name,
+            isBlocked: false,
+            totalOrders: 0,
+            totalSpentStars: 0,
+            createdAt: now,
+          }),
+          balanceUsdCents: 2000,
+          balance: 20,
+          totalOrders: 0,
+          totalSpentUsdCents: 0,
+          updatedAt: now,
+        });
+      });
+
+      const userBefore = await UserService.getUserByTelegramId(buyer1.id);
+      assert.ok(userBefore);
+      const startBalance = userBefore.balanceUsdCents ?? 0;
+
+      const origRunTx = firestoreRepo.runTransaction.bind(firestoreRepo);
+      let callbackInvocations = 0;
+
+      try {
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            const wrappedFn: Parameters<typeof firestoreRepo.runTransaction<T>>[0] = async (tx) => {
+              callbackInvocations += 1;
+              const res = await fn(tx);
+              if (callbackInvocations === 1) {
+                // Simulate Firestore SDK transaction commit conflict after callback reads and staged writes
+                const conflict = new Error('10 ABORTED: Optimistic concurrency retry');
+                (conflict as Error & { code?: string }).code = 'aborted';
+                throw conflict;
+              }
+              return res;
+            };
+            return origRunTx(wrappedFn).catch(async (err) => {
+              if ((err as { code?: string })?.code === 'aborted' && callbackInvocations === 1) {
+                return origRunTx(wrappedFn);
+              }
+              throw err;
+            });
+          };
+
+        const payRes = await bs.purchaseWithInternalBalance({
+          telegramId: buyer1.id,
+          productId: 'stars_pack_50',
+          quantity: 1,
+          recipientUsername: 's27_03_buyer',
+          orderId: 'ord_s27_03_tx_retry',
+        });
+
+        assert.equal(payRes.duplicate, false);
+        assert.equal(callbackInvocations, 2, 'Транзакционный callback должен выполниться повторно после ABORTED');
+
+        const userAfter = await UserService.getUserByTelegramId(buyer1.id);
+        assert.ok(userAfter);
+        assert.equal(
+          userAfter.balanceUsdCents,
+          startBalance - payRes.order.totalPriceUsdCents,
+          'Баланс должен списаться ровно один раз несмотря на повтор транзакции',
+        );
+      } finally {
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTx;
+      }
+
+      return 'Автоматический повтор транзакции Firestore (optimistic concurrency retry) выполняется без двойного списания баланса и без побочных эффектов.';
+    },
+  );
+
+  await runTest(
+    'S27-04',
+    'Fulfillment',
+    '4. Process restart with an order in processing state',
+    async () => {
+      await resetS27TestState();
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 's27_04_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      let postCount = 0;
+      let getCount = 0;
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's27_04_buyer',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCount += 1;
+            throw new Error('POST /v1/orders must not be called when order already exists remotely after restart');
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_s27_04')) {
+            getCount += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s27_04',
+                status: 'completed',
+                type: 'stars',
+                recipient_username: 's27_04_buyer',
+                quantity: 50,
+                price_usdt: '0.6200',
+                payment_tx: 'tx_pay_s27_04',
+                purchase_tx: 'tx_pur_s27_04',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request: ${req.method} ${req.url}`);
+        });
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 50,
+          recipientUsername: 's27_04_buyer',
+        });
+
+        const staleStartedAt = new Date(
+          Date.now() - FulfillmentService.staleProcessingLeaseMs - 10_000,
+        ).toISOString();
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentProvider: 'mystars',
+          mystarsOrderId: 'ord_ms_s27_04',
+          externalExecutionReference: 'ord_ms_s27_04',
+          fulfillmentIdempotencyKey: `fulfill_${ord.orderId}`,
+          fulfillmentStartedAt: staleStartedAt,
+          paidAt: staleStartedAt,
+        });
+
+        // Simulate process restart: clear in-memory worker state and run recovery pass
+        FulfillmentService.resetMyStarsPollingState();
+        const sentMessages: Array<{ chatId: number; text: string }> = [];
+        const bot = createMockBot(sentMessages);
+        await FulfillmentService.recoverPendingFulfillments(bot);
+
+        const after = await OrderService.getOrderById(ord.orderId);
+        assert.ok(after);
+        assert.equal(after.fulfillmentStatus, 'completed');
+        assert.equal(after.paymentStatus, 'completed');
+        assert.equal(postCount, 0, 'Повторный POST /v1/orders не должен вызываться');
+        assert.ok(getCount >= 1, 'Должна выполниться сверка GET /v1/orders/{id}');
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'После рестарта процесса заказ в статусе processing безопасно сверяется с внешним провайдером и завершается без дублирования внешнего вызова.';
+    },
+  );
+
+  await runTest(
+    'S27-05',
+    'Fulfillment',
+    '5. Expired fulfillment lease recovery',
+    async () => {
+      await resetS27TestState();
+      let executeCalls = 0;
+      let statusChecks = 0;
+      const seenIdempotencyKeys: string[] = [];
+
+      const idempotentAdapter: FulfillmentProviderAdapter = {
+        providerName: 's27-05-idempotent-provider',
+        supportsIdempotency: true,
+        isConfigured: () => true,
+        checkExternalStatus: async () => {
+          statusChecks += 1;
+          return {
+            alreadyExecuted: false,
+          };
+        },
+        requestFulfillment: async (order, ctx) => {
+          executeCalls += 1;
+          if (ctx?.idempotencyKey) {
+            seenIdempotencyKeys.push(ctx.idempotencyKey);
+          }
+          return {
+            handledAutomatically: true,
+            status: 'completed',
+            details: `Idempotent execution for #${order.orderId}`,
+            externalReference: `ext_${ctx?.idempotencyKey || order.orderId}`,
+          };
+        },
+      };
+
+      FulfillmentService.setAdapter(idempotentAdapter);
+      try {
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 55,
+          recipientUsername: 's27_05_buyer',
+        });
+
+        const expiredStartIso = new Date(
+          Date.now() - FulfillmentService.staleProcessingLeaseMs - 5_000,
+        ).toISOString();
+        const lockedKey = `fulfill_${ord.orderId}`;
+
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentStartedAt: expiredStartIso,
+          fulfillmentAttempts: 1,
+          fulfillmentIdempotencyKey: lockedKey,
+          paidAt: expiredStartIso,
+        });
+
+        const sentMessages: Array<{ chatId: number; text: string }> = [];
+        const bot = createMockBot(sentMessages);
+        await FulfillmentService.recoverPendingFulfillments(bot);
+
+        const recovered = await OrderService.getOrderById(ord.orderId);
+        assert.ok(recovered);
+        assert.equal(recovered.fulfillmentStatus, 'completed');
+        assert.equal(statusChecks, 1, 'Перед перехватом истёкшего lease должна вызываться сверка checkExternalStatus');
+        assert.equal(executeCalls, 1, 'После подтверждения alreadyExecuted=false выдача должна выполниться ровно 1 раз');
+        assert.deepEqual(
+          seenIdempotencyKeys,
+          [lockedKey],
+          'При перехвате истёкшего lease должен сохраняться исходный fulfillmentIdempotencyKey',
+        );
+      } finally {
+        FulfillmentService.resetAdapterToDefault();
+      }
+
+      return 'Истёкший fulfillment lease восстанавливается через предварительную сверку checkExternalStatus и повтор с тем же fulfillmentIdempotencyKey.';
+    },
+  );
+
+  await runTest(
+    'S27-06',
+    'Fulfillment',
+    '6. Two concurrent recovery workers',
+    async () => {
+      await resetS27TestState();
+      let adapterExecutions = 0;
+      const slowAdapter: FulfillmentProviderAdapter = {
+        providerName: 's27-06-concurrent-adapter',
+        supportsIdempotency: true,
+        isConfigured: () => true,
+        requestFulfillment: async (order, ctx) => {
+          adapterExecutions += 1;
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          return {
+            handledAutomatically: true,
+            status: 'completed',
+            details: `Concurrent recovery safe for #${order.orderId}`,
+            externalReference: `ref_${ctx?.idempotencyKey || order.orderId}`,
+          };
+        },
+      };
+
+      FulfillmentService.setAdapter(slowAdapter);
+      try {
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 65,
+          recipientUsername: 's27_06_buyer',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          paidAt: new Date().toISOString(),
+        });
+
+        const freshOrder = await OrderService.getOrderById(ord.orderId);
+        assert.ok(freshOrder);
+
+        const sentMessages: Array<{ chatId: number; text: string }> = [];
+        const bot = createMockBot(sentMessages);
+        // Two independent workers attempt to recover/claim the same paid order concurrently
+        await Promise.all([
+          FulfillmentService.initiateFulfillment({ ...freshOrder }, bot),
+          FulfillmentService.initiateFulfillment({ ...freshOrder }, bot),
+        ]);
+
+        assert.equal(
+          adapterExecutions,
+          1,
+          'Только один из двух параллельных воркеров должен захватить lease и вызвать провайдера выдачи',
+        );
+
+        const finalOrd = await OrderService.getOrderById(ord.orderId);
+        assert.ok(finalOrd);
+        assert.equal(finalOrd.fulfillmentStatus, 'completed');
+      } finally {
+        FulfillmentService.resetAdapterToDefault();
+      }
+
+      return 'При одновременном запуске двух воркеров восстановления атомарная транзакция в Firestore гарантирует ровно одно выполнение выдачи.';
+    },
+  );
+
+  await runTest(
+    'S27-07',
+    'Fulfillment',
+    '7. MyStars success followed by Firestore persistence failure',
+    async () => {
+      await resetS27TestState();
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 's27_07_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      FulfillmentService.setAdapter(new MyStarsFulfillmentAdapter(myStarsClient));
+      FulfillmentService.resetMyStarsPollingState();
+
+      let postCalls = 0;
+      const origRunTx = firestoreRepo.runTransaction.bind(firestoreRepo);
+      const origUpdateDoc = firestoreRepo.updateDoc.bind(firestoreRepo);
+
+      try {
+        myStarsClient.setHttpTransport(async (req) => {
+          if (req.url.endsWith('/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                ok: true,
+                type: 'stars',
+                recipient_username: 's27_07_buyer',
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+          if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+            postCalls += 1;
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s27_07',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's27_07_buyer',
+                quantity: 50,
+                currency: 'usdt_ton',
+                payment_amount: '0.6100',
+                price_usdt: '0.6100',
+                pay_to_address: 'EQD_S27_07_ADDR',
+                payment_memo: 'MEMO_S27_07',
+                payment_amount_usdt: '0.6100',
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+              },
+            };
+          }
+          if (req.method === 'GET' && req.url.includes('/v1/orders/ord_ms_s27_07')) {
+            return {
+              status: 200,
+              ok: true,
+              headers: {},
+              json: {
+                order_id: 'ord_ms_s27_07',
+                status: 'awaiting_payment',
+                type: 'stars',
+                recipient_username: 's27_07_buyer',
+                quantity: 50,
+                currency: 'usdt_ton',
+                price_usdt: '0.6100',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected request: ${req.method} ${req.url}`);
+        });
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 50,
+          recipientUsername: 's27_07_buyer',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+          fulfillmentProvider: 'mystars',
+          paidAt: new Date().toISOString(),
+        });
+
+        const paidOrd = await OrderService.getOrderById(ord.orderId);
+        assert.ok(paidOrd);
+
+        // Simulate Firestore outage immediately after MyStars POST /v1/orders succeeds
+        let blockFirestoreAfterPost = false;
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          async <T extends object>(col: StoreCollectionName, id: string, data: Partial<T>) => {
+            if (postCalls >= 1 && id === ord.orderId) {
+              blockFirestoreAfterPost = true;
+              throw new Error('14 UNAVAILABLE: Firestore write failed after external MyStars POST succeeded');
+            }
+            return origUpdateDoc(col, id, data);
+          };
+
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          async <T>(fn: Parameters<typeof firestoreRepo.runTransaction<T>>[0]) => {
+            if (blockFirestoreAfterPost) {
+              throw new Error('14 UNAVAILABLE: Firestore Phase 3 transaction failed after MyStars POST succeeded');
+            }
+            return origRunTx(fn);
+          };
+
+        const sentMessages: Array<{ chatId: number; text: string }> = [];
+        const bot = createMockBot(sentMessages);
+        await assert.rejects(
+          async () => {
+            await FulfillmentService.initiateFulfillment(paidOrd, bot);
+          },
+          /14 UNAVAILABLE: Firestore Phase 3 transaction failed after MyStars POST succeeded/,
+        );
+        assert.equal(postCalls, 1, 'POST /v1/orders должен быть вызван ровно 1 раз');
+
+        // Restore Firestore and inspect persisted order state during outage
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTx;
+        blockFirestoreAfterPost = false;
+
+        const duringOutage = await OrderService.getOrderById(ord.orderId);
+        assert.ok(duringOutage);
+        assert.equal(
+          duringOutage.fulfillmentStatus,
+          'processing',
+          'При отказе Firestore после успеха MyStars заказ НЕ должен переводиться в failed',
+        );
+        assert.equal(duringOutage.mystarsCreateInFlight, true);
+
+        // Run recovery pass: retainedProviderResults flushes the saved MyStars metadata without re-POSTing
+        await FulfillmentService.recoverPendingFulfillments(bot);
+
+        const recovered = await OrderService.getOrderById(ord.orderId);
+        assert.ok(recovered);
+        assert.equal(recovered.mystarsOrderId, 'ord_ms_s27_07');
+        assert.equal(recovered.mystarsPayToAddress, 'EQD_S27_07_ADDR');
+        assert.equal(postCalls, 1, 'Восстановление из retainedProviderResults не должно повторно вызывать POST /v1/orders');
+      } finally {
+        (firestoreRepo as unknown as { updateDoc: typeof firestoreRepo.updateDoc }).updateDoc =
+          origUpdateDoc;
+        (firestoreRepo as unknown as { runTransaction: typeof firestoreRepo.runTransaction }).runTransaction =
+          origRunTx;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Сбой записи Firestore после успешного создания заказа в MyStars удерживает результат в памяти (retainedProviderResults), не помечает заказ failed и дозаписывает метаданные без повторного POST.';
+    },
+  );
+
+  await runTest(
+    'S27-08',
+    'Payments',
+    '8. Duplicate payment callback',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_08_buyer',
+      });
+
+      let createdPaymentId = '';
+      let expectedAmount = '';
+      const extInvId = '2708001';
+
+      const transport = async (
+        req: HttpTransportRequest,
+      ): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/getExchangeRates')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: [{ source: 'USDT', target: 'USD', rate: '1.00', is_valid: true }],
+            },
+          };
+        }
+        if (req.url.endsWith('/createInvoice')) {
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          createdPaymentId = String(body.payload || '');
+          expectedAmount = String(body.amount || '1.00');
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                invoice_id: extInvId,
+                status: 'active',
+                asset: 'USDT',
+                currency_type: 'crypto',
+                amount: expectedAmount,
+                bot_invoice_url: `https://t.me/CryptoBot?start=${extInvId}`,
+                payload: createdPaymentId,
+              },
+            },
+          };
+        }
+        if (req.url.includes('/getInvoices')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                items: [
+                  {
+                    invoice_id: extInvId,
+                    status: 'paid',
+                    asset: 'USDT',
+                    currency_type: 'crypto',
+                    amount: expectedAmount,
+                    paid_asset: 'USDT',
+                    paid_amount: expectedAmount,
+                    payload: createdPaymentId,
+                    paid_at: new Date().toISOString(),
+                  },
+                ],
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected payment gateway call: ${req.url}`);
+      };
+
+      const gateway = new PaymentProviderGateway(transport, TEST_MOCK_CREDS);
+      const ps = new PaymentService('s27-08', gateway);
+
+      const created = await ps.createOrReuseOrderPayment({
+        orderId: ord.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USDT',
+      });
+
+      // Deliver 3 concurrent/duplicate payment callbacks for the exact same invoice
+      const [cb1, cb2, cb3] = await Promise.all([
+        ps.verifyAndProcessOrderPayment(created.payment.paymentId),
+        ps.verifyAndProcessOrderPayment(created.payment.paymentId),
+        ps.verifyAndProcessOrderPayment(created.payment.paymentId),
+      ]);
+
+      const nonDuplicateCount = [cb1, cb2, cb3].filter((r) => r.ok && !r.duplicate).length;
+      const duplicateCount = [cb1, cb2, cb3].filter((r) => r.ok && r.duplicate).length;
+      assert.equal(nonDuplicateCount, 1, 'Ровно один callback должен выполнить первичный переход в paid');
+      assert.equal(duplicateCount, 2, 'Остальные дублирующиеся callbacks должны вернуть duplicate: true');
+
+      const paidTxs = (await OrderService.getRecentTransactions(200)).filter(
+        (t) => t.orderId === ord.orderId && t.type === 'payment_received',
+      );
+      assert.equal(paidTxs.length, 1, 'Должна быть создана ровно одна транзакция payment_received');
+
+      return 'Повторные и параллельные платёжные callbacks дедуплицируются через транзакцию и payment_locks без двойного проведения оплаты.';
+    },
+  );
+
+  await runTest(
+    'S27-09',
+    'Fulfillment',
+    '9. Telegram notification failure',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_09_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(completedOrd);
+
+      // Bot fails with a transient 502 Bad Gateway
+      const failingBot = {
+        telegram: {
+          sendMessage: async () => {
+            const err = new Error('502: Bad Gateway');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 502 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const afterFail = await FulfillmentService.ensureBuyerNotified(completedOrd, failingBot);
+      assert.equal(afterFail.fulfillmentStatus, 'completed', 'Сбой уведомления не должен откатывать статус выполненного заказа');
+      assert.equal(afterFail.buyerNotifiedAt, undefined, 'buyerNotifiedAt не должен выставляться при ошибке отправки');
+      assert.equal(afterFail.buyerNotificationState?.status, 'pending');
+      assert.equal(afterFail.buyerNotificationState?.permanentFailure, false);
+      assert.equal(afterFail.buyerNotificationState?.lastHttpStatus, 502);
+      assert.ok(afterFail.buyerNotificationState?.lastError?.includes('502'));
+
+      return 'Временный сбой Telegram API (502 Bad Gateway) не нарушает состояние заказа, оставляет уведомление в pending с сохранённой ошибкой и кодом HTTP 502 для последующего повтора.';
+    },
+  );
+
+  await runTest(
+    'S27-10',
+    'Fulfillment',
+    '10. Telegram 429 retry handling',
+    async () => {
+      await resetS27TestState();
+      const ord1 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_10_buyer1',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord1.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completed1 = await OrderService.getOrderById(ord1.orderId);
+      assert.ok(completed1);
+
+      // Part A: Short 429 retry_after (1s <= maxInlineRateLimitWaitMs) retries inline and succeeds
+      let inlineAttempts = 0;
+      const inline429Bot = {
+        telegram: {
+          sendMessage: async () => {
+            inlineAttempts += 1;
+            if (inlineAttempts === 1) {
+              const err = new Error('429: Too Many Requests: retry after 1');
+              (err as Error & {
+                response?: { error_code: number; parameters: { retry_after: number } };
+              }).response = {
+                error_code: 429,
+                parameters: { retry_after: 1 },
+              };
+              throw err;
+            }
+            return { message_id: 271001 };
+          },
+        },
+      } as unknown as Telegraf;
+
+      const resInline = await FulfillmentService.ensureBuyerNotified(completed1, inline429Bot);
+      assert.equal(inlineAttempts, 2, 'При коротком retry_after (1с) должен выполниться inline-повтор');
+      assert.equal(resInline.buyerNotificationState?.status, 'sent');
+      assert.ok(resInline.buyerNotifiedAt);
+
+      // Part B: Long 429 retry_after (12s > maxInlineRateLimitWaitMs) defers and persists nextRetryAt + retryAfterSeconds
+      const ord2 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_10_buyer2',
+      });
+      await firestoreRepo.updateDoc<Order>('orders', ord2.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completed2 = await OrderService.getOrderById(ord2.orderId);
+      assert.ok(completed2);
+
+      let deferredAttempts = 0;
+      const deferred429Bot = {
+        telegram: {
+          sendMessage: async () => {
+            deferredAttempts += 1;
+            const err = new Error('429: Too Many Requests: retry after 12');
+            (err as Error & {
+              response?: { error_code: number; parameters: { retry_after: number } };
+            }).response = {
+              error_code: 429,
+              parameters: { retry_after: 12 },
+            };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const beforeDeferMs = Date.now();
+      const resDeferred = await FulfillmentService.ensureBuyerNotified(completed2, deferred429Bot);
+      assert.equal(
+        deferredAttempts,
+        1,
+        'При длительном retry_after (12с) воркер не должен блокировать поток, а сразу откладывает повтор по nextRetryAt',
+      );
+      assert.equal(resDeferred.buyerNotificationState?.status, 'pending');
+      assert.equal(resDeferred.buyerNotificationState?.lastHttpStatus, 429);
+      assert.equal(resDeferred.buyerNotificationState?.retryAfterSeconds, 12);
+      assert.ok(resDeferred.buyerNotificationState?.nextRetryAt);
+      const scheduledMs = Date.parse(resDeferred.buyerNotificationState.nextRetryAt);
+      assert.ok(
+        scheduledMs >= beforeDeferMs + 11_000,
+        'nextRetryAt должен учитывать retry_after=12 секунд от Telegram',
+      );
+
+      // Immediate retry while backoff window is active must be skipped without calling Telegram
+      await FulfillmentService.ensureBuyerNotified(resDeferred, deferred429Bot);
+      assert.equal(deferredAttempts, 1, 'До наступлении nextRetryAt повторный вызов к Telegram не выполняется');
+
+      return 'Telegram HTTP 429 корректно обрабатывает как короткий inline retry_after, так и отложенный повтор через сохранение retryAfterSeconds и nextRetryAt в Firestore.';
+    },
+  );
+
+  await runTest(
+    'S27-11',
+    'Fulfillment',
+    '11. Notification worker crash after claiming a notification',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_11_buyer',
+      });
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+
+      // Simulate a worker that claimed the notification (`status: 'sending'`) and crashed before lease expired,
+      // and now the lease has expired.
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+        buyerNotificationState: {
+          status: 'sending',
+          eventId: `evt_buyer_completed_${ord.orderId}`,
+          operationId: 'op_crashed_worker_claim_s27_11',
+          leaseOwner: 'worker_crashed_11',
+          leaseUntil: {
+            seconds: Math.floor((nowMs - 5_000) / 1000),
+            nanoseconds: 0,
+          },
+          attemptCount: 1,
+        },
+      });
+
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const bot = createMockBot(sentMessages);
+      const currentOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(currentOrd);
+
+      const recovered = await FulfillmentService.ensureBuyerNotified(currentOrd, bot);
+      assert.equal(
+        recovered.buyerNotificationState?.status,
+        'delivery_uncertain',
+        'После падения воркера в состоянии sending и истечения lease статус обязан перейти в delivery_uncertain',
+      );
+      assert.equal(recovered.buyerNotificationState?.deliveryUncertainAfterCrash, true);
+      assert.equal(recovered.buyerNotifiedAt, undefined, 'buyerNotifiedAt не должен выставляться ложно');
+      assert.equal(
+        sentMessages.length,
+        0,
+        'Автоматический повтор при delivery_uncertain заблокирован для защиты от дублей',
+      );
+
+      return 'Падение воркера после захвата sending-lease по истечении TTL переводит уведомление в delivery_uncertain без автоспама и без ложного buyerNotifiedAt.';
+    },
+  );
+
+  await runTest(
+    'S27-12',
+    'Fulfillment',
+    '12. Notification worker crash after Telegram accepts a message',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_12_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(completedOrd);
+
+      let telegramDeliveredCount = 0;
+      // Telegram accepts the message, but the connection drops / worker crashes before receiving HTTP 200 response
+      const dropAfterAcceptBot = {
+        telegram: {
+          sendMessage: async () => {
+            telegramDeliveredCount += 1;
+            const err = new Error('socket hang up (ECONNRESET after Telegram accepted request)');
+            (err as Error & { code?: string }).code = 'ECONNRESET';
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const afterAmbiguous = await FulfillmentService.ensureBuyerNotified(
+        completedOrd,
+        dropAfterAcceptBot,
+      );
+      assert.equal(
+        telegramDeliveredCount,
+        1,
+        'При обрыве соединения после отправки запроса sendTelegramMessageWithResult не должен делать второй inline-повтор',
+      );
+      assert.equal(afterAmbiguous.buyerNotificationState?.status, 'delivery_uncertain');
+      assert.equal(afterAmbiguous.buyerNotifiedAt, undefined);
+
+      // Subsequent background recovery pass must NOT auto-resend a delivery_uncertain message
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const cleanBot = createMockBot(sentMessages);
+      await FulfillmentService.recoverPendingFulfillments(cleanBot);
+      assert.equal(
+        sentMessages.filter((m) => m.chatId === buyer1.id).length,
+        0,
+        'Фоновое восстановление не должно повторно отправлять сообщение в статусе delivery_uncertain',
+      );
+
+      // Admin inspects and acknowledges delivery without re-sending
+      const acked = await FulfillmentService.acknowledgeUncertainNotification({
+        orderId: ord.orderId,
+        target: 'buyer',
+        adminTelegramId: ownerTelegramId,
+      });
+      assert.equal(acked.buyerNotificationState?.status, 'sent');
+      assert.equal(acked.buyerNotificationState?.acknowledgedByAdminId, ownerTelegramId);
+      assert.ok(acked.buyerNotifiedAt);
+
+      return 'При обрыве сети/падении после приёма сообщения Telegram уведомление переводится в delivery_uncertain (0 дублей) и подтверждается админом через acknowledgeUncertainNotification.';
+    },
+  );
+
+  await runTest(
+    'S27-13',
+    'Fulfillment',
+    '13. Notification retry after process restart',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_13_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(completedOrd);
+
+      // 1. Before restart: Telegram API is down (503 Service Unavailable), leaving notifications in 'pending'
+      const downBot = {
+        telegram: {
+          sendMessage: async () => {
+            const err = new Error('503: Service Unavailable');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 503 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      await FulfillmentService.ensureAdminNotified(completedOrd, downBot);
+      const afterFail = await FulfillmentService.ensureBuyerNotified(completedOrd, downBot);
+      assert.equal(afterFail.buyerNotificationState?.status, 'pending');
+      assert.equal(afterFail.adminNotificationState?.status, 'pending');
+
+      // 2. Simulate process restart: reset in-memory cursors & worker state
+      FulfillmentService.resetMyStarsPollingState();
+
+      // 3. On startup, recovery worker runs with healthy Telegram bot
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const healthyBot = createMockBot(sentMessages);
+      await FulfillmentService.recoverPendingFulfillments(healthyBot);
+
+      const recoveredOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(recoveredOrd);
+      assert.equal(recoveredOrd.buyerNotificationState?.status, 'sent');
+      assert.ok(recoveredOrd.buyerNotifiedAt);
+      assert.equal(recoveredOrd.adminNotificationState?.status, 'sent');
+      assert.ok(recoveredOrd.adminNotifiedAt);
+      assert.ok(
+        sentMessages.some((m) => m.chatId === buyer1.id),
+        'После рестарта процесса покупатель должен получить отложенное уведомление',
+      );
+
+      return 'Отложенные из-за временного сбоя уведомления (status=pending) надёжно доставляются фоновым воркером после перезапуска процесса.';
+    },
+  );
+
+  await runTest(
+    'S27-14',
+    'Fulfillment',
+    '14. Permanent notification failure and admin visibility',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_14_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+        adminNotifiedAt: nowIso,
+        adminNotificationState: {
+          status: 'sent',
+          eventId: `evt_admin_${ord.orderId}_completed`,
+          attemptCount: 1,
+          sentAt: nowIso,
+        },
+      });
+      const completedOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(completedOrd);
+
+      let permanentCallCount = 0;
+      const blockedByUserBot = {
+        telegram: {
+          sendMessage: async () => {
+            permanentCallCount += 1;
+            const err = new Error('403: Forbidden: bot was blocked by the user');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 403 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const failedOrd = await FulfillmentService.ensureBuyerNotified(
+        completedOrd,
+        blockedByUserBot,
+      );
+      assert.equal(
+        permanentCallCount,
+        1,
+        'При невосстановимой ошибке 403 (bot was blocked by the user) не должно выполняться лишних inline-повторов',
+      );
+      assert.equal(failedOrd.buyerNotificationState?.status, 'pending');
+      assert.equal(
+        failedOrd.buyerNotificationState?.permanentFailure,
+        true,
+        'Должен быть выставлен флаг permanentFailure: true',
+      );
+      assert.equal(failedOrd.buyerNotificationState?.lastHttpStatus, 403);
+
+      // Subsequent automatic recovery passes must NOT retry a permanent failure
+      await FulfillmentService.recoverPendingFulfillments(blockedByUserBot);
+      assert.equal(
+        permanentCallCount,
+        1,
+        'Фоновое восстановление обязано пропускать уведомления с permanentFailure=true (защита от бесконечного цикла повторов)',
+      );
+
+      // Verify admin observability in order card, notification review message, action keyboard, and attention query
+      const adminCardHtml = formatAdminOrderCard(failedOrd);
+      assert.ok(
+        adminCardHtml.includes('постоянный сбой доставки'),
+        'Карточка заказа админа должна явно отображать постоянный сбой доставки уведомления',
+      );
+
+      const reviewHtml = formatAdminNotificationReviewMessage(failedOrd);
+      assert.ok(
+        reviewHtml.includes('permanent_failure') && reviewHtml.includes('403'),
+        'Экран проверки доставки уведомлений должен отображать permanent_failure и HTTP код 403',
+      );
+
+      const kbJson = JSON.stringify(buildAdminOrderActionKeyboard(failedOrd));
+      assert.ok(
+        kbJson.includes(`adm:ord_notify_review:${ord.orderId}`),
+        'Клавиатура заказа админа должна содержать кнопку проверки доставки уведомления при permanentFailure',
+      );
+
+      const attentionList = await FulfillmentService.getOrdersNeedingNotificationAttention(50);
+      assert.ok(
+        attentionList.some((o) => o.orderId === ord.orderId),
+        'Заказ с permanentFailure должен возвращаться в списке getOrdersNeedingNotificationAttention',
+      );
+
+      return 'Невосстановимая ошибка Telegram (403 Forbidden) немедленно помечается permanentFailure=true, исключается из бесконечных автоповторов и отображается администратору.';
+    },
+  );
+
+  await runTest(
+    'S27-15',
+    'Fulfillment',
+    '15. Duplicate notification prevention under concurrent workers',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's27_15_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(completedOrd);
+
+      const sentToChats: number[] = [];
+      const concurrentBot = {
+        telegram: {
+          sendMessage: async (chatId: number | string) => {
+            await new Promise((resolve) => setTimeout(resolve, 35));
+            sentToChats.push(Number(chatId));
+            return { message_id: 271501 };
+          },
+        },
+      } as unknown as Telegraf;
+
+      // Launch 3 concurrent workers for buyer notification and 3 concurrent workers for admin notification
+      await Promise.all([
+        FulfillmentService.ensureBuyerNotified(completedOrd, concurrentBot, false, 'worker_s27_15_a'),
+        FulfillmentService.ensureBuyerNotified(completedOrd, concurrentBot, false, 'worker_s27_15_b'),
+        FulfillmentService.ensureBuyerNotified(completedOrd, concurrentBot, false, 'worker_s27_15_c'),
+        FulfillmentService.ensureAdminNotified(completedOrd, concurrentBot, false, 'worker_s27_15_a'),
+        FulfillmentService.ensureAdminNotified(completedOrd, concurrentBot, false, 'worker_s27_15_b'),
+        FulfillmentService.ensureAdminNotified(completedOrd, concurrentBot, false, 'worker_s27_15_c'),
+      ]);
+
+      const buyerDeliveries = sentToChats.filter((id) => id === buyer1.id);
+      assert.equal(
+        buyerDeliveries.length,
+        1,
+        'Покупатель должен получить ровно 1 уведомление при параллельной работе 3 воркеров',
+      );
+
+      const configuredAdmins = Array.from(new Set(getEnvConfig().adminIds));
+      for (const adminId of configuredAdmins) {
+        const adminDeliveries = sentToChats.filter((id) => id === adminId);
+        assert.equal(
+          adminDeliveries.length,
+          1,
+          `Администратор ${adminId} должен получить ровно 1 уведомление при параллельной работе 3 воркеров`,
+        );
+      }
+
+      const finalOrd = await OrderService.getOrderById(ord.orderId);
+      assert.ok(finalOrd);
+      assert.equal(finalOrd.buyerNotificationState?.status, 'sent');
+      assert.equal(finalOrd.adminNotificationState?.status, 'sent');
+
+      return 'Параллельные воркеры уведомлений синхронизируются через атомарный sending-lease в Firestore, гарантируя отсутствие дубликатов покупателю и администраторам.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {
