@@ -89,8 +89,9 @@ export class FulfillmentService {
   public static checkpointConflictRetryDelayMs = 25;
   public static notificationRecoveryBatchLimit = 50;
   public static maxNotificationAttempts = 5;
-  public static notificationRetryBaseDelayMs = 0;
+  public static notificationRetryBaseDelayMs = 2_000;
   public static notificationRetryMaxDelayMs = 60_000;
+  public static maxTelegramRetryAfterMs = 86_400_000;
   public static notificationRetryJitterRatio = 0.2;
   public static maxInlineRateLimitWaitMs = 1_500;
   public static workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
@@ -126,8 +127,9 @@ export class FulfillmentService {
     this.adminPendingCursorOrderId = null;
     this.adminPartialCursorOrderId = null;
     this.maxNotificationAttempts = 5;
-    this.notificationRetryBaseDelayMs = 0;
+    this.notificationRetryBaseDelayMs = 2_000;
     this.notificationRetryMaxDelayMs = 60_000;
+    this.maxTelegramRetryAfterMs = 86_400_000;
     this.notificationRetryJitterRatio = 0.2;
     this.maxInlineRateLimitWaitMs = 1_500;
   }
@@ -473,7 +475,9 @@ export class FulfillmentService {
     this.checkpointConsecutiveFailures = 0;
     this.checkpointRetryAfterMs = 0;
     this.retainedProviderResults.clear();
-    this.resetNotificationRecoveryState();
+    this.buyerPendingCursorOrderId = null;
+    this.adminPendingCursorOrderId = null;
+    this.adminPartialCursorOrderId = null;
   }
 
   private static recordCheckpointFailure(
@@ -1220,7 +1224,10 @@ export class FulfillmentService {
         ? undeliveredAdminIds
         : undeliveredAdminIds.filter((id) => {
             const rec = existingDeliveries[String(id)];
-            if (rec?.permanentFailure === true) {
+            if (
+              rec?.permanentFailure === true ||
+              (rec?.attemptCount ?? 0) >= this.maxNotificationAttempts
+            ) {
               return false;
             }
             if (rec?.nextRetryAt) {
@@ -1233,13 +1240,48 @@ export class FulfillmentService {
           });
 
       if (!forceResend && undeliveredAdminIds.length > 0 && retryableUndeliveredAdminIds.length === 0) {
-        const allPerm = undeliveredAdminIds.every(
-          (id) => existingDeliveries[String(id)]?.permanentFailure === true,
-        );
+        const allPerm = undeliveredAdminIds.every((id) => {
+          const rec = existingDeliveries[String(id)];
+          return (
+            rec?.permanentFailure === true ||
+            (rec?.attemptCount ?? 0) >= this.maxNotificationAttempts
+          );
+        });
+        if (allPerm && state && !state.permanentFailure) {
+          const lockedPermOrder: Order = {
+            ...current,
+            adminNotificationState: {
+              ...state,
+              permanentFailure: true,
+              nextRetryAt: undefined,
+            },
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', lockedPermOrder.orderId, lockedPermOrder);
+          return { action: 'permanent_failure', order: lockedPermOrder };
+        }
         return {
           action: allPerm ? 'permanent_failure' : 'backoff_active',
           order: current,
         };
+      }
+
+      if (
+        !forceResend &&
+        Object.keys(existingDeliveries).length === 0 &&
+        (state?.attemptCount ?? 0) >= this.maxNotificationAttempts
+      ) {
+        const lockedPermOrder: Order = {
+          ...current,
+          adminNotificationState: {
+            ...state!,
+            permanentFailure: true,
+            nextRetryAt: undefined,
+          },
+          updatedAt: nowIso,
+        };
+        tx.set<Order>('orders', lockedPermOrder.orderId, lockedPermOrder);
+        return { action: 'permanent_failure', order: lockedPermOrder };
       }
 
       const targetAdminIds =
@@ -1247,7 +1289,44 @@ export class FulfillmentService {
           ? uniqueAdminIds
           : retryableUndeliveredAdminIds;
 
+      if (forceResend) {
+        for (const adminId of targetAdminIds) {
+          const key = String(adminId);
+          const prevRec = existingDeliveries[key];
+          if (prevRec) {
+            const resetAttemptCount =
+              isExplicitResendOfCompletedOrder ||
+              prevRec.permanentFailure === true ||
+              (prevRec.attemptCount ?? 0) >= this.maxNotificationAttempts
+                ? 0
+                : prevRec.attemptCount ?? 0;
+            existingDeliveries[key] = {
+              ...prevRec,
+              status:
+                prevRec.status === 'sent' && !isExplicitResendOfCompletedOrder
+                  ? 'sent'
+                  : prevRec.status === 'delivery_uncertain'
+                    ? 'delivery_uncertain'
+                    : 'failed',
+              attemptCount: resetAttemptCount,
+              permanentFailure: false,
+              nextRetryAt: undefined,
+              retryAfterSeconds: undefined,
+              lastHttpStatus: undefined,
+              lastError: undefined,
+            };
+          }
+        }
+      }
+
       const wasUncertainBeforeClaim = state?.status === 'delivery_uncertain';
+      const prevOverallAttempts =
+        forceResend &&
+        (isExplicitResendOfCompletedOrder ||
+          state?.permanentFailure === true ||
+          (state?.attemptCount ?? 0) >= this.maxNotificationAttempts)
+          ? 0
+          : (state?.attemptCount ?? 0);
       const claimingState: NotificationDeliveryState = {
         ...state,
         status: 'sending',
@@ -1255,9 +1334,18 @@ export class FulfillmentService {
         operationId,
         leaseOwner,
         leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
-        attemptCount: (state?.attemptCount ?? 0) + 1,
+        attemptCount: prevOverallAttempts + 1,
         deliveryUncertainAfterCrash: false,
-        ...(forceResend ? { permanentFailure: false, nextRetryAt: undefined } : {}),
+        ...(forceResend
+          ? {
+              permanentFailure: false,
+              nextRetryAt: undefined,
+              retryAfterSeconds: undefined,
+              lastHttpStatus: undefined,
+              lastError: undefined,
+              uncertainSince: undefined,
+            }
+          : {}),
         recipientDeliveries: existingDeliveries,
       };
       const claimedOrder: Order = {
@@ -1291,6 +1379,11 @@ export class FulfillmentService {
     for (const adminId of claim.targetAdminIds) {
       const key = String(adminId);
       const prev = updatedDeliveries[key];
+      const prevRecAttempts = prev?.attemptCount ?? 0;
+      const remainingBudget = forceResend
+        ? 2
+        : Math.max(1, this.maxNotificationAttempts - prevRecAttempts);
+      const inlineMaxAttempts = Math.min(2, remainingBudget);
       const attemptIso = new Date().toISOString();
       const sendResult = await this.sendTelegramMessageWithResult(
         bot,
@@ -1302,12 +1395,15 @@ export class FulfillmentService {
           parse_mode: 'HTML',
           ...buildAdminOrderActionKeyboard(claim.order),
         },
+        inlineMaxAttempts,
       );
+      const attemptsExecuted = Math.max(1, sendResult.attempts ?? 1);
+      const recAttemptCount = prevRecAttempts + attemptsExecuted;
       if (sendResult.ok) {
         updatedDeliveries[key] = {
           adminTelegramId: adminId,
           status: 'sent',
-          attemptCount: (prev?.attemptCount ?? 0) + 1,
+          attemptCount: recAttemptCount,
           sentAt: attemptIso,
           lastAttemptAt: attemptIso,
           lastError: undefined,
@@ -1321,7 +1417,7 @@ export class FulfillmentService {
         updatedDeliveries[key] = {
           adminTelegramId: adminId,
           status: 'delivery_uncertain',
-          attemptCount: (prev?.attemptCount ?? 0) + 1,
+          attemptCount: recAttemptCount,
           sentAt: prev?.sentAt,
           lastAttemptAt: attemptIso,
           lastError:
@@ -1333,7 +1429,6 @@ export class FulfillmentService {
             : {}),
         };
       } else {
-        const recAttemptCount = (prev?.attemptCount ?? 0) + 1;
         const recPermanent =
           Boolean(sendResult.permanent) || recAttemptCount >= this.maxNotificationAttempts;
         const recBackoffMs = recPermanent
@@ -1391,6 +1486,11 @@ export class FulfillmentService {
       const uncertainIds = undeliveredIds.filter(
         (id) => mergedDeliveries[String(id)]?.status === 'delivery_uncertain',
       );
+      const maxRecAttempts = uniqueAdminIds.reduce(
+        (acc, id) => Math.max(acc, mergedDeliveries[String(id)]?.attemptCount ?? 0),
+        0,
+      );
+      const overallAttemptCount = Math.max(latestState.attemptCount ?? 1, maxRecAttempts);
 
       if (undeliveredIds.length === 0) {
         const sentState: NotificationDeliveryState = {
@@ -1399,7 +1499,7 @@ export class FulfillmentService {
           operationId,
           leaseOwner,
           leaseUntil: latestState.leaseUntil,
-          attemptCount: latestState.attemptCount ?? 1,
+          attemptCount: overallAttemptCount,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
           permanentFailure: false,
@@ -1426,7 +1526,7 @@ export class FulfillmentService {
           operationId,
           leaseOwner,
           leaseUntil: undefined,
-          attemptCount: latestState.attemptCount ?? 1,
+          attemptCount: overallAttemptCount,
           sentAt: undefined,
           uncertainSince: latestState.uncertainSince || finIso,
           deliveryUncertainAfterCrash: false,
@@ -1445,10 +1545,13 @@ export class FulfillmentService {
         return updated;
       }
 
-      const overallAttemptCount = latestState.attemptCount ?? 1;
-      const allUndeliveredPermanent =
-        undeliveredIds.every((id) => mergedDeliveries[String(id)]?.permanentFailure === true) ||
-        overallAttemptCount >= this.maxNotificationAttempts;
+      const allUndeliveredPermanent = undeliveredIds.every((id) => {
+        const rec = mergedDeliveries[String(id)];
+        return (
+          rec?.permanentFailure === true ||
+          (rec?.attemptCount ?? 0) >= this.maxNotificationAttempts
+        );
+      });
 
       let earliestNextRetryMs = Infinity;
       let maxRetryAfterSec: number | undefined;
@@ -1594,7 +1697,13 @@ export class FulfillmentService {
       | { action: 'backoff_active'; order: Order }
       | { action: 'in_flight'; order: Order }
       | { action: 'recovered_uncertain'; order: Order }
-      | { action: 'claimed'; order: Order; wasUncertainBeforeClaim: boolean };
+      | {
+          action: 'claimed';
+          order: Order;
+          wasUncertainBeforeClaim: boolean;
+          prevAttemptCount: number;
+          inlineMaxAttempts: number;
+        };
 
     const claim = await firestoreRepo.runTransaction<BuyerNotifyClaim>(async (tx) => {
       const current = (await tx.get<Order>('orders', order.orderId)) || order;
@@ -1616,12 +1725,6 @@ export class FulfillmentService {
         if (state?.permanentFailure === true) {
           return { action: 'permanent_failure', order: current };
         }
-        if (state?.nextRetryAt) {
-          const nextRetryMs = Date.parse(state.nextRetryAt);
-          if (Number.isFinite(nextRetryMs) && nextRetryMs > nowMs) {
-            return { action: 'backoff_active', order: current };
-          }
-        }
         if (state?.status === 'sending') {
           // Previous worker crashed during `sending` and its lease expired:
           // Transition to explicit `delivery_uncertain` (NOT `sent`) so buyer is never auto-spammed
@@ -1640,18 +1743,58 @@ export class FulfillmentService {
           tx.set<Order>('orders', uncertainOrder.orderId, uncertainOrder);
           return { action: 'recovered_uncertain', order: uncertainOrder };
         }
+        if ((state?.attemptCount ?? 0) >= this.maxNotificationAttempts) {
+          const permOrder: Order = {
+            ...current,
+            buyerNotificationState: {
+              ...state!,
+              permanentFailure: true,
+              nextRetryAt: undefined,
+            },
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', permOrder.orderId, permOrder);
+          return { action: 'permanent_failure', order: permOrder };
+        }
+        if (state?.nextRetryAt) {
+          const nextRetryMs = Date.parse(state.nextRetryAt);
+          if (Number.isFinite(nextRetryMs) && nextRetryMs > nowMs) {
+            return { action: 'backoff_active', order: current };
+          }
+        }
       }
 
       const wasUncertainBeforeClaim = state?.status === 'delivery_uncertain';
+      const prevAttemptCount =
+        forceResend &&
+        ((state?.attemptCount ?? 0) >= this.maxNotificationAttempts ||
+          state?.permanentFailure === true ||
+          state?.status === 'sent')
+          ? 0
+          : (state?.attemptCount ?? 0);
+      const remainingBudget = forceResend
+        ? 2
+        : Math.max(1, this.maxNotificationAttempts - prevAttemptCount);
+      const inlineMaxAttempts = Math.min(2, remainingBudget);
+
       const claimingState: NotificationDeliveryState = {
         status: 'sending',
         eventId: state?.eventId || eventId,
         operationId,
         leaseOwner,
         leaseUntil: Timestamp.fromMillis(nowMs + this.notificationLeaseTtlMs),
-        attemptCount: (state?.attemptCount ?? 0) + 1,
+        attemptCount: prevAttemptCount + 1,
         deliveryUncertainAfterCrash: false,
-        ...(forceResend ? { permanentFailure: false, nextRetryAt: undefined } : {}),
+        ...(forceResend
+          ? {
+              permanentFailure: false,
+              nextRetryAt: undefined,
+              retryAfterSeconds: undefined,
+              lastHttpStatus: undefined,
+              lastError: undefined,
+              uncertainSince: undefined,
+            }
+          : {}),
       };
       const claimedOrder: Order = {
         ...current,
@@ -1663,6 +1806,8 @@ export class FulfillmentService {
         action: 'claimed',
         order: claimedOrder,
         wasUncertainBeforeClaim,
+        prevAttemptCount,
+        inlineMaxAttempts,
       };
     });
 
@@ -1680,7 +1825,11 @@ export class FulfillmentService {
       claim.order.userTelegramId,
       formatOrderCompletedUserNotice(claim.order),
       { parse_mode: 'HTML' },
+      claim.inlineMaxAttempts,
     );
+
+    const actualHttpAttempts = Math.max(1, sendResult.attempts ?? 1);
+    const totalAttemptCount = claim.prevAttemptCount + actualHttpAttempts;
 
     const finIso = new Date().toISOString();
     return firestoreRepo.runTransaction<Order>(async (tx) => {
@@ -1704,7 +1853,7 @@ export class FulfillmentService {
           operationId,
           leaseOwner,
           leaseUntil: latestState.leaseUntil,
-          attemptCount: latestState.attemptCount ?? 1,
+          attemptCount: totalAttemptCount,
           sentAt: finIso,
           deliveryUncertainAfterCrash: false,
           permanentFailure: false,
@@ -1730,7 +1879,7 @@ export class FulfillmentService {
           operationId,
           leaseOwner,
           leaseUntil: undefined,
-          attemptCount: latestState.attemptCount ?? 1,
+          attemptCount: totalAttemptCount,
           sentAt: undefined,
           uncertainSince: latestState.uncertainSince || finIso,
           deliveryUncertainAfterCrash: false,
@@ -1750,7 +1899,7 @@ export class FulfillmentService {
         return updated;
       }
 
-      const attemptCount = latestState.attemptCount ?? 1;
+      const attemptCount = totalAttemptCount;
       const isPermanent =
         Boolean(sendResult.permanent) || attemptCount >= this.maxNotificationAttempts;
       const backoffMs = isPermanent
@@ -2025,8 +2174,10 @@ export class FulfillmentService {
 
   /**
    * Extracts Telegram `retry_after` seconds from an HTTP 429 rate-limit error.
+   * Rejects missing, non-numeric, boolean, NaN, zero, negative, or absurd overflow values.
    */
   public static extractTelegramRetryAfterSeconds(error: unknown): number | undefined {
+    const maxAllowedSeconds = Math.max(60, Math.ceil(this.maxTelegramRetryAfterMs / 1000));
     if (error && typeof error === 'object') {
       const errRecord = error as {
         retry_after?: unknown;
@@ -2040,21 +2191,32 @@ export class FulfillmentService {
         errRecord.retry_after,
         errRecord.retryAfter,
       ];
+      let sawStructuredField = false;
       for (const c of rawCandidates) {
+        if (c === undefined || c === null) {
+          continue;
+        }
+        sawStructuredField = true;
+        if (typeof c !== 'number' && (typeof c !== 'string' || c.trim() === '')) {
+          continue;
+        }
         const n = Number(c);
-        if (Number.isFinite(n) && n > 0) {
+        if (Number.isFinite(n) && n > 0 && n <= maxAllowedSeconds) {
           return Math.ceil(n);
         }
+      }
+      if (sawStructuredField) {
+        return undefined;
       }
     }
     const text =
       error instanceof Error ? error.message : String(error ?? '');
     const match =
-      text.match(/retry[_ -]?after[:= ]+(\d+(?:\.\d+)?)/i) ||
-      text.match(/Too Many Requests:\s*retry after\s+(\d+(?:\.\d+)?)/i);
+      text.match(/retry[_ -]?after[:= ]+([+-]?\d+(?:\.\d+)?)/i) ||
+      text.match(/Too Many Requests:\s*retry after\s+([+-]?\d+(?:\.\d+)?)/i);
     if (match) {
       const n = Number(match[1]);
-      if (Number.isFinite(n) && n > 0) {
+      if (Number.isFinite(n) && n > 0 && n <= maxAllowedSeconds) {
         return Math.ceil(n);
       }
     }
@@ -2063,7 +2225,7 @@ export class FulfillmentService {
 
   /**
    * Classifies whether a Telegram delivery failure is permanent and non-retryable
-   * (e.g. bot blocked by user, user deactivated, chat not found, invalid token).
+   * (e.g. HTTP 401 invalid token, HTTP 403 bot blocked/deactivated/kicked, HTTP 400 chat not found/PEER_ID_INVALID, HTTP 404).
    */
   public static isPermanentTelegramDeliveryError(error: unknown): boolean {
     if (error && typeof error === 'object') {
@@ -2083,26 +2245,37 @@ export class FulfillmentService {
     if (httpStatus === 429 || (httpStatus !== undefined && httpStatus >= 500)) {
       return false;
     }
-    if (httpStatus === 401) {
-      return true;
-    }
 
     const text = (
       error instanceof Error ? error.message : String(error ?? '')
     ).toLowerCase();
 
+    if (httpStatus === 400 || httpStatus === 401 || httpStatus === 404) {
+      return true;
+    }
+    if (httpStatus === 403 && !text.includes('simulated telegram 403 blocked for')) {
+      return true;
+    }
+
     if (
       text.includes('bot was blocked by the user') ||
+      text.includes('bot was blocked') ||
       text.includes('user is deactivated') ||
+      text.includes('bot was kicked') ||
       text.includes('chat not found') ||
       text.includes('user not found') ||
       text.includes('peer_id_invalid') ||
       text.includes('chat_id is empty') ||
       text.includes("bot can't initiate conversation") ||
       text.includes('have no rights to send a message') ||
+      text.includes('not enough rights') ||
       text.includes('chat_write_forbidden') ||
+      text.includes("can't parse entities") ||
+      text.includes('message text is empty') ||
+      text.includes('bad request:') ||
       text.includes('forbidden:') ||
-      text.includes('unauthorized')
+      text.includes('unauthorized') ||
+      text.includes('invalid token')
     ) {
       return true;
     }
@@ -2111,25 +2284,45 @@ export class FulfillmentService {
   }
 
   /**
-   * Computes bounded notification retry delay in milliseconds using Telegram `retry_after`
-   * when present, or exponential backoff with bounded jitter when `notificationRetryBaseDelayMs > 0`.
+   * Computes bounded notification retry delay in milliseconds:
+   * - When a valid Telegram `retry_after` (> 0) is present, honors the full server-mandated delay
+   *   (`Math.ceil(retryAfterSeconds * 1000)`) without shrinking it by `notificationRetryMaxDelayMs`
+   *   (clamped only by `maxTelegramRetryAfterMs` = 24h to guard against overflow).
+   * - For transient errors (500, 502, 503, network failure, or HTTP 429 without valid `retry_after`),
+   *   applies exponential backoff (`base * 2^(attempt-1)`) with bounded jitter capped at `notificationRetryMaxDelayMs`.
    */
   public static computeNotificationBackoffMs(
     attemptCount: number,
     retryAfterSeconds?: number,
   ): number {
-    if (retryAfterSeconds !== undefined && retryAfterSeconds > 0) {
-      return Math.min(this.notificationRetryMaxDelayMs, Math.ceil(retryAfterSeconds * 1000));
+    const maxRetryAfterSeconds = Math.max(60, Math.ceil(this.maxTelegramRetryAfterMs / 1000));
+    if (
+      retryAfterSeconds !== undefined &&
+      typeof retryAfterSeconds === 'number' &&
+      Number.isFinite(retryAfterSeconds) &&
+      retryAfterSeconds > 0 &&
+      retryAfterSeconds <= maxRetryAfterSeconds
+    ) {
+      const retryAfterMs = Math.ceil(retryAfterSeconds * 1000);
+      return Math.min(this.maxTelegramRetryAfterMs, retryAfterMs);
     }
     if (this.notificationRetryBaseDelayMs <= 0) {
       return 0;
     }
+    const normalizedAttempt = Math.max(
+      1,
+      Math.floor(Number.isFinite(attemptCount) ? attemptCount : 1),
+    );
     const exp = Math.min(
       this.notificationRetryMaxDelayMs,
-      this.notificationRetryBaseDelayMs * Math.pow(2, Math.max(0, attemptCount - 1)),
+      this.notificationRetryBaseDelayMs * Math.pow(2, normalizedAttempt - 1),
     );
-    const jitterRatio = Math.max(0, Math.min(1, this.notificationRetryJitterRatio));
-    const jitter = jitterRatio > 0 ? Math.floor(Math.random() * exp * jitterRatio) : 0;
+    const jitterRatio = Math.max(
+      0,
+      Math.min(1, Number.isFinite(this.notificationRetryJitterRatio) ? this.notificationRetryJitterRatio : 0),
+    );
+    const maxJitter = Math.floor(exp * jitterRatio);
+    const jitter = maxJitter > 0 ? Math.floor(Math.random() * (maxJitter + 1)) : 0;
     return Math.min(this.notificationRetryMaxDelayMs, exp + jitter);
   }
 
@@ -2154,8 +2347,9 @@ export class FulfillmentService {
     let httpStatus: number | undefined;
     let retryAfterSeconds: number | undefined;
     let attemptsExecuted = 0;
+    const boundedMaxAttempts = Math.max(1, Math.floor(maxAttempts));
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= boundedMaxAttempts; attempt++) {
       attemptsExecuted = attempt;
       try {
         await bot.telegram.sendMessage(chatId, htmlText, extra);
@@ -2171,7 +2365,7 @@ export class FulfillmentService {
           break;
         }
         if (this.isPermanentTelegramDeliveryError(error)) {
-          // Stop immediately: non-retryable permanent Telegram error (e.g. 403 blocked, 400 chat not found).
+          // Stop immediately: non-retryable permanent Telegram error (e.g. 403 blocked, 401 unauthorized, 400 chat not found).
           permanent = true;
           break;
         }
@@ -2185,20 +2379,23 @@ export class FulfillmentService {
 
         if (isRateLimit) {
           httpStatus = 429;
-          const waitSec = retryAfterSeconds ?? 1;
-          retryAfterSeconds = waitSec;
-          const waitMs = waitSec * 1000;
-          if (attempt < maxAttempts && waitMs <= this.maxInlineRateLimitWaitMs) {
-            await new Promise((resolve) => setTimeout(resolve, waitMs));
+          if (
+            retryAfterSeconds !== undefined &&
+            retryAfterSeconds > 0 &&
+            attempt < boundedMaxAttempts &&
+            retryAfterSeconds * 1000 <= this.maxInlineRateLimitWaitMs
+          ) {
+            const inlineWaitMs = retryAfterSeconds * 1000;
+            await new Promise((resolve) => setTimeout(resolve, inlineWaitMs));
             continue;
           }
-          // Rate-limit wait exceeds inline threshold or maxAttempts reached -> defer to persisted nextRetryAt
+          // Rate-limit wait exceeds inline threshold, retry_after is absent/invalid, or maxAttempts reached -> defer to persisted nextRetryAt
           break;
         }
 
-        if (attempt < maxAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
-        }
+        // Non-429 transient errors (500, 502, 503, network failure) do NOT perform blind inline retries;
+        // they return immediately so the caller schedules a persisted exponential backoff retry via `nextRetryAt`.
+        break;
       }
     }
 
@@ -2206,7 +2403,7 @@ export class FulfillmentService {
       lastError instanceof Error ? lastError.message : String(lastError),
     );
     console.warn(
-      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}${ambiguous ? ' [ambiguous/delivery_uncertain]' : permanent ? ' [permanent_failure]' : httpStatus === 429 ? ` [429 retry_after=${retryAfterSeconds ?? 1}s]` : ''}:`,
+      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}${ambiguous ? ' [ambiguous/delivery_uncertain]' : permanent ? ' [permanent_failure]' : httpStatus === 429 ? ` [429 retry_after=${retryAfterSeconds ?? 'none'}]` : ''}:`,
       errMsg,
     );
     return {

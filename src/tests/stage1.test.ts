@@ -600,6 +600,7 @@ async function runFullAuditTestSuite(): Promise<void> {
   firestoreRepo.enableIsolatedTestMode(true);
   FulfillmentService.baseRetryDelayMs = 10;
   FulfillmentService.staleProcessingLeaseMs = 50;
+  FulfillmentService.notificationRetryBaseDelayMs = 0;
 
   const buyer1 = {
     id: 100200301,
@@ -19088,6 +19089,7 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Stage 2.6 (8/8): Устойчивость при сбое Telegram-уведомления покупателю после успешной выдачи, проверка авторизации админа (ensureAdmin) и отсутствие утечки секретов',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
+      FulfillmentService.notificationRetryBaseDelayMs = 0;
       await UserService.upsertFromTelegram(buyer1);
 
       let telegramShouldFailForBuyer = true;
@@ -21241,6 +21243,7 @@ async function runFullAuditTestSuite(): Promise<void> {
     '13. Notification retry after process restart',
     async () => {
       await resetS27TestState();
+      FulfillmentService.notificationRetryBaseDelayMs = 20;
       const ord = await OrderService.createOrder({
         telegramUser: buyer1,
         productId: 'stars_custom',
@@ -21272,9 +21275,11 @@ async function runFullAuditTestSuite(): Promise<void> {
       const afterFail = await FulfillmentService.ensureBuyerNotified(completedOrd, downBot);
       assert.equal(afterFail.buyerNotificationState?.status, 'pending');
       assert.equal(afterFail.adminNotificationState?.status, 'pending');
+      assert.ok(afterFail.buyerNotificationState?.nextRetryAt);
 
-      // 2. Simulate process restart: reset in-memory cursors & worker state
+      // 2. Simulate process restart: reset in-memory cursors & worker state, then wait for backoff window
       FulfillmentService.resetMyStarsPollingState();
+      await new Promise((resolve) => setTimeout(resolve, 35));
 
       // 3. On startup, recovery worker runs with healthy Telegram bot
       const sentMessages: Array<{ chatId: number; text: string }> = [];
@@ -21457,6 +21462,1135 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(finalOrd.adminNotificationState?.status, 'sent');
 
       return 'Параллельные воркеры уведомлений синхронизируются через атомарный sending-lease в Firestore, гарантируя отсутствие дубликатов покупателю и администраторам.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 2.7.1 — NOTIFICATION RELIABILITY HARDENING (18 REQUIRED TESTS)
+  // =========================================================================
+
+  await runTest(
+    'S271-01',
+    'Fulfillment',
+    'Stage 2.7.1 (1/18): Telegram 429 с retry_after = 120 не урезается внутренним лимитом 60с',
+    async () => {
+      await resetS27TestState();
+      assert.equal(
+        FulfillmentService.computeNotificationBackoffMs(1, 120),
+        120_000,
+        'retry_after = 120 обязан давать задержку 120 000 мс без обрезки до notificationRetryMaxDelayMs (60 000 мс)',
+      );
+
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_01_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      let attempts = 0;
+      const bot429x120 = {
+        telegram: {
+          sendMessage: async () => {
+            attempts += 1;
+            const err = new Error('429: Too Many Requests: retry after 120');
+            (err as Error & {
+              response?: { error_code: number; parameters: { retry_after: number } };
+            }).response = {
+              error_code: 429,
+              parameters: { retry_after: 120 },
+            };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const beforeMs = Date.now();
+      const after429 = await FulfillmentService.ensureBuyerNotified(completedOrd, bot429x120);
+      assert.equal(attempts, 1, 'При retry_after=120 должен быть выполнен ровно 1 HTTP-запрос');
+      assert.equal(after429.buyerNotificationState?.status, 'pending');
+      assert.equal(after429.buyerNotificationState?.lastHttpStatus, 429);
+      assert.equal(after429.buyerNotificationState?.retryAfterSeconds, 120);
+      assert.ok(after429.buyerNotificationState?.nextRetryAt);
+
+      const nextRetryMs = Date.parse(after429.buyerNotificationState.nextRetryAt);
+      assert.ok(
+        nextRetryMs >= beforeMs + 120_000,
+        `nextRetryAt (${nextRetryMs - beforeMs}мс) обязан быть не меньше 120 000 мс от момента ошибки`,
+      );
+
+      return 'Telegram 429 с retry_after = 120 планирует повтор ровно через >=120 секунд без урезания до 60 секунд.';
+    },
+  );
+
+  await runTest(
+    'S271-02',
+    'Fulfillment',
+    'Stage 2.7.1 (2/18): Telegram 429 без retry_after использует exponential backoff без ложного retryAfterSeconds=1',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_02_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      let attempts = 0;
+      const bot429NoParam = {
+        telegram: {
+          sendMessage: async () => {
+            attempts += 1;
+            const err = new Error('429: Too Many Requests');
+            (err as Error & { response?: { error_code: number } }).response = {
+              error_code: 429,
+            };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const beforeMs = Date.now();
+      const after429 = await FulfillmentService.ensureBuyerNotified(completedOrd, bot429NoParam);
+      assert.equal(
+        attempts,
+        1,
+        'При 429 без retry_after не должен выполняться скрытый inline-повтор через 1 секунду',
+      );
+      assert.equal(after429.buyerNotificationState?.status, 'pending');
+      assert.equal(after429.buyerNotificationState?.lastHttpStatus, 429);
+      assert.equal(after429.buyerNotificationState?.retryAfterSeconds, undefined);
+      assert.ok(after429.buyerNotificationState?.nextRetryAt);
+
+      const scheduledDelayMs = Date.parse(after429.buyerNotificationState.nextRetryAt) - beforeMs;
+      assert.ok(
+        scheduledDelayMs >= FulfillmentService.notificationRetryBaseDelayMs,
+        `При 429 без retry_after должен применяться exponential backoff >= ${FulfillmentService.notificationRetryBaseDelayMs} мс (получено ${scheduledDelayMs} мс)`,
+      );
+
+      return 'Telegram 429 без retry_after не фабрикует 1-секундный inline-повтор и планирует nextRetryAt по exponential backoff.';
+    },
+  );
+
+  await runTest(
+    'S271-03',
+    'Fulfillment',
+    'Stage 2.7.1 (3/18): Некорректный, отрицательный, нулевой, NaN или переполненный retry_after безопасно отклоняется',
+    async () => {
+      await resetS27TestState();
+
+      const invalidErrors: unknown[] = [
+        { response: { error_code: 429, parameters: { retry_after: 0 } }, message: '429 retry after 0' },
+        { response: { error_code: 429, parameters: { retry_after: -15 } }, message: '429 retry after -15' },
+        { response: { error_code: 429, parameters: { retry_after: 'abc' } }, message: '429 retry after abc' },
+        { response: { error_code: 429, parameters: { retry_after: NaN } }, message: '429' },
+        { response: { error_code: 429, parameters: { retry_after: true } }, message: '429' },
+        { response: { error_code: 429, parameters: { retry_after: null } }, message: '429' },
+        { response: { error_code: 429, parameters: { retry_after: 99_999_999 } }, message: '429' },
+        new Error('429: Too Many Requests: retry after -30'),
+      ];
+
+      for (const badErr of invalidErrors) {
+        assert.equal(
+          FulfillmentService.extractTelegramRetryAfterSeconds(badErr),
+          undefined,
+          `Некорректный retry_after (${JSON.stringify(badErr)}) обязан возвращать undefined`,
+        );
+      }
+
+      FulfillmentService.notificationRetryJitterRatio = 0;
+      assert.equal(
+        FulfillmentService.computeNotificationBackoffMs(1, -10),
+        2_000,
+        'Отрицательный retryAfterSeconds обязан переключаться на базовый exponential backoff (2000 мс)',
+      );
+      assert.equal(
+        FulfillmentService.computeNotificationBackoffMs(2, 0),
+        4_000,
+        'Нулевой retryAfterSeconds обязан переключаться на exponential backoff (4000 мс на 2-й попытке)',
+      );
+      assert.equal(
+        FulfillmentService.computeNotificationBackoffMs(1, Number.NaN),
+        2_000,
+        'NaN retryAfterSeconds обязан переключаться на базовый exponential backoff (2000 мс)',
+      );
+
+      return 'Все некорректные значения retry_after (0, отрицательные, строки, boolean, NaN, >24ч) отвергаются и переводятся на exponential backoff.';
+    },
+  );
+
+  await runTest(
+    'S271-04',
+    'Fulfillment',
+    'Stage 2.7.1 (4/18): Exponential backoff для последовательных временных ошибок (2s -> 4s -> 8s -> 16s -> cap 60s)',
+    async () => {
+      await resetS27TestState();
+      assert.equal(
+        FulfillmentService.notificationRetryBaseDelayMs,
+        2_000,
+        'Базовая задержка notificationRetryBaseDelayMs по умолчанию обязана быть положительной (2000 мс)',
+      );
+      FulfillmentService.notificationRetryJitterRatio = 0;
+
+      const d1 = FulfillmentService.computeNotificationBackoffMs(1);
+      const d2 = FulfillmentService.computeNotificationBackoffMs(2);
+      const d3 = FulfillmentService.computeNotificationBackoffMs(3);
+      const d4 = FulfillmentService.computeNotificationBackoffMs(4);
+      const d5 = FulfillmentService.computeNotificationBackoffMs(5);
+      const d6 = FulfillmentService.computeNotificationBackoffMs(6);
+
+      assert.equal(d1, 2_000);
+      assert.equal(d2, 4_000);
+      assert.equal(d3, 8_000);
+      assert.equal(d4, 16_000);
+      assert.equal(d5, 32_000);
+      assert.equal(d6, 60_000, 'Внутренний exponential backoff ограничивается потолком 60 000 мс');
+      assert.ok(d1 < d2 && d2 < d3 && d3 < d4 && d4 < d5 && d5 < d6);
+
+      return 'Exponential backoff монотонно растёт по степеням двойки (2с, 4с, 8с, 16с, 32с) до потолка 60с.';
+    },
+  );
+
+  await runTest(
+    'S271-05',
+    'Fulfillment',
+    'Stage 2.7.1 (5/18): Jitter находится строго в допустимых границах [exp, min(maxDelay, exp * (1 + jitterRatio))]',
+    async () => {
+      await resetS27TestState();
+      // Default: base = 2000, jitterRatio = 0.2, maxDelay = 60000
+      const samplesAttempt1 = new Set<number>();
+      for (let i = 0; i < 60; i++) {
+        const val1 = FulfillmentService.computeNotificationBackoffMs(1);
+        assert.ok(
+          val1 >= 2_000 && val1 <= 2_400,
+          `Попытка 1 с jitter 20% обязана быть в [2000, 2400], получено ${val1}`,
+        );
+        samplesAttempt1.add(val1);
+
+        const val3 = FulfillmentService.computeNotificationBackoffMs(3);
+        assert.ok(
+          val3 >= 8_000 && val3 <= 9_600,
+          `Попытка 3 с jitter 20% обязана быть в [8000, 9600], получено ${val3}`,
+        );
+
+        const valCap = FulfillmentService.computeNotificationBackoffMs(8);
+        assert.ok(
+          valCap <= FulfillmentService.notificationRetryMaxDelayMs,
+          `Даже с jitter задержка не должна превышать notificationRetryMaxDelayMs (${valCap})`,
+        );
+      }
+      assert.ok(samplesAttempt1.size > 1, 'Jitter должен давать вариативность задержек');
+
+      return 'Jitter строго ограничен диапазоном [exp, exp * (1 + jitterRatio)] и не превышает notificationRetryMaxDelayMs.';
+    },
+  );
+
+  await runTest(
+    'S271-06',
+    'Fulfillment',
+    'Stage 2.7.1 (6/18): HTTP 403 классифицируется как permanent error (ровно 1 HTTP-запрос, без retry)',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_06_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      let httpCalls = 0;
+      const bot403 = {
+        telegram: {
+          sendMessage: async () => {
+            httpCalls += 1;
+            const err = new Error('403: Forbidden: user is deactivated');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 403 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const failed = await FulfillmentService.ensureBuyerNotified(completedOrd, bot403);
+      assert.equal(httpCalls, 1, 'При HTTP 403 должен выполняться ровно 1 HTTP-запрос');
+      assert.equal(failed.buyerNotificationState?.permanentFailure, true);
+      assert.equal(failed.buyerNotificationState?.lastHttpStatus, 403);
+      assert.equal(failed.buyerNotificationState?.attemptCount, 1);
+      assert.equal(failed.buyerNotificationState?.nextRetryAt, undefined);
+
+      await FulfillmentService.ensureBuyerNotified(failed, bot403);
+      await FulfillmentService.recoverPendingFulfillments(bot403);
+      assert.equal(httpCalls, 1, 'Последующие циклы восстановления не должны повторять 403');
+
+      return 'HTTP 403 немедленно фиксирует permanentFailure=true после 1 HTTP-запроса без повторных попыток.';
+    },
+  );
+
+  await runTest(
+    'S271-07',
+    'Fulfillment',
+    'Stage 2.7.1 (7/18): HTTP 401 классифицируется как permanent error (ровно 1 HTTP-запрос, без retry)',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_07_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      let httpCalls = 0;
+      const bot401 = {
+        telegram: {
+          sendMessage: async () => {
+            httpCalls += 1;
+            const err = new Error('401: Unauthorized');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 401 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const failed = await FulfillmentService.ensureBuyerNotified(completedOrd, bot401);
+      assert.equal(httpCalls, 1, 'При HTTP 401 должен выполняться ровно 1 HTTP-запрос');
+      assert.equal(failed.buyerNotificationState?.permanentFailure, true);
+      assert.equal(failed.buyerNotificationState?.lastHttpStatus, 401);
+      assert.equal(failed.buyerNotificationState?.attemptCount, 1);
+      assert.equal(failed.buyerNotificationState?.nextRetryAt, undefined);
+
+      await FulfillmentService.ensureBuyerNotified(failed, bot401);
+      await FulfillmentService.recoverPendingFulfillments(bot401);
+      assert.equal(httpCalls, 1, 'При HTTP 401 повторные вызовы не выполняются');
+
+      return 'HTTP 401 (Unauthorized) классифицируется как permanentFailure=true после 1 HTTP-запроса.';
+    },
+  );
+
+  await runTest(
+    'S271-08',
+    'Fulfillment',
+    'Stage 2.7.1 (8/18): HTTP 500 классифицируется как временная ошибка с планированием exponential backoff',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_08_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      let httpCalls = 0;
+      const bot500 = {
+        telegram: {
+          sendMessage: async () => {
+            httpCalls += 1;
+            const err = new Error('500: Internal Server Error');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 500 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const beforeMs = Date.now();
+      const after500 = await FulfillmentService.ensureBuyerNotified(completedOrd, bot500);
+      assert.equal(
+        httpCalls,
+        1,
+        'При HTTP 500 выполняется ровно 1 HTTP-запрос за цикл без скрытого inline-дубля',
+      );
+      assert.equal(after500.buyerNotificationState?.status, 'pending');
+      assert.equal(after500.buyerNotificationState?.permanentFailure, false);
+      assert.equal(after500.buyerNotificationState?.lastHttpStatus, 500);
+      assert.equal(after500.buyerNotificationState?.attemptCount, 1);
+      assert.ok(after500.buyerNotificationState?.nextRetryAt);
+      assert.ok(
+        Date.parse(after500.buyerNotificationState.nextRetryAt) >= beforeMs + 2_000,
+        'После первой ошибки HTTP 500 должен планироваться nextRetryAt >= 2000 мс',
+      );
+
+      return 'HTTP 500 сохраняет уведомление в pending (attemptCount=1, permanentFailure=false) и планирует nextRetryAt по exponential backoff.';
+    },
+  );
+
+  await runTest(
+    'S271-09',
+    'Fulfillment',
+    'Stage 2.7.1 (9/18): Превышение лимита реальных HTTP-попыток (maxNotificationAttempts = 5) переводит в permanentFailure',
+    async () => {
+      await resetS27TestState();
+      FulfillmentService.notificationRetryBaseDelayMs = 5;
+      FulfillmentService.notificationRetryJitterRatio = 0;
+      FulfillmentService.maxNotificationAttempts = 5;
+
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_09_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+
+      let actualTelegramHttpRequests = 0;
+      const always503Bot = {
+        telegram: {
+          sendMessage: async () => {
+            actualTelegramHttpRequests += 1;
+            const err = new Error('503: Service Unavailable');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 503 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      let current = (await OrderService.getOrderById(ord.orderId))!;
+      for (let cycle = 1; cycle <= 7; cycle++) {
+        if (current.buyerNotificationState?.nextRetryAt) {
+          await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+            buyerNotificationState: {
+              ...current.buyerNotificationState,
+              nextRetryAt: new Date(Date.now() - 1_000).toISOString(),
+            },
+          });
+          current = (await OrderService.getOrderById(ord.orderId))!;
+        }
+        current = await FulfillmentService.ensureBuyerNotified(current, always503Bot);
+      }
+
+      assert.equal(
+        actualTelegramHttpRequests,
+        5,
+        'Общее число реальных HTTP-запросов к Telegram не должно превышать maxNotificationAttempts (5)',
+      );
+      assert.equal(current.buyerNotificationState?.attemptCount, 5);
+      assert.equal(
+        current.buyerNotificationState?.permanentFailure,
+        true,
+        'После 5 неуспешных HTTP-попыток обязан выставляться permanentFailure=true',
+      );
+      assert.equal(current.buyerNotificationState?.nextRetryAt, undefined);
+
+      // Even after process restart, no 6th HTTP request is ever sent
+      FulfillmentService.resetMyStarsPollingState();
+      await FulfillmentService.recoverPendingFulfillments(always503Bot);
+      assert.equal(actualTelegramHttpRequests, 5);
+
+      return 'Счётчик attemptCount считает реальные HTTP-запросы к Telegram и строго блокирует отправку после достижения лимита 5 попыток.';
+    },
+  );
+
+  await runTest(
+    'S271-10',
+    'Fulfillment',
+    'Stage 2.7.1 (10/18): Рестарт процесса сохраняет nextRetryAt, retryAfterSeconds, attemptCount и lastHttpStatus в Firestore',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_10_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      const bot429x45 = {
+        telegram: {
+          sendMessage: async () => {
+            const err = new Error('429: Too Many Requests: retry after 45');
+            (err as Error & {
+              response?: { error_code: number; parameters: { retry_after: number } };
+            }).response = {
+              error_code: 429,
+              parameters: { retry_after: 45 },
+            };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const failedBeforeRestart = await FulfillmentService.ensureBuyerNotified(
+        completedOrd,
+        bot429x45,
+      );
+      const persistedNextRetryAt = failedBeforeRestart.buyerNotificationState?.nextRetryAt;
+      assert.ok(persistedNextRetryAt);
+      assert.equal(failedBeforeRestart.buyerNotificationState?.retryAfterSeconds, 45);
+      assert.equal(failedBeforeRestart.buyerNotificationState?.attemptCount, 1);
+      assert.equal(failedBeforeRestart.buyerNotificationState?.lastHttpStatus, 429);
+
+      // Simulate full process restart: reset in-memory worker cursors and assign a new workerInstanceId
+      const prevWorkerId = FulfillmentService.workerInstanceId;
+      try {
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.workerInstanceId = 'worker_restarted_s271_10';
+
+        const reloadedAfterRestart = (await OrderService.getOrderById(ord.orderId))!;
+        assert.equal(
+          reloadedAfterRestart.buyerNotificationState?.nextRetryAt,
+          persistedNextRetryAt,
+          'nextRetryAt обязан сохраняться в Firestore после перезапуска процесса',
+        );
+        assert.equal(reloadedAfterRestart.buyerNotificationState?.attemptCount, 1);
+        assert.equal(reloadedAfterRestart.buyerNotificationState?.retryAfterSeconds, 45);
+        assert.equal(reloadedAfterRestart.buyerNotificationState?.lastHttpStatus, 429);
+      } finally {
+        FulfillmentService.workerInstanceId = prevWorkerId;
+      }
+
+      return 'Состояние backoff (nextRetryAt, retryAfterSeconds, attemptCount, lastHttpStatus) хранится в Firestore и полностью сохраняется при рестарте процесса.';
+    },
+  );
+
+  await runTest(
+    'S271-11',
+    'Fulfillment',
+    'Stage 2.7.1 (11/18): Recovery до наступления nextRetryAt не отправляет сообщение (даже после рестарта процесса)',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_11_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+        adminNotifiedAt: nowIso,
+        adminNotificationState: {
+          status: 'sent',
+          eventId: `evt_admin_${ord.orderId}_completed`,
+          attemptCount: 1,
+          sentAt: nowIso,
+        },
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      let attempts = 0;
+      const bot502 = {
+        telegram: {
+          sendMessage: async () => {
+            attempts += 1;
+            const err = new Error('502: Bad Gateway');
+            (err as Error & { response?: { error_code: number } }).response = { error_code: 502 };
+            throw err;
+          },
+        },
+      } as unknown as Telegraf;
+
+      const afterFirstFail = await FulfillmentService.ensureBuyerNotified(completedOrd, bot502);
+      assert.equal(attempts, 1);
+      assert.ok(afterFirstFail.buyerNotificationState?.nextRetryAt);
+      assert.ok(Date.parse(afterFirstFail.buyerNotificationState.nextRetryAt) > Date.now() + 1_000);
+
+      // Simulate restart while nextRetryAt is still in the future
+      FulfillmentService.resetMyStarsPollingState();
+      let prematureCalls = 0;
+      const spyBot = {
+        telegram: {
+          sendMessage: async () => {
+            prematureCalls += 1;
+            return { message_id: 27111 };
+          },
+        },
+      } as unknown as Telegraf;
+
+      await FulfillmentService.ensureBuyerNotified(afterFirstFail, spyBot);
+      await FulfillmentService.recoverPendingFulfillments(spyBot);
+      assert.equal(
+        prematureCalls,
+        0,
+        'До наступления nextRetryAt ни прямой вызов, ни фоновый recovery не должны обращаться к Telegram API',
+      );
+
+      return 'До наступления nextRetryAt повторная отправка гарантированно пропускается как при прямом вызове, так и при фоновом recovery после рестарта.';
+    },
+  );
+
+  await runTest(
+    'S271-12',
+    'Fulfillment',
+    'Stage 2.7.1 (12/18): Recovery после наступления nextRetryAt успешно доставляет уведомление',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_12_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+        adminNotifiedAt: nowIso,
+        adminNotificationState: {
+          status: 'sent',
+          eventId: `evt_admin_${ord.orderId}_completed`,
+          attemptCount: 1,
+          sentAt: nowIso,
+        },
+        buyerNotificationState: {
+          status: 'pending',
+          eventId: `evt_buyer_completed_${ord.orderId}`,
+          operationId: 'op_prev_fail_s271_12',
+          leaseOwner: 'worker_old',
+          attemptCount: 2,
+          permanentFailure: false,
+          lastHttpStatus: 503,
+          lastError: '503: Service Unavailable',
+          nextRetryAt: new Date(Date.now() - 500).toISOString(),
+        },
+      });
+
+      FulfillmentService.resetMyStarsPollingState();
+      const delivered: Array<{ chatId: number; text: string }> = [];
+      const healthyBot = createMockBot(delivered);
+
+      await FulfillmentService.recoverPendingFulfillments(healthyBot);
+
+      const finalOrd = (await OrderService.getOrderById(ord.orderId))!;
+      assert.equal(finalOrd.buyerNotificationState?.status, 'sent');
+      assert.equal(finalOrd.buyerNotificationState?.attemptCount, 3);
+      assert.equal(finalOrd.buyerNotificationState?.nextRetryAt, undefined);
+      assert.equal(finalOrd.buyerNotificationState?.lastError, undefined);
+      assert.ok(finalOrd.buyerNotifiedAt);
+      assert.equal(delivered.filter((m) => m.chatId === buyer1.id).length, 1);
+
+      return 'После наступления nextRetryAt фоновый воркер доставляет уведомление ровно 1 раз, очищает nextRetryAt и переводит статус в sent.';
+    },
+  );
+
+  await runTest(
+    'S271-13',
+    'Fulfillment',
+    'Stage 2.7.1 (13/18): Два параллельных воркера (atomic lease, 0 дубликатов)',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_13_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+      const completedOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+      const sentToChats: number[] = [];
+      const bot2Workers = {
+        telegram: {
+          sendMessage: async (chatId: number | string) => {
+            await new Promise((r) => setTimeout(r, 30));
+            sentToChats.push(Number(chatId));
+            return { message_id: 27113 };
+          },
+        },
+      } as unknown as Telegraf;
+
+      await Promise.all([
+        FulfillmentService.ensureBuyerNotified(completedOrd, bot2Workers, false, 'worker_2w_A'),
+        FulfillmentService.ensureBuyerNotified(completedOrd, bot2Workers, false, 'worker_2w_B'),
+        FulfillmentService.ensureAdminNotified(completedOrd, bot2Workers, false, 'worker_2w_A'),
+        FulfillmentService.ensureAdminNotified(completedOrd, bot2Workers, false, 'worker_2w_B'),
+      ]);
+
+      assert.equal(
+        sentToChats.filter((id) => id === buyer1.id).length,
+        1,
+        'При 2 параллельных воркерах покупатель обязан получить ровно 1 сообщение',
+      );
+      const configuredAdmins = Array.from(new Set(getEnvConfig().adminIds));
+      for (const adminId of configuredAdmins) {
+        assert.equal(
+          sentToChats.filter((id) => id === adminId).length,
+          1,
+          `Администратор ${adminId} обязан получить ровно 1 сообщение при 2 параллельных воркерах`,
+        );
+      }
+
+      return 'Два параллельных воркера синхронизируются через транзакционный sending-lease без дублирования сообщений.';
+    },
+  );
+
+  await runTest(
+    'S271-14',
+    'Fulfillment',
+    'Stage 2.7.1 (14/18): Три параллельных воркера фонового восстановления (recoverPendingFulfillments)',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_14_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+        buyerNotificationState: {
+          status: 'pending',
+          eventId: `evt_buyer_completed_${ord.orderId}`,
+          attemptCount: 0,
+        },
+        adminNotificationState: {
+          status: 'pending',
+          eventId: `evt_admin_${ord.orderId}_completed`,
+          attemptCount: 0,
+        },
+      });
+
+      const sentForOrder: number[] = [];
+      const bot3Workers = {
+        telegram: {
+          sendMessage: async (chatId: number | string, text: string) => {
+            await new Promise((r) => setTimeout(r, 30));
+            if (text.includes(ord.orderId)) {
+              sentForOrder.push(Number(chatId));
+            }
+            return { message_id: 27114 };
+          },
+        },
+      } as unknown as Telegraf;
+
+      await Promise.all([
+        FulfillmentService.recoverPendingFulfillments(bot3Workers, {
+          bypassLocalMutex: true,
+          workerId: 'worker_3w_1',
+        }),
+        FulfillmentService.recoverPendingFulfillments(bot3Workers, {
+          bypassLocalMutex: true,
+          workerId: 'worker_3w_2',
+        }),
+        FulfillmentService.recoverPendingFulfillments(bot3Workers, {
+          bypassLocalMutex: true,
+          workerId: 'worker_3w_3',
+        }),
+      ]);
+
+      assert.equal(
+        sentForOrder.filter((id) => id === buyer1.id).length,
+        1,
+        'При 3 параллельных воркерах recoverPendingFulfillments покупатель получает ровно 1 сообщение',
+      );
+      const configuredAdmins = Array.from(new Set(getEnvConfig().adminIds));
+      for (const adminId of configuredAdmins) {
+        assert.equal(
+          sentForOrder.filter((id) => id === adminId).length,
+          1,
+          `Администратор ${adminId} получает ровно 1 сообщение при 3 параллельных воркерах recoverPendingFulfillments`,
+        );
+      }
+
+      return 'Три параллельных воркера фонового восстановления доставляют ровно по 1 сообщению покупателю и каждому администратору.';
+    },
+  );
+
+  await runTest(
+    'S271-15',
+    'Fulfillment',
+    'Stage 2.7.1 (15/18): Частичная доставка нескольким администраторам (status=partial_sent, индивидуальный nextRetryAt)',
+    async () => {
+      await resetS27TestState();
+      const prevOwner = process.env.OWNER_TELEGRAM_ID;
+      const prevAdmins = process.env.ADMIN_IDS;
+      const ADM_1 = 9271001;
+      const ADM_2 = 9271002;
+      const ADM_3 = 9271003;
+
+      try {
+        process.env.OWNER_TELEGRAM_ID = String(ADM_1);
+        process.env.ADMIN_IDS = `${ADM_2},${ADM_3}`;
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 50,
+          recipientUsername: 's271_15_buyer',
+        });
+        const nowIso = new Date().toISOString();
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          paidAt: nowIso,
+        });
+        const processingOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+        const partialBot = {
+          telegram: {
+            sendMessage: async (chatId: number | string) => {
+              if (Number(chatId) === ADM_2) {
+                const err = new Error('503: Service Unavailable for Admin 2');
+                (err as Error & { response?: { error_code: number } }).response = {
+                  error_code: 503,
+                };
+                throw err;
+              }
+              return { message_id: 27115 };
+            },
+          },
+        } as unknown as Telegraf;
+
+        const beforeMs = Date.now();
+        const partialOrd = await FulfillmentService.ensureAdminNotified(processingOrd, partialBot);
+        assert.equal(partialOrd.adminNotificationState?.status, 'partial_sent');
+        assert.equal(partialOrd.adminNotifiedAt, undefined);
+        assert.equal(partialOrd.adminNotificationState?.permanentFailure, false);
+
+        const deliveries = partialOrd.adminNotificationState?.recipientDeliveries;
+        assert.ok(deliveries);
+        assert.equal(deliveries[String(ADM_1)]?.status, 'sent');
+        assert.equal(deliveries[String(ADM_1)]?.attemptCount, 1);
+        assert.equal(deliveries[String(ADM_3)]?.status, 'sent');
+        assert.equal(deliveries[String(ADM_3)]?.attemptCount, 1);
+
+        assert.equal(deliveries[String(ADM_2)]?.status, 'failed');
+        assert.equal(deliveries[String(ADM_2)]?.attemptCount, 1);
+        assert.equal(deliveries[String(ADM_2)]?.lastHttpStatus, 503);
+        assert.equal(deliveries[String(ADM_2)]?.permanentFailure, false);
+        assert.ok(deliveries[String(ADM_2)]?.nextRetryAt);
+        assert.ok(Date.parse(deliveries[String(ADM_2)].nextRetryAt!) >= beforeMs + 2_000);
+        assert.equal(
+          partialOrd.adminNotificationState?.nextRetryAt,
+          deliveries[String(ADM_2)]?.nextRetryAt,
+        );
+      } finally {
+        if (prevOwner === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwner;
+        if (prevAdmins === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdmins;
+      }
+
+      return 'Частичная доставка 2 из 3 администраторов фиксирует partial_sent и планирует индивидуальный nextRetryAt только для упавшего получателя.';
+    },
+  );
+
+  await runTest(
+    'S271-16',
+    'Fulfillment',
+    'Stage 2.7.1 (16/18): Успешно получивший получатель никогда не получает дубль при retry partial_sent',
+    async () => {
+      await resetS27TestState();
+      const prevOwner = process.env.OWNER_TELEGRAM_ID;
+      const prevAdmins = process.env.ADMIN_IDS;
+      const ADM_1 = 9271011;
+      const ADM_2 = 9271012;
+      const ADM_3 = 9271013;
+
+      try {
+        process.env.OWNER_TELEGRAM_ID = String(ADM_1);
+        process.env.ADMIN_IDS = `${ADM_2},${ADM_3}`;
+
+        const ord = await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_custom',
+          quantity: 50,
+          recipientUsername: 's271_16_buyer',
+        });
+        const nowIso = new Date().toISOString();
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          paidAt: nowIso,
+        });
+        const processingOrd = (await OrderService.getOrderById(ord.orderId))!;
+
+        const callCounts = new Map<number, number>();
+        let failAdm2 = true;
+        const trackingBot = {
+          telegram: {
+            sendMessage: async (chatId: number | string) => {
+              const id = Number(chatId);
+              callCounts.set(id, (callCounts.get(id) ?? 0) + 1);
+              if (id === ADM_2 && failAdm2) {
+                const err = new Error('502: Bad Gateway');
+                (err as Error & { response?: { error_code: number } }).response = {
+                  error_code: 502,
+                };
+                throw err;
+              }
+              return { message_id: 27116 };
+            },
+          },
+        } as unknown as Telegraf;
+
+        const partialOrd = await FulfillmentService.ensureAdminNotified(processingOrd, trackingBot);
+        assert.equal(partialOrd.adminNotificationState?.status, 'partial_sent');
+        assert.equal(callCounts.get(ADM_1), 1);
+        assert.equal(callCounts.get(ADM_2), 1);
+        assert.equal(callCounts.get(ADM_3), 1);
+
+        // Expire nextRetryAt for ADM_2 and retry
+        const expiredIso = new Date(Date.now() - 1_000).toISOString();
+        await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+          adminNotificationState: {
+            ...partialOrd.adminNotificationState!,
+            nextRetryAt: expiredIso,
+            recipientDeliveries: {
+              ...partialOrd.adminNotificationState!.recipientDeliveries!,
+              [String(ADM_2)]: {
+                ...partialOrd.adminNotificationState!.recipientDeliveries![String(ADM_2)],
+                nextRetryAt: expiredIso,
+              },
+            },
+          },
+        });
+
+        failAdm2 = false;
+        const readyForRetry = (await OrderService.getOrderById(ord.orderId))!;
+        const finalOrd = await FulfillmentService.ensureAdminNotified(readyForRetry, trackingBot);
+
+        assert.equal(finalOrd.adminNotificationState?.status, 'sent');
+        assert.ok(finalOrd.adminNotifiedAt);
+        assert.equal(
+          callCounts.get(ADM_1),
+          1,
+          'ADM_1 уже получил сообщение в первой попытке и не должен получать дубль',
+        );
+        assert.equal(
+          callCounts.get(ADM_3),
+          1,
+          'ADM_3 уже получил сообщение в первой попытке и не должен получать дубль',
+        );
+        assert.equal(
+          callCounts.get(ADM_2),
+          2,
+          'ADM_2 должен получить ровно 1 повторную попытку после первой ошибки',
+        );
+      } finally {
+        if (prevOwner === undefined) delete process.env.OWNER_TELEGRAM_ID;
+        else process.env.OWNER_TELEGRAM_ID = prevOwner;
+        if (prevAdmins === undefined) delete process.env.ADMIN_IDS;
+        else process.env.ADMIN_IDS = prevAdmins;
+      }
+
+      return 'При повторной отправке partial_sent сообщения досылаются исключительно недоставленным получателям без единого дубля уже получившим.';
+    },
+  );
+
+  await runTest(
+    'S271-17',
+    'Fulfillment',
+    'Stage 2.7.1 (17/18): Ручной forceResend корректно сбрасывает permanentFailure, nextRetryAt, retryAfterSeconds, lastHttpStatus и исчерпанный лимит попыток',
+    async () => {
+      await resetS27TestState();
+      const ord = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_17_buyer',
+      });
+      const nowIso = new Date().toISOString();
+      const futureRetryIso = new Date(Date.now() + 300_000).toISOString();
+
+      await firestoreRepo.updateDoc<Order>('orders', ord.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+        buyerNotificationState: {
+          status: 'pending',
+          eventId: `evt_buyer_completed_${ord.orderId}`,
+          operationId: 'op_exhausted_buyer',
+          leaseOwner: 'worker_prev',
+          attemptCount: 5,
+          permanentFailure: true,
+          nextRetryAt: futureRetryIso,
+          retryAfterSeconds: 300,
+          lastHttpStatus: 403,
+          lastError: '403: Forbidden: bot was blocked by the user',
+          uncertainSince: nowIso,
+          deliveryUncertainAfterCrash: true,
+        },
+        adminNotificationState: {
+          status: 'delivery_uncertain',
+          eventId: `evt_admin_${ord.orderId}_completed`,
+          operationId: 'op_uncertain_admin',
+          leaseOwner: 'worker_prev',
+          attemptCount: 5,
+          permanentFailure: true,
+          nextRetryAt: futureRetryIso,
+          retryAfterSeconds: 300,
+          lastHttpStatus: 504,
+          lastError: '504: Gateway Timeout',
+          uncertainSince: nowIso,
+          deliveryUncertainAfterCrash: true,
+        },
+      });
+
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const workingBot = createMockBot(sentMessages);
+
+      const resendResult = await FulfillmentService.forceResendOrderNotification({
+        orderId: ord.orderId,
+        target: 'both',
+        bot: workingBot,
+        adminTelegramId: ownerTelegramId,
+      });
+
+      assert.equal(resendResult.sentBuyer, true);
+      assert.equal(resendResult.sentAdmin, true);
+      assert.equal(resendResult.skippedInFlight, false);
+
+      const updated = resendResult.order;
+      assert.equal(updated.buyerNotificationState?.status, 'sent');
+      assert.equal(updated.buyerNotificationState?.permanentFailure, false);
+      assert.equal(updated.buyerNotificationState?.nextRetryAt, undefined);
+      assert.equal(updated.buyerNotificationState?.retryAfterSeconds, undefined);
+      assert.equal(updated.buyerNotificationState?.lastHttpStatus, undefined);
+      assert.equal(updated.buyerNotificationState?.lastError, undefined);
+      assert.equal(updated.buyerNotificationState?.uncertainSince, undefined);
+      assert.equal(updated.buyerNotificationState?.deliveryUncertainAfterCrash, false);
+      assert.equal(
+        updated.buyerNotificationState?.attemptCount,
+        1,
+        'При ручном forceResend после исчерпания лимита/permanentFailure счётчик попыток сбрасывается для нового цикла (1)',
+      );
+
+      assert.equal(updated.adminNotificationState?.status, 'sent');
+      assert.equal(updated.adminNotificationState?.permanentFailure, false);
+      assert.equal(updated.adminNotificationState?.nextRetryAt, undefined);
+      assert.equal(updated.adminNotificationState?.retryAfterSeconds, undefined);
+      assert.equal(updated.adminNotificationState?.lastHttpStatus, undefined);
+      assert.equal(updated.adminNotificationState?.lastError, undefined);
+      assert.equal(updated.adminNotificationState?.deliveryUncertainAfterCrash, false);
+
+      return 'Ручной forceResend очищает permanentFailure, nextRetryAt, retryAfterSeconds, lastHttpStatus, lastError, deliveryUncertainAfterCrash и сбрасывает исчерпанный бюджет попыток.';
+    },
+  );
+
+  await runTest(
+    'S271-18',
+    'Fulfillment',
+    'Stage 2.7.1 (18/18): Обратная совместимость со старыми заказами без новых полей уведомлений',
+    async () => {
+      await resetS27TestState();
+
+      // Case A: Legacy order that was already notified before notificationState existed (only buyerNotifiedAt / adminNotifiedAt)
+      const legacySentOrd = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_18_legacy_sent',
+      });
+      const nowIso = new Date().toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', legacySentOrd.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+        buyerNotifiedAt: nowIso,
+        adminNotifiedAt: nowIso,
+      });
+
+      const sentCallsA: Array<{ chatId: number; text: string }> = [];
+      const botA = createMockBot(sentCallsA);
+      const loadedLegacySent = (await OrderService.getOrderById(legacySentOrd.orderId))!;
+      await FulfillmentService.ensureBuyerNotified(loadedLegacySent, botA);
+      await FulfillmentService.ensureAdminNotified(loadedLegacySent, botA);
+      assert.equal(
+        sentCallsA.length,
+        0,
+        'Старый заказ с заполненными buyerNotifiedAt и adminNotifiedAt без notificationState не должен отправляться повторно',
+      );
+
+      // Case B: Legacy completed order without buyerNotificationState / adminNotificationState and without *NotifiedAt timestamps
+      const legacyPendingOrd = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 's271_18_legacy_unnotified',
+      });
+      await firestoreRepo.updateDoc<Order>('orders', legacyPendingOrd.orderId, {
+        paymentStatus: 'completed',
+        fulfillmentStatus: 'completed',
+        paidAt: nowIso,
+        completedAt: nowIso,
+      });
+
+      const sentCallsB: Array<{ chatId: number; text: string }> = [];
+      const botB = createMockBot(sentCallsB);
+      const loadedLegacyPending = (await OrderService.getOrderById(legacyPendingOrd.orderId))!;
+      const afterAdmin = await FulfillmentService.ensureAdminNotified(loadedLegacyPending, botB);
+      const afterBuyer = await FulfillmentService.ensureBuyerNotified(afterAdmin, botB);
+
+      assert.equal(afterBuyer.adminNotificationState?.status, 'sent');
+      assert.ok(afterBuyer.adminNotifiedAt);
+      assert.equal(afterBuyer.buyerNotificationState?.status, 'sent');
+      assert.ok(afterBuyer.buyerNotifiedAt);
+      assert.equal(sentCallsB.filter((m) => m.chatId === buyer1.id).length, 1);
+
+      // Also verify formatters & keyboards render cleanly on legacy orders without notificationState
+      const legacyCard = formatAdminOrderCard(loadedLegacySent);
+      assert.ok(legacyCard.includes(legacySentOrd.orderId));
+      const legacyReview = formatAdminNotificationReviewMessage(loadedLegacySent);
+      assert.ok(legacyReview.includes(legacySentOrd.orderId));
+
+      return 'Старые заказы без новых полей (buyerNotificationState, adminNotificationState, permanentFailure, nextRetryAt, retryAfterSeconds, lastHttpStatus) полностью совместимы.';
     },
   );
 
