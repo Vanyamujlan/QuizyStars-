@@ -1,0 +1,147 @@
+================================================================================
+STAGE 4.5 AUDIT REPORT — MYSTARS POLLING QUEUE FAIRNESS & SCALABILITY
+================================================================================
+Date:       2026-11-26
+Repository: Vanyamujlan/Shop-Tg-bot
+Branch:     main
+Stage:      Stage 4.5 — Fix MyStars Polling Queue Fairness & Scalability
+Mode:       Inspect -> Implement -> Test -> Audit
+
+--------------------------------------------------------------------------------
+1. ROOT CAUSE ПРОБЛЕМЫ
+--------------------------------------------------------------------------------
+1.1. Ограничение выборки 50 старейшими заказами (Head-of-Line Starvation):
+     В исходном варианте запроса `firestoreRepo.queryDocs<Order>('orders', { where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }], orderBy: { field: 'createdAt', direction: 'asc' }, limit: 50 })`:
+     - При наличии >50 заказов в статусе `processing` (например, зависших в `pending` на стороне провайдера или ожидающих ручной сверки в `recoverPendingFulfillments` шаг 3) статический лимит 50 возвращал только первые 50 заказов по `createdAt ASC`.
+     - В `recoverPendingFulfillments` (шаг 3 — сверка `stale processing` заказов и проверка отложенных админ-уведомлений) также использовался жёсткий `limit: 50` без курсорной пагинации, из-за чего более новые `processing` заказы после первых 50 никогда не попадали в шаг 3 восстановления.
+
+1.2. Недостаточная приоритизация в мультистраничной очереди:
+     - В `pollMyStarsOrders()` при обходе очереди из нескольких страниц (`hasMorePages === true`) заказы внутри выбранного окна обрабатывались в порядке курсора `createdAt ASC`, а не по приоритету времени последнего опроса (`mystarsLastPolledAt`).
+     - Из-за этого новые заказы (у которых `mystarsLastPolledAt` ещё не задан) или заказы, которые дольше всех не опрашивались в пределах рабочего окна, могли ждать своей очереди за недавно опрошенными заказами в рамках того же тика.
+
+1.3. Недостаточно строгая фильтрация кандидатов MyStars (`ord_*` коллизия):
+     - В `FulfillmentService.pollMyStarsOrders()` и `MyStarsFulfillmentAdapter` (`checkExternalStatus`, `requestFulfillment`) резервная проверка `order.externalExecutionReference?.startsWith('ord_')` не проверяла `fulfillmentProvider` и `category`.
+     - Если заказ другого провайдера (`fulfillmentProvider: 'fragment'`, `fulfillmentProvider: 'manual'`, либо `category: 'gifts'`) имел `externalExecutionReference` вида `ord_*` без `mystarsOrderId`, он мог ошибочно попасть в выборку MyStars polling и вызвать лишние запросы `GET /v1/orders/{id}` в MyStars API.
+
+--------------------------------------------------------------------------------
+2. КАКИЕ ФАЙЛЫ ИЗМЕНЕНЫ
+--------------------------------------------------------------------------------
+1. `src/services/FulfillmentService.ts`
+   - Добавлен статический метод строгой фильтрации кандидатов `FulfillmentService.isMyStarsPollingCandidate(ord: Order): boolean`.
+   - Добавлен статический компаратор приоритета очереди `FulfillmentService.compareMyStarsPollPriority(a: Order, b: Order): number`.
+   - Обновлён метод `FulfillmentService.pollMyStarsOrders()`:
+     * Внедрена строгая фильтрация кандидатов через `isMyStarsPollingCandidate`.
+     * Внедрено ранжирование кандидатов по `compareMyStarsPollPriority` как для одностраничной очереди, так и для ограниченного мультистраничного окна (`bounded window`), с сохранением детерминированного продвижения курсора `(createdAt, id)`.
+   - Обновлён метод `FulfillmentService.recoverPendingFulfillments()` (шаг 3):
+     * Статический запрос `limit: 50` заменён на курсорную пагинацию `startAfter: { value: createdAt, id: orderId }` с ограничением `MAX_STALE_SCAN_PAGES`, что исключает голодание (starvation) при >50 активных `processing` заказах.
+
+2. `src/services/MyStarsService.ts`
+   - Добавлен метод `MyStarsFulfillmentAdapter.resolveMyStarsExternalOrderId(order: Order): string | undefined`.
+   - В `requestFulfillment()` и `checkExternalStatus()` устранена небезопасная подстановка `externalExecutionReference.startsWith('ord_')` для заказов сторонних провайдеров (`fragment`, `manual`, `category === 'gifts'`).
+
+3. `src/tests/stage1.test.ts`
+   - Добавлены 10 целевых интеграционных и стресс-тестов `S45-01` .. `S45-10`, проверяющих честность очереди, масштабируемость на 100+ заказах, фильтрацию провайдеров, приоритет `mystarsLastPolledAt`, защиту от параллельного polling, обработку HTTP 429 / 503 / timeout, восстановление после рестарта и защиту от дублирования выдачи.
+
+--------------------------------------------------------------------------------
+3. КАК ТЕПЕРЬ УСТРОЕНА ОЧЕРЕДЬ POLLING
+--------------------------------------------------------------------------------
+1. Отбор кандидатов (`FulfillmentService.isMyStarsPollingCandidate`):
+   - Заказ обязан находиться в статусе `fulfillmentStatus === 'processing'`.
+   - Заказы категории `category === 'gifts'` и провайдера `fulfillmentProvider === 'fragment'` безусловно исключаются.
+   - Если у заказа явно заполнен непустой `mystarsOrderId`, заказ признаётся валидным кандидатом MyStars.
+   - Если `mystarsOrderId` отсутствует, но задан `externalExecutionReference`:
+     * Заказы с `fulfillmentProvider === 'manual'` исключаются.
+     * Ссылка с префиксом `ms_` допускается для заказов Stars/Premium.
+     * Ссылка с префиксом `ord_` допускается ТОЛЬКО если `fulfillmentProvider === 'mystars'`.
+
+2. Приоритет выбора (`FulfillmentService.compareMyStarsPollPriority`):
+   - Вычисляется `lastPolledAt = Number.isFinite(ord.mystarsLastPolledAt) ? ord.mystarsLastPolledAt : 0`.
+   - Заказы без `mystarsLastPolledAt` (новые или мигрированные заказы, `lastPolledAt === 0`) получают наивысший приоритет.
+   - Далее заказы сортируются по возрастанию `mystarsLastPolledAt` (самые давно не проверявшиеся заказы идут первыми).
+   - При равенстве `mystarsLastPolledAt` используется детерминированный tie-breaker: `createdAt ASC`, затем `id ASC`.
+
+3. Контроль нагрузки на тик:
+   - За один вызов `pollMyStarsOrders()` опрашивается не более `pollBatchBudget` заказов (`getMyStarsPollBatchSize()`, по умолчанию 25, диапазон 1..100).
+   - Запросы внутри тика выполняются последовательно с проверкой `mystarsPollCooldownUntilMs`, `inFlightMyStarsPollOrders` и распределённого lease в Firestore (`mystarsPollLease`).
+
+--------------------------------------------------------------------------------
+4. КАК ОБЕСПЕЧЕНА ЧЕСТНАЯ ОБРАБОТКА ВСЕХ ЗАКАЗОВ (FAIRNESS)
+--------------------------------------------------------------------------------
+1. Отсутствие starvation первых 50 заказов:
+   - Если в системе находится 100 и более `processing` заказов MyStars, `pollMyStarsOrders()` не останавливается на первых 50 заказах:
+     * Курсор пагинации `(lastCreatedAt, lastOrderId)` сохраняется между тиками в памяти процесса и персистентно в Firestore (`system_state/mystars_polling`).
+     * После каждого заказа `mystarsLastPolledAt` обновляется до текущего `Date.now()`.
+     * Внутри выбранного окна кандидатов заказы ранжируются через `compareMyStarsPollPriority`, поэтому ни один новый заказ (без `mystarsLastPolledAt`) и ни один давно не опрашивавшийся заказ не может быть заблокирован старыми заказами, зависшими в статусе `processing`.
+
+2. Защита от вытеснения сторонними заказами:
+   - Если страница Firestore содержит заказы других провайдеров (`manual`, `fragment`, `gifts`), они отфильтровываются через `isMyStarsPollingCandidate` до расходования `pollBatchBudget`, а пагинатор автоматически подгружает следующие страницы до набора нужного числа реальных кандидатов MyStars (в пределах `maxScanPages`).
+
+--------------------------------------------------------------------------------
+5. КАК РАБОТАЕТ ПАГИНАЦИЯ
+--------------------------------------------------------------------------------
+1. Почему в Firestore используется курсор по `(createdAt ASC, __name__ ASC)`, а НЕ `orderBy('mystarsLastPolledAt', 'asc')`:
+   - В Cloud Firestore любой запрос с `orderBy('mystarsLastPolledAt')` автоматически ИСКЛЮЧАЕТ из результатов все документы, у которых поле `mystarsLastPolledAt` отсутствует (`undefined`).
+   - Поскольку у всех новых заказов (и заказов, созданных до появления поля) `mystarsLastPolledAt` изначально отсутствует, запрос `orderBy('mystarsLastPolledAt')` на уровне Firestore привёл бы к полной потере новых заказов!
+   - Поле `createdAt` гарантированно присутствует у 100% документов `orders`. Поэтому пагинация на уровне БД выполняется по составному индексу `(fulfillmentStatus == 'processing', createdAt ASC, __name__ ASC)` с курсором `startAfter: { value: cursorCreatedAt, id: cursorOrderId }`.
+
+2. Алгоритм обхода страниц:
+   - На каждом тике загружается окно до `maxScanPages` (до 4 страниц по `pageFetchLimit` документов), начиная с сохранённого чекпоинта `(lastCreatedAt, lastOrderId)`.
+   - Если достигнут конец коллекции (`wrappedAround === true`) и бюджет тика ещё не заполнен, сканер бесшовно переходит к началу очереди (`wrap-around`) в том же тике.
+   - Все найденные в окне кандидаты MyStars сортируются по `compareMyStarsPollPriority` (сначала `mystarsLastPolledAt = 0`, затем старейшие `mystarsLastPolledAt`), после чего обрабатывается до `pollBatchBudget` заказов.
+   - По завершении тика чекпоинт атомарно сохраняется в `system_state/mystars_polling` (с монотонным `checkpointSeq`), обеспечивая продолжение обхода даже после перезапуска процесса.
+
+--------------------------------------------------------------------------------
+6. ИНДЕКСЫ FIRESTORE И НЕОБХОДИМОСТЬ ДЕПЛОЯ В PRODUCTION
+--------------------------------------------------------------------------------
+1. Проверка `firestore.indexes.json`:
+   - В `firestore.indexes.json` УЖЕ присутствует необходимый составной индекс для коллекции `orders`:
+     ```json
+     {
+       "collectionGroup": "orders",
+       "queryScope": "COLLECTION",
+       "fields": [
+         { "fieldPath": "fulfillmentStatus", "order": "ASCENDING" },
+         { "fieldPath": "createdAt", "order": "ASCENDING" }
+       ]
+     }
+     ```
+2. Новые индексы:
+   - Добавление новых составных индексов в `firestore.indexes.json` НЕ требуется, так как курсорная пагинация `where('fulfillmentStatus', '==', 'processing')` + `orderBy('createdAt', 'asc')` полностью покрывается существующим индексом `(fulfillmentStatus ASC, createdAt ASC)`, а приоритетная сортировка по `mystarsLastPolledAt` выполняется в памяти над ограниченным пагинированным окном (что также защищает от исключения документов без поля `mystarsLastPolledAt` движком Firestore).
+   - Дополнительный деплой индексов в production не требуется (при условии, что существующий `firestore.indexes.json` уже задеплоен).
+
+--------------------------------------------------------------------------------
+7. НОВЫЕ ТЕСТЫ И ИХ РЕЗУЛЬТАТЫ
+--------------------------------------------------------------------------------
+В `src/tests/stage1.test.ts` добавлены 10 тестов Stage 4.5:
+- [PASS] S45-01: 10 MyStars orders are processed properly in a single polling cycle.
+- [PASS] S45-02: 100 MyStars orders do not cause permanent processing of only the first 50 (all 100 unique orders polled in 4 ticks without starvation).
+- [PASS] S45-03: Orders from other providers (manual, fragment, gifts, non-MyStars ord_*) are completely ignored (0 MyStars API requests).
+- [PASS] S45-04: Orders without mystarsLastPolledAt are not lost and receive highest priority over already-polled orders.
+- [PASS] S45-05: Old orders with the oldest mystarsLastPolledAt timestamp receive priority across page boundaries.
+- [PASS] S45-06: Repeated/concurrent polling of the same order is not launched in parallel (single-flight guard + distributed lease).
+- [PASS] S45-07: HTTP 429 activates global cooldown without losing orders and resumes cleanly on subsequent ticks.
+- [PASS] S45-08: HTTP 503 and network timeout do not cause permanent failure; orders remain in processing and complete when API recovers.
+- [PASS] S45-09: After process restart, unfinished orders re-enter the polling queue from persisted checkpoint and complete without duplicate POST /v1/orders.
+- [PASS] S45-10: Duplicate fulfillment/completion of the same order is impossible under concurrent pollMyStarsOrders + checkExternalStatus + completeOrderFulfillment.
+
+--------------------------------------------------------------------------------
+8. РЕЗУЛЬТАТЫ NPM TEST, NPM RUN LINT, NPM RUN BUILD
+--------------------------------------------------------------------------------
+- `npm test`:      PASS (220 / 220 tests passed, 0 failed, exit code 0)
+- `npm run lint`:  PASS (tsc --noEmit completed with 0 errors, exit code 0)
+- `npm run build`: PASS (vite build completed successfully, exit code 0)
+
+--------------------------------------------------------------------------------
+9. ОСТАТОЧНЫЕ РИСКИ И ОГРАНИЧЕНИЯ
+--------------------------------------------------------------------------------
+1. Размер окна приоритетной сортировки (`maxScanPages * pageFetchLimit`):
+   - Приоритетная сортировка по `mystarsLastPolledAt` применяется к скользящему пагинированному окну (по умолчанию до 4 страниц = до 100-200 документов за тик), а сам курсор непрерывно проходит по всей очереди `processing` заказов по кругу. При экстремальном скоплении тысяч `processing` заказов одновременно обход всей очереди займёт пропорциональное число тиков (`N / pollBatchBudget`), что является штатным поведением для соблюдения rate limit MyStars API.
+2. Зависимость от часов инстансов при multi-instance запуске:
+   - Для `mystarsPollLease` и `mystarsLastPolledAt` используется `Date.now()`. При стандартной синхронизации NTP между инстансами расхождение составляет единицы миллисекунд и не влияет на TTL lease (30 секунд).
+
+--------------------------------------------------------------------------------
+10. СТАТУС ГОТОВНОСТИ К PRODUCTION
+--------------------------------------------------------------------------------
+READY FOR PRODUCTION (Stage 4.5 Complete).
+Все требования к честности очереди, пагинации, фильтрации провайдеров, идемпотентности и отказоустойчивости выполнены и подтверждены 220 автоматическими тестами.
+================================================================================

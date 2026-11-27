@@ -1939,13 +1939,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       return { alreadyExecuted: false };
     }
 
-    const mystarsOrderId =
-      order.mystarsOrderId ||
-      (order.externalExecutionReference &&
-      (order.externalExecutionReference.startsWith('ord_') ||
-        order.externalExecutionReference.startsWith('ms_'))
-        ? order.externalExecutionReference
-        : undefined);
+    const mystarsOrderId = this.resolveMyStarsExternalOrderId(order);
 
     if (!mystarsOrderId) {
       return { alreadyExecuted: false };
@@ -2047,6 +2041,51 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
     };
   }
 
+  /**
+   * Strictly resolves the external MyStars order ID for an Order document.
+   * Rejects non-MyStars providers ('manual', 'fragment', 'gifts') and refuses
+   * to treat an arbitrary 'ord_*' externalExecutionReference as a MyStars ID
+   * unless the order explicitly belongs to MyStars.
+   */
+  public resolveMyStarsExternalOrderId(order: Order): string | undefined {
+    if (order.category === 'gifts' || order.fulfillmentProvider === 'fragment') {
+      return undefined;
+    }
+    const explicitId =
+      typeof order.mystarsOrderId === 'string' ? order.mystarsOrderId.trim() : '';
+    if (explicitId.length > 0) {
+      return explicitId;
+    }
+    if (order.fulfillmentProvider === 'manual') {
+      return undefined;
+    }
+
+    const extRef =
+      typeof order.externalExecutionReference === 'string'
+        ? order.externalExecutionReference.trim()
+        : '';
+    if (!extRef || extRef === order.orderId) {
+      return undefined;
+    }
+    if (
+      extRef.startsWith('manual_') ||
+      extRef.startsWith('fragment_') ||
+      extRef.includes(':')
+    ) {
+      return undefined;
+    }
+    if (extRef.startsWith('ms_')) {
+      return extRef;
+    }
+    if (
+      (order.fulfillmentProvider === 'mystars' || Boolean(order.mystarsOrderStatus)) &&
+      extRef.startsWith('ord_')
+    ) {
+      return extRef;
+    }
+    return undefined;
+  }
+
   public async requestFulfillment(
     order: Order,
     context?: FulfillmentRequestContext,
@@ -2080,13 +2119,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
         : undefined;
 
     // 1. If a MyStars order ID already exists on the order, check its current status first
-    const existingMyStarsId =
-      order.mystarsOrderId ||
-      (order.externalExecutionReference &&
-      (order.externalExecutionReference.startsWith('ord_') ||
-        order.externalExecutionReference.startsWith('ms_'))
-        ? order.externalExecutionReference
-        : undefined);
+    const existingMyStarsId = this.resolveMyStarsExternalOrderId(order);
     if (existingMyStarsId) {
       order.mystarsOrderId = existingMyStarsId;
       const existingCheck = await this.checkExternalStatus(

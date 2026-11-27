@@ -22594,6 +22594,1159 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  // =========================================================================
+  // STAGE 4.5 — MYSTARS POLLING QUEUE FAIRNESS & SCALABILITY (10 SCENARIOS)
+  // =========================================================================
+
+  await runTest(
+    'S45-01',
+    'Fulfillment',
+    'Stage 4.5 (1/10): 10 заказов MyStars обрабатываются корректно',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450101, username: 's45_01_buyer', first_name: 'S45Buyer1' };
+      await UserService.upsertFromTelegram(buyer);
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      const polledExternalIds: string[] = [];
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_01_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          polledExternalIds.push(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'completed',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              purchase_tx: `tx_${extId}`,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-01: ${req.method} ${req.url}`);
+      });
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 600_000;
+        for (let i = 1; i <= 10; i++) {
+          const ordId = `ord_s45_01_${String(i).padStart(2, '0')}`;
+          const msId = `ms_s45_01_${String(i).padStart(2, '0')}`;
+          await firestoreRepo.setDoc<Order>('orders', ordId, {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: '100 Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            fulfillmentProvider: 'mystars',
+            mystarsOrderId: msId,
+            externalExecutionReference: msId,
+            mystarsOrderStatus: 'awaiting_payment',
+            createdAt: new Date(baseMs + i * 1000).toISOString(),
+            updatedAt: new Date(baseMs + i * 1000).toISOString(),
+          });
+        }
+
+        const res = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(res.polled, 10, 'Все 10 заказов MyStars должны быть опрошены за один тик');
+        assert.equal(res.completed, 10, 'Все 10 заказов MyStars должны перейти в completed');
+        assert.equal(polledExternalIds.length, 10);
+
+        for (let i = 1; i <= 10; i++) {
+          const ordId = `ord_s45_01_${String(i).padStart(2, '0')}`;
+          const updated = await OrderService.getOrderById(ordId);
+          assert.equal(updated?.fulfillmentStatus, 'completed');
+          assert.equal(updated?.paymentStatus, 'completed');
+          assert.ok(updated?.mystarsLastPolledAt);
+        }
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Все 10 заказов MyStars корректно выбраны, опрошены и переведены в completed с фиксацией mystarsLastPolledAt.';
+    },
+  );
+
+  await runTest(
+    'S45-02',
+    'Fulfillment',
+    'Stage 4.5 (2/10): 100 заказов MyStars не приводят к вечной обработке только первых 50',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450102, username: 's45_02_buyer', first_name: 'S45Buyer2' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      const polledByTick: string[][] = [];
+      let currentPolls: string[] = [];
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_02_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          currentPolls.push(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-02: ${req.method} ${req.url}`);
+      });
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.pollBatchBudget = 50;
+        FulfillmentService.pollPageSize = 50;
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 1_200_000;
+        for (let i = 1; i <= 100; i++) {
+          const ordId = `ord_s45_02_${String(i).padStart(3, '0')}`;
+          const msId = `ms_s45_02_${String(i).padStart(3, '0')}`;
+          await firestoreRepo.setDoc<Order>('orders', ordId, {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: '100 Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            fulfillmentProvider: 'mystars',
+            mystarsOrderId: msId,
+            externalExecutionReference: msId,
+            mystarsOrderStatus: 'awaiting_payment',
+            createdAt: new Date(baseMs + i * 1000).toISOString(),
+            updatedAt: new Date(baseMs + i * 1000).toISOString(),
+          });
+        }
+
+        // Tick 1: polls first 50 (#001..#050)
+        currentPolls = [];
+        const tick1 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        polledByTick.push([...currentPolls]);
+        assert.equal(tick1.polled, 50);
+        assert.equal(currentPolls[0], 'ms_s45_02_001');
+        assert.equal(currentPolls[49], 'ms_s45_02_050');
+
+        // Tick 2: polls next 50 (#051..#100) — never stuck on first 50!
+        currentPolls = [];
+        const tick2 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        polledByTick.push([...currentPolls]);
+        assert.equal(tick2.polled, 50);
+        assert.equal(currentPolls[0], 'ms_s45_02_051');
+        assert.equal(currentPolls[49], 'ms_s45_02_100');
+
+        const uniqueAcrossTwoTicks = new Set([...polledByTick[0], ...polledByTick[1]]);
+        assert.equal(
+          uniqueAcrossTwoTicks.size,
+          100,
+          'За 2 тика (по 50 заказов) должны быть опрошены все 100 уникальных заказов без голодания хвоста очереди',
+        );
+
+        // Even if checkpoint is reset while #001..#050 have a newer mystarsLastPolledAt than #051..#100,
+        // mystarsLastPolledAt priority sorting still picks the 50 least-recently-polled orders!
+        const newerIso = new Date(Date.now() + 60_000).toISOString();
+        for (let i = 1; i <= 50; i++) {
+          const ordId = `ord_s45_02_${String(i).padStart(3, '0')}`;
+          await firestoreRepo.updateDoc<Order>('orders', ordId, {
+            mystarsLastPolledAt: newerIso,
+          });
+        }
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        currentPolls = [];
+        const tick3WithoutCheckpoint = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tick3WithoutCheckpoint.polled, 50);
+        assert.equal(
+          currentPolls[0],
+          'ms_s45_02_051',
+          'Даже при сброшенном курсоре приоритет mystarsLastPolledAt обязан выбрать заказы #051..#100, а не первые 50',
+        );
+        assert.equal(currentPolls[49], 'ms_s45_02_100');
+      } finally {
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'При 100 processing-заказах MyStars все 100 заказов равномерно опрашиваются за 2 тика (50 + 50) как через курсор, так и через приоритет mystarsLastPolledAt.';
+    },
+  );
+
+  await runTest(
+    'S45-03',
+    'Fulfillment',
+    'Stage 4.5 (3/10): Заказы других провайдеров строго игнорируются',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450103, username: 's45_03_buyer', first_name: 'S45Buyer3' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      const polledExternalIds: string[] = [];
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_03_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          polledExternalIds.push(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-03: ${req.method} ${req.url}`);
+      });
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const nowIso = new Date().toISOString();
+        const makeBaseOrder = (id: string): Order => ({
+          orderId: id,
+          userId: `tg_${buyer.id}`,
+          userTelegramId: buyer.id,
+          username: buyer.username,
+          recipientUsername: buyer.username,
+          productId: 'stars_custom',
+          productName: '100 Telegram Stars',
+          category: 'stars',
+          quantity: 100,
+          totalPriceUsdCents: 200,
+          totalPrice: 200,
+          currency: 'USD',
+          paymentMethod: 'balance',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        // 1. Manual provider order (even with ord_* externalExecutionReference!)
+        await firestoreRepo.setDoc<Order>('orders', 'ord_s45_03_manual', {
+          ...makeBaseOrder('ord_s45_03_manual'),
+          fulfillmentProvider: 'manual',
+          externalExecutionReference: 'ord_manual_ref_001',
+        });
+
+        // 2. Fragment provider order (even with ord_* externalExecutionReference!)
+        await firestoreRepo.setDoc<Order>('orders', 'ord_s45_03_fragment', {
+          ...makeBaseOrder('ord_s45_03_fragment'),
+          fulfillmentProvider: 'fragment',
+          externalExecutionReference: 'ord_fragment_ref_002',
+        });
+
+        // 3. Gifts category order in processing
+        await firestoreRepo.setDoc<Order>('orders', 'ord_s45_03_gifts', {
+          ...makeBaseOrder('ord_s45_03_gifts'),
+          category: 'gifts',
+          externalExecutionReference: 'ord_gifts_ref_003',
+        });
+
+        // 4. Unassigned provider order whose externalExecutionReference happens to start with 'ord_'
+        //    (e.g. internal orderId or custom non-MyStars reference without mystarsOrderId)
+        await firestoreRepo.setDoc<Order>('orders', 'ord_s45_03_generic_ord_prefix', {
+          ...makeBaseOrder('ord_s45_03_generic_ord_prefix'),
+          externalExecutionReference: 'ord_custom_non_mystars_999',
+        });
+
+        // 5. Genuine MyStars order (has mystarsOrderId)
+        await firestoreRepo.setDoc<Order>('orders', 'ord_s45_03_valid_mystars', {
+          ...makeBaseOrder('ord_s45_03_valid_mystars'),
+          fulfillmentProvider: 'mystars',
+          mystarsOrderId: 'ord_ms_valid_777',
+          externalExecutionReference: 'ord_ms_valid_777',
+        });
+
+        const res = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(res.polled, 1, 'Должен быть опрошен ровно 1 настоящий заказ MyStars');
+        assert.deepEqual(
+          polledExternalIds,
+          ['ord_ms_valid_777'],
+          'Ни один заказ других провайдеров (manual, fragment, gifts, чужой ord_*) не должен отправляться в MyStars API',
+        );
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Заказы manual, fragment, gifts и сторонние заказы с префиксом ord_ без признаков MyStars полностью игнорируются (0 лишних вызовов MyStars API).';
+    },
+  );
+
+  await runTest(
+    'S45-04',
+    'Fulfillment',
+    'Stage 4.5 (4/10): Заказы без mystarsLastPolledAt не теряются и получают высший приоритет первичного опроса',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450104, username: 's45_04_buyer', first_name: 'S45Buyer4' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      const polledSequence: string[] = [];
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_04_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          polledSequence.push(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-04: ${req.method} ${req.url}`);
+      });
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.pollBatchBudget = 2;
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 300_000;
+        // Order 1: created earlier, already polled 1 minute ago
+        await firestoreRepo.setDoc<Order>('orders', 'ord_s45_04_polled', {
+          orderId: 'ord_s45_04_polled',
+          userId: `tg_${buyer.id}`,
+          userTelegramId: buyer.id,
+          username: buyer.username,
+          recipientUsername: buyer.username,
+          productId: 'stars_custom',
+          productName: '100 Telegram Stars',
+          category: 'stars',
+          quantity: 100,
+          totalPriceUsdCents: 200,
+          totalPrice: 200,
+          currency: 'USD',
+          paymentMethod: 'balance',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ms_s45_04_already_polled',
+          mystarsLastPolledAt: new Date(Date.now() - 60_000).toISOString(),
+          createdAt: new Date(baseMs + 1000).toISOString(),
+          updatedAt: new Date(baseMs + 1000).toISOString(),
+        });
+
+        // Orders 2 & 3: created later, mystarsLastPolledAt is completely absent (undefined)
+        for (const idx of [2, 3]) {
+          await firestoreRepo.setDoc<Order>('orders', `ord_s45_04_unpolled_${idx}`, {
+            orderId: `ord_s45_04_unpolled_${idx}`,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: '100 Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: `ms_s45_04_unpolled_${idx}`,
+            createdAt: new Date(baseMs + idx * 10_000).toISOString(),
+            updatedAt: new Date(baseMs + idx * 10_000).toISOString(),
+          });
+        }
+
+        const tick = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tick.polled, 2);
+        assert.deepEqual(
+          polledSequence,
+          ['ms_s45_04_unpolled_2', 'ms_s45_04_unpolled_3'],
+          'Заказы без mystarsLastPolledAt не должны теряться и обязаны опрашиваться в первую очередь перед уже опрошенными заказами',
+        );
+
+        const after2 = await OrderService.getOrderById('ord_s45_04_unpolled_2');
+        const after3 = await OrderService.getOrderById('ord_s45_04_unpolled_3');
+        assert.ok(after2?.mystarsLastPolledAt, 'После первичного опроса mystarsLastPolledAt должен быть записан');
+        assert.ok(after3?.mystarsLastPolledAt, 'После первичного опроса mystarsLastPolledAt должен быть записан');
+      } finally {
+        FulfillmentService.pollBatchBudget = prevBudget;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Заказы без поля mystarsLastPolledAt не фильтруются запросом Firestore, получают наивысший приоритет (0) и после опроса получают актуальный mystarsLastPolledAt.';
+    },
+  );
+
+  await runTest(
+    'S45-05',
+    'Fulfillment',
+    'Stage 4.5 (5/10): Старые давно не опрошенные заказы (mystarsLastPolledAt) получают приоритет',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450105, username: 's45_05_buyer', first_name: 'S45Buyer5' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      const polledSequence: string[] = [];
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_05_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          polledSequence.push(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-05: ${req.method} ${req.url}`);
+      });
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      const prevPageSize = FulfillmentService.pollPageSize;
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        // Force multi-page scanning (pageSize = 3, total = 6 orders, budget = 3)
+        FulfillmentService.pollPageSize = 3;
+        FulfillmentService.pollBatchBudget = 3;
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const now = Date.now();
+        const seeds: Array<{ id: string; msId: string; createdOffsetSec: number; polledAgoSec?: number }> = [
+          // Page 1 (earliest createdAt, but polled VERY recently: 5s, 10s, 15s ago)
+          { id: 'ord_s45_05_p1_a', msId: 'ms_recent_5s', createdOffsetSec: 10, polledAgoSec: 5 },
+          { id: 'ord_s45_05_p1_b', msId: 'ms_recent_10s', createdOffsetSec: 20, polledAgoSec: 10 },
+          { id: 'ord_s45_05_p1_c', msId: 'ms_recent_15s', createdOffsetSec: 30, polledAgoSec: 15 },
+          // Page 2 (later createdAt, but oldest mystarsLastPolledAt: 600s ago, 300s ago, and never polled)
+          { id: 'ord_s45_05_p2_d', msId: 'ms_stale_300s', createdOffsetSec: 40, polledAgoSec: 300 },
+          { id: 'ord_s45_05_p2_e', msId: 'ms_stale_600s', createdOffsetSec: 50, polledAgoSec: 600 },
+          { id: 'ord_s45_05_p2_f', msId: 'ms_never_polled', createdOffsetSec: 60, polledAgoSec: undefined },
+        ];
+
+        for (const s of seeds) {
+          await firestoreRepo.setDoc<Order>('orders', s.id, {
+            orderId: s.id,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: '100 Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: s.msId,
+            ...(s.polledAgoSec !== undefined
+              ? { mystarsLastPolledAt: new Date(now - s.polledAgoSec * 1000).toISOString() }
+              : {}),
+            createdAt: new Date(now - 1_000_000 + s.createdOffsetSec * 1000).toISOString(),
+            updatedAt: new Date(now - 1_000_000 + s.createdOffsetSec * 1000).toISOString(),
+          });
+        }
+
+        const res = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(res.polled, 3);
+        assert.deepEqual(
+          polledSequence,
+          ['ms_never_polled', 'ms_stale_600s', 'ms_stale_300s'],
+          'Первыми обязаны опрашиваться: 1) без mystarsLastPolledAt, 2) 600s назад, 3) 300s назад (даже если они на 2-й странице createdAt)',
+        );
+      } finally {
+        FulfillmentService.pollBatchBudget = prevBudget;
+        FulfillmentService.pollPageSize = prevPageSize;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Приоритет опроса строго упорядочен по mystarsLastPolledAt ASC (сначала без даты, затем старейшие по дате опроса) даже через границу страниц пагинации.';
+    },
+  );
+
+  await runTest(
+    'S45-06',
+    'Fulfillment',
+    'Stage 4.5 (6/10): Повторный опрос одного и того же заказа не запускается параллельно',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450106, username: 's45_06_buyer', first_name: 'S45Buyer6' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      let activeInFlightHttp = 0;
+      let maxConcurrentHttpForOrder = 0;
+      let totalHttpCallsForOrder = 0;
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_06_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        if (req.method === 'GET' && req.url.includes('/v1/orders/ms_s45_06_single')) {
+          activeInFlightHttp += 1;
+          totalHttpCallsForOrder += 1;
+          if (activeInFlightHttp > maxConcurrentHttpForOrder) {
+            maxConcurrentHttpForOrder = activeInFlightHttp;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          activeInFlightHttp -= 1;
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: 'ms_s45_06_single',
+              status: 'awaiting_payment',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-06: ${req.method} ${req.url}`);
+      });
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const nowIso = new Date().toISOString();
+        await firestoreRepo.setDoc<Order>('orders', 'ord_s45_06_single', {
+          orderId: 'ord_s45_06_single',
+          userId: `tg_${buyer.id}`,
+          userTelegramId: buyer.id,
+          username: buyer.username,
+          recipientUsername: buyer.username,
+          productId: 'stars_custom',
+          productName: '100 Telegram Stars',
+          category: 'stars',
+          quantity: 100,
+          totalPriceUsdCents: 200,
+          totalPrice: 200,
+          currency: 'USD',
+          paymentMethod: 'balance',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ms_s45_06_single',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        // Launch 3 parallel pollMyStarsOrders calls against the same processing order
+        const [p1, p2, p3] = await Promise.all([
+          FulfillmentService.pollMyStarsOrders(mockBot),
+          FulfillmentService.pollMyStarsOrders(mockBot),
+          FulfillmentService.pollMyStarsOrders(mockBot),
+        ]);
+
+        assert.equal(
+          maxConcurrentHttpForOrder,
+          1,
+          'Один и тот же заказ никогда не должен опрашиваться параллельно',
+        );
+        assert.equal(
+          totalHttpCallsForOrder,
+          1,
+          'Из 3 параллельных вызовов pollMyStarsOrders ровно 1 должен выполнить HTTP GET к MyStars',
+        );
+        assert.equal(p1.polled + p2.polled + p3.polled, 1);
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Параллельный запуск 3 циклов pollMyStarsOrders защищён inFlightMyStarsPollOrders и транзакционным mystarsPollLease: выполнен ровно 1 HTTP-запрос (maxConcurrent=1).';
+    },
+  );
+
+  await runTest(
+    'S45-07',
+    'Fulfillment',
+    'Stage 4.5 (7/10): HTTP 429 не приводит к потере заказов и корректно возобновляет очередь после cooldown',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450107, username: 's45_07_buyer', first_name: 'S45Buyer7' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      let return429OnSecond = true;
+      const completedExtIds: string[] = [];
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_07_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          if (extId === 'ms_s45_07_02' && return429OnSecond) {
+            return {
+              status: 429,
+              ok: false,
+              headers: { 'retry-after': '1' },
+              json: { error: 'rate_limit_exceeded', message: 'Too Many Requests' },
+            };
+          }
+          completedExtIds.push(extId);
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'completed',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              purchase_tx: `tx_${extId}`,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-07: ${req.method} ${req.url}`);
+      });
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 120_000;
+        for (let i = 1; i <= 3; i++) {
+          const ordId = `ord_s45_07_0${i}`;
+          const msId = `ms_s45_07_0${i}`;
+          await firestoreRepo.setDoc<Order>('orders', ordId, {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: '100 Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: msId,
+            createdAt: new Date(baseMs + i * 1000).toISOString(),
+            updatedAt: new Date(baseMs + i * 1000).toISOString(),
+          });
+        }
+
+        // Tick 1: order #1 completes, order #2 hits HTTP 429 -> batch stops, cooldown activated
+        const tick1 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tick1.rateLimited, true);
+        assert.equal(tick1.completed, 1);
+
+        const ord2After429 = await OrderService.getOrderById('ord_s45_07_02');
+        const ord3After429 = await OrderService.getOrderById('ord_s45_07_03');
+        assert.equal(
+          ord2After429?.fulfillmentStatus,
+          'processing',
+          'Заказ, получивший HTTP 429, должен оставаться в processing (не failed!)',
+        );
+        assert.equal(ord3After429?.fulfillmentStatus, 'processing');
+
+        // Tick during active cooldown: deferred without making API requests
+        const tickDuringCooldown = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickDuringCooldown.deferredByCooldown, true);
+        assert.equal(tickDuringCooldown.polled, 0);
+
+        // Expire cooldown and poll again: orders #2 and #3 complete without loss
+        FulfillmentService.resetMyStarsPollingState();
+        return429OnSecond = false;
+        const tickAfterCooldown = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tickAfterCooldown.polled, 2);
+        assert.equal(tickAfterCooldown.completed, 2);
+
+        for (let i = 1; i <= 3; i++) {
+          const finalOrd = await OrderService.getOrderById(`ord_s45_07_0${i}`);
+          assert.equal(
+            finalOrd?.fulfillmentStatus,
+            'completed',
+            `Заказ ord_s45_07_0${i} должен быть успешно завершён после окончания 429 cooldown`,
+          );
+        }
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'HTTP 429 включает глобальный cooldown по Retry-After, не помечает заказ как failed, не теряет его из очереди и завершает все заказы после истечения паузы.';
+    },
+  );
+
+  await runTest(
+    'S45-08',
+    'Fulfillment',
+    'Stage 4.5 (8/10): HTTP 503 и timeout не приводят к permanent failure',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450108, username: 's45_08_buyer', first_name: 'S45Buyer8' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      let simulateFailures = true;
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_08_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      const prevRetries = myStarsClient.maxTransientGetRetries;
+      myStarsClient.maxTransientGetRetries = 0;
+
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          if (simulateFailures) {
+            if (extId === 'ms_s45_08_503') {
+              return {
+                status: 503,
+                ok: false,
+                json: { error: 'service_unavailable', message: 'Backend temporarily unavailable' },
+              };
+            }
+            if (extId === 'ms_s45_08_timeout') {
+              const abortErr = new Error('The operation was aborted due to timeout');
+              abortErr.name = 'AbortError';
+              throw abortErr;
+            }
+          }
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: 'completed',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              purchase_tx: `tx_${extId}`,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-08: ${req.method} ${req.url}`);
+      });
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const nowIso = new Date().toISOString();
+        for (const suffix of ['503', 'timeout']) {
+          const ordId = `ord_s45_08_${suffix}`;
+          const msId = `ms_s45_08_${suffix}`;
+          await firestoreRepo.setDoc<Order>('orders', ordId, {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: '100 Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: msId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          });
+        }
+
+        // Tick 1: both orders encounter transient errors (503 & AbortError timeout)
+        const tick1 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tick1.polled, 2);
+        assert.equal(tick1.failed, 0, 'Временные ошибки 503 и timeout НЕ должны переводить заказ в failed');
+        assert.equal(tick1.transientErrors, 2);
+        assert.equal(tick1.stillProcessing, 2);
+
+        const after503 = await OrderService.getOrderById('ord_s45_08_503');
+        const afterTimeout = await OrderService.getOrderById('ord_s45_08_timeout');
+        assert.equal(after503?.fulfillmentStatus, 'processing');
+        assert.equal(afterTimeout?.fulfillmentStatus, 'processing');
+        assert.ok(after503?.mystarsLastPolledAt);
+        assert.ok(afterTimeout?.mystarsLastPolledAt);
+        assert.ok(after503?.mystarsLastPollError);
+        assert.ok(afterTimeout?.mystarsLastPollError);
+
+        // Tick 2: API recovers -> both orders complete cleanly
+        simulateFailures = false;
+        const tick2 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(tick2.polled, 2);
+        assert.equal(tick2.completed, 2);
+
+        assert.equal((await OrderService.getOrderById('ord_s45_08_503'))?.fulfillmentStatus, 'completed');
+        assert.equal((await OrderService.getOrderById('ord_s45_08_timeout'))?.fulfillmentStatus, 'completed');
+      } finally {
+        myStarsClient.maxTransientGetRetries = prevRetries;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Временные ошибки HTTP 503 и сетевой таймаут сохраняют заказ в статусе processing с обновлением mystarsLastPolledAt и завершают его при следующем успешном тике.';
+    },
+  );
+
+  await runTest(
+    'S45-09',
+    'Fulfillment',
+    'Stage 4.5 (9/10): После перезапуска незавершённые заказы снова попадают в очередь и обрабатываются',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450109, username: 's45_09_buyer', first_name: 'S45Buyer9' };
+      await UserService.upsertFromTelegram(buyer);
+      const mockBot = createMockBot([]);
+
+      let completeAll = false;
+      const polledAfterRestart: string[] = [];
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_09_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        const match = req.url.match(/\/v1\/orders\/([^/?]+)/);
+        if (req.method === 'GET' && match) {
+          const extId = decodeURIComponent(match[1]);
+          if (completeAll) {
+            polledAfterRestart.push(extId);
+          }
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: extId,
+              status: completeAll ? 'completed' : 'awaiting_payment',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              ...(completeAll ? { purchase_tx: `tx_${extId}` } : {}),
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-09: ${req.method} ${req.url}`);
+      });
+
+      const prevBudget = FulfillmentService.pollBatchBudget;
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.pollBatchBudget = 3;
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const baseMs = Date.now() - 300_000;
+        for (let i = 1; i <= 5; i++) {
+          const ordId = `ord_s45_09_0${i}`;
+          const msId = `ms_s45_09_0${i}`;
+          await firestoreRepo.setDoc<Order>('orders', ordId, {
+            orderId: ordId,
+            userId: `tg_${buyer.id}`,
+            userTelegramId: buyer.id,
+            username: buyer.username,
+            recipientUsername: buyer.username,
+            productId: 'stars_custom',
+            productName: '100 Telegram Stars',
+            category: 'stars',
+            quantity: 100,
+            totalPriceUsdCents: 200,
+            totalPrice: 200,
+            currency: 'USD',
+            paymentMethod: 'balance',
+            paymentStatus: 'paid',
+            fulfillmentStatus: 'processing',
+            mystarsOrderId: msId,
+            createdAt: new Date(baseMs + i * 1000).toISOString(),
+            updatedAt: new Date(baseMs + i * 1000).toISOString(),
+          });
+        }
+
+        // Before restart: poll 3 of 5 orders (still awaiting_payment)
+        const beforeRestart = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(beforeRestart.polled, 3);
+        assert.equal(beforeRestart.stillProcessing, 3);
+
+        // Simulate process restart (clear all in-memory state + change workerInstanceId)
+        FulfillmentService.resetMyStarsPollingState();
+        FulfillmentService.workerInstanceId = 'worker_after_restart_s45_09';
+        completeAll = true;
+
+        // Tick 1 after restart via recoverPendingFulfillments: picks unpolled #4, #5 first + oldest #1
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.equal(polledAfterRestart[0], 'ms_s45_09_04');
+        assert.equal(polledAfterRestart[1], 'ms_s45_09_05');
+
+        // Tick 2 after restart: completes remaining processing orders
+        await FulfillmentService.recoverPendingFulfillments(mockBot);
+
+        for (let i = 1; i <= 5; i++) {
+          const ord = await OrderService.getOrderById(`ord_s45_09_0${i}`);
+          assert.equal(
+            ord?.fulfillmentStatus,
+            'completed',
+            `Незавершённый заказ ord_s45_09_0${i} должен быть восстановлен и завершён после рестарта`,
+          );
+        }
+      } finally {
+        FulfillmentService.pollBatchBudget = prevBudget;
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'После перезапуска процесса все незавершённые заказы в статусе processing извлекаются из Firestore и доводятся до completed без потери состояния.';
+    },
+  );
+
+  await runTest(
+    'S45-10',
+    'Fulfillment',
+    'Stage 4.5 (10/10): Повторное выполнение (duplicate fulfillment / double completion) одного и того же заказа невозможно',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const buyer = { id: 450110, username: 's45_10_buyer', first_name: 'S45Buyer10' };
+      await UserService.upsertFromTelegram(buyer);
+      const sentMessages: Array<{ chatId: number; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      let postOrdersCalls = 0;
+      let getOrdersCalls = 0;
+
+      myStarsClient.setCredentialsOverride({
+        apiBaseUrl: 'https://api.mystars.tg',
+        apiKey: 'ms_live_s45_10_key',
+        paymentCurrency: 'usdt_ton',
+      });
+      myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        if (req.method === 'POST' && req.url.endsWith('/v1/orders')) {
+          postOrdersCalls += 1;
+          throw new Error('Duplicate POST /v1/orders must never be called when mystarsOrderId already exists');
+        }
+        if (req.method === 'GET' && req.url.includes('/v1/orders/ms_s45_10_idem')) {
+          getOrdersCalls += 1;
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              order_id: 'ms_s45_10_idem',
+              status: 'completed',
+              type: 'stars',
+              recipient_username: buyer.username,
+              quantity: 100,
+              purchase_tx: 'tx_s45_10_unique',
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }
+        throw new Error(`Unexpected request in S45-10: ${req.method} ${req.url}`);
+      });
+
+      try {
+        FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        await FulfillmentService.resetMyStarsPollCheckpoint();
+
+        const nowIso = new Date().toISOString();
+        const ordId = 'ord_s45_10_idem';
+        await firestoreRepo.setDoc<Order>('orders', ordId, {
+          orderId: ordId,
+          userId: `tg_${buyer.id}`,
+          userTelegramId: buyer.id,
+          username: buyer.username,
+          recipientUsername: buyer.username,
+          productId: 'stars_custom',
+          productName: '100 Telegram Stars',
+          category: 'stars',
+          quantity: 100,
+          totalPriceUsdCents: 200,
+          totalPrice: 200,
+          currency: 'USD',
+          paymentMethod: 'balance',
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          fulfillmentProvider: 'mystars',
+          mystarsOrderId: 'ms_s45_10_idem',
+          externalExecutionReference: 'ms_s45_10_idem',
+          fulfillmentIdempotencyKey: `fulfill_${ordId}`,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        const snapshotBefore = (await OrderService.getOrderById(ordId))!;
+
+        // 1. Run pollMyStarsOrders, initiateFulfillment, and completeOrder concurrently & repeatedly
+        await Promise.all([
+          FulfillmentService.pollMyStarsOrders(mockBot),
+          FulfillmentService.pollMyStarsOrders(mockBot),
+          FulfillmentService.initiateFulfillment({ ...snapshotBefore }, mockBot),
+        ]);
+
+        // 2. Call pollMyStarsOrders and completeOrder again after completion
+        const pollAfterComplete = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(pollAfterComplete.polled, 0, 'Завершённый заказ не должен повторно попадать в polling');
+
+        const repeatComplete = await FulfillmentService.completeOrder({
+          orderId: ordId,
+          bot: mockBot,
+        });
+        assert.equal(repeatComplete.fulfillmentStatus, 'completed');
+        assert.equal(postOrdersCalls, 0, 'POST /v1/orders не должен вызываться повторно при наличии mystarsOrderId');
+        assert.ok(getOrdersCalls >= 1);
+
+        // Verify exactly 1 fulfillment_completed transaction record exists for this order
+        const allTxs = await firestoreRepo.listDocs<StoreTransaction>('transactions', 500);
+        const completedTxs = allTxs.filter(
+          (tx) => tx.orderId === ordId && tx.type === 'fulfillment_completed',
+        );
+        assert.equal(
+          completedTxs.length,
+          1,
+          'В коллекции transactions должна быть создана ровно 1 запись fulfillment_completed',
+        );
+
+        // Verify buyer received at most 1 completion message
+        const buyerCompletionMessages = sentMessages.filter((m) => m.chatId === buyer.id);
+        assert.equal(
+          buyerCompletionMessages.length,
+          1,
+          'Покупателю должно быть отправлено ровно 1 уведомление о выдаче заказа',
+        );
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetMyStarsPollingState();
+      }
+
+      return 'Повторная или конкурентная обработка заказа с mystarsOrderId никогда не вызывает повторный POST /v1/orders и создаёт ровно 1 транзакцию fulfillment_completed и 1 уведомление покупателю.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {

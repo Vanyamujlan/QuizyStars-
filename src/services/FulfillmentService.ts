@@ -109,6 +109,7 @@ export class FulfillmentService {
   private static checkpointLastError: string | null = null;
   private static checkpointConsecutiveFailures = 0;
   private static checkpointRetryAfterMs = 0;
+  private static justRepairedCorruptedCheckpoint = false;
   private static buyerPendingCursorOrderId: string | null = null;
   private static adminPendingCursorOrderId: string | null = null;
   private static adminPartialCursorOrderId: string | null = null;
@@ -474,6 +475,7 @@ export class FulfillmentService {
     this.checkpointLastError = null;
     this.checkpointConsecutiveFailures = 0;
     this.checkpointRetryAfterMs = 0;
+    this.justRepairedCorruptedCheckpoint = false;
     this.retainedProviderResults.clear();
     this.buyerPendingCursorOrderId = null;
     this.adminPendingCursorOrderId = null;
@@ -786,6 +788,7 @@ export class FulfillmentService {
         });
 
         if (repairResult.repaired && repairResult.repairedDoc) {
+          this.justRepairedCorruptedCheckpoint = true;
           this.updateLocalConfirmedCheckpoint(repairResult.repairedDoc, { force: true });
           this.clearCheckpointDegradedState();
           return null;
@@ -861,6 +864,7 @@ export class FulfillmentService {
   public static async resetMyStarsPollCheckpoint(): Promise<MyStarsPollCheckpoint> {
     this.pendingUnsavedCheckpoint = null;
     this.checkpointRetryAfterMs = 0;
+    this.justRepairedCorruptedCheckpoint = false;
     try {
       const resetDoc = await this.runCheckpointTransactionWithRetry<MyStarsPollCheckpoint>(
         'save',
@@ -3650,73 +3654,95 @@ export class FulfillmentService {
       }
 
       // 3. Stale 'processing' orders (crashed mid-call without external reference) and admin notifications
-      const processingOrders = await firestoreRepo.queryDocs<Order>('orders', {
-        where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
-        orderBy: { field: 'createdAt', direction: 'asc' },
-        limit: 50,
-      });
+      // Use bounded cursor pagination so >50 processing orders cannot starve stale reconciliation
+      const staleScanPageSize = Math.max(1, Math.min(this.pollPageSize, 100));
+      const maxStaleScanDocs = Math.max(staleScanPageSize * 3, 250);
+      let staleScanCursor: { value: string; id: string } | undefined = undefined;
+      let staleScannedCount = 0;
 
-      for (const ord of processingOrders) {
-        const startedMs = ord.fulfillmentStartedAt
-          ? Date.parse(ord.fulfillmentStartedAt)
-          : 0;
-        const isStale =
-          startedMs > 0 && nowMs - startedMs >= this.staleProcessingLeaseMs;
-
-        if (
-          !ord.externalExecutionReference &&
-          !ord.mystarsOrderId &&
-          isStale &&
-          (!ord.needsManualReconciliation || Boolean(ord.mystarsCreateInFlight))
-        ) {
-          try {
-            const reconciled = await this.reconcileStaleProcessingOrder(ord, bot);
-            adminNotifyAttemptedInPass.add(ord.orderId);
-            if (reconciled.fulfillmentStatus === 'completed') {
-              buyerNotifyAttemptedInPass.add(ord.orderId);
-            }
-            recovered.push(reconciled);
-          } catch (error) {
-            console.error(
-              `[FulfillmentService] Ошибка сверки зависшего заказа #${ord.orderId}:`,
-              error instanceof Error ? error.message : String(error),
-            );
-          }
-          continue;
+      while (staleScannedCount < maxStaleScanDocs) {
+        const processingPage: Order[] = await firestoreRepo.queryDocs<Order>('orders', {
+          where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
+          orderBy: { field: 'createdAt', direction: 'asc' },
+          limit: staleScanPageSize,
+          ...(staleScanCursor ? { startAfter: staleScanCursor } : {}),
+        });
+        if (processingPage.length === 0) {
+          break;
         }
 
-        const isActivelyDispatchingCreate =
-          !ord.mystarsOrderId &&
-          (Boolean(ord.mystarsCreateInFlight) ||
-            (!ord.externalExecutionReference &&
-              !ord.adminNotificationState &&
-              startedMs > 0 &&
-              !isStale));
+        for (const ord of processingPage) {
+          staleScannedCount += 1;
+          const startedMs = ord.fulfillmentStartedAt
+            ? Date.parse(ord.fulfillmentStartedAt)
+            : 0;
+          const isStale =
+            startedMs > 0 && nowMs - startedMs >= this.staleProcessingLeaseMs;
 
-        if (
-          !isActivelyDispatchingCreate &&
-          this.needsAdminNotificationRecovery(ord, nowMs)
-        ) {
-          adminNotifyAttemptedInPass.add(ord.orderId);
-          try {
-            const notified = await this.ensureAdminNotified(
-              ord,
-              bot,
-              false,
-              leaseOwnerOverride,
-            );
-            if (this.didAdminNotificationProgress(ord, notified)) {
-              recovered.push(notified);
-            }
-          } catch (error) {
-            console.error(
-              `[FulfillmentService] Ошибка восстановления уведомления админам для processing-заказа #${ord.orderId}:`,
-              redactSecretsFromText(
+          if (
+            !ord.externalExecutionReference &&
+            !ord.mystarsOrderId &&
+            isStale &&
+            (!ord.needsManualReconciliation || Boolean(ord.mystarsCreateInFlight))
+          ) {
+            try {
+              const reconciled = await this.reconcileStaleProcessingOrder(ord, bot);
+              adminNotifyAttemptedInPass.add(ord.orderId);
+              if (reconciled.fulfillmentStatus === 'completed') {
+                buyerNotifyAttemptedInPass.add(ord.orderId);
+              }
+              recovered.push(reconciled);
+            } catch (error) {
+              console.error(
+                `[FulfillmentService] Ошибка сверки зависшего заказа #${ord.orderId}:`,
                 error instanceof Error ? error.message : String(error),
-              ),
-            );
+              );
+            }
+            continue;
+          }
+
+          const isActivelyDispatchingCreate =
+            !ord.mystarsOrderId &&
+            (Boolean(ord.mystarsCreateInFlight) ||
+              (!ord.externalExecutionReference &&
+                !ord.adminNotificationState &&
+                startedMs > 0 &&
+                !isStale));
+
+          if (
+            !isActivelyDispatchingCreate &&
+            this.needsAdminNotificationRecovery(ord, nowMs)
+          ) {
+            adminNotifyAttemptedInPass.add(ord.orderId);
+            try {
+              const notified = await this.ensureAdminNotified(
+                ord,
+                bot,
+                false,
+                leaseOwnerOverride,
+              );
+              if (this.didAdminNotificationProgress(ord, notified)) {
+                recovered.push(notified);
+              }
+            } catch (error) {
+              console.error(
+                `[FulfillmentService] Ошибка восстановления уведомления админам для processing-заказа #${ord.orderId}:`,
+                redactSecretsFromText(
+                  error instanceof Error ? error.message : String(error),
+                ),
+              );
+            }
           }
         }
+
+        if (processingPage.length < staleScanPageSize) {
+          break;
+        }
+        const lastInStalePage: Order = processingPage[processingPage.length - 1];
+        staleScanCursor = {
+          value: lastInStalePage.createdAt,
+          id: lastInStalePage.orderId,
+        };
       }
 
       // 3b. Dedicated MyStars FaaS v1 Polling Pass (GET /v1/orders/{order_id})
@@ -3799,6 +3825,81 @@ export class FulfillmentService {
         this.isRecoveryPassRunning = false;
       }
     }
+  }
+
+  /**
+   * Strictly determines whether an Order in `processing` belongs to MyStars FaaS v1
+   * and is eligible for MyStars status polling (`GET /v1/orders/{order_id}`).
+   *
+   * Rejects:
+   * - Any order not in `fulfillmentStatus === 'processing'`
+   * - Gifts orders (`category === 'gifts'`)
+   * - Orders explicitly assigned to other fulfillment providers (`manual`, `fragment`)
+   * - Orders whose `externalExecutionReference` is a manual/fragment/other adapter token
+   *   or merely starts with `'ord_'` without confirmed MyStars ownership (`mystarsOrderId`,
+   *   `fulfillmentProvider === 'mystars'`, or `mystarsOrderStatus`).
+   */
+  public static isMyStarsPollingCandidate(ord: Order): boolean {
+    if (ord.fulfillmentStatus !== 'processing') {
+      return false;
+    }
+    if (ord.category === 'gifts' || ord.fulfillmentProvider === 'fragment') {
+      return false;
+    }
+
+    const explicitMyStarsId =
+      typeof ord.mystarsOrderId === 'string' ? ord.mystarsOrderId.trim() : '';
+    if (explicitMyStarsId.length > 0) {
+      return true;
+    }
+
+    if (ord.fulfillmentProvider === 'manual') {
+      return false;
+    }
+
+    const extRef =
+      typeof ord.externalExecutionReference === 'string'
+        ? ord.externalExecutionReference.trim()
+        : '';
+    if (!extRef || extRef === ord.orderId) {
+      return false;
+    }
+    if (
+      extRef.startsWith('manual_') ||
+      extRef.startsWith('fragment_') ||
+      extRef.includes(':')
+    ) {
+      return false;
+    }
+    if (extRef.startsWith('ms_')) {
+      return true;
+    }
+    if (
+      (ord.fulfillmentProvider === 'mystars' || Boolean(ord.mystarsOrderStatus)) &&
+      extRef.startsWith('ord_')
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Fair polling priority comparator:
+   * 1. Orders without `mystarsLastPolledAt` (0 -> never polled / legacy) come FIRST.
+   * 2. Orders with the oldest `mystarsLastPolledAt` timestamp come next.
+   * 3. Tie-breaker: `createdAt` ascending, then `orderId` ascending.
+   */
+  public static compareMyStarsPollPriority(a: Order, b: Order): number {
+    const aPolledMs = a.mystarsLastPolledAt ? Date.parse(a.mystarsLastPolledAt) || 0 : 0;
+    const bPolledMs = b.mystarsLastPolledAt ? Date.parse(b.mystarsLastPolledAt) || 0 : 0;
+    if (aPolledMs !== bPolledMs) {
+      return aPolledMs - bPolledMs;
+    }
+    const createdCmp = (a.createdAt || '').localeCompare(b.createdAt || '');
+    if (createdCmp !== 0) {
+      return createdCmp;
+    }
+    return a.orderId.localeCompare(b.orderId);
   }
 
   /**
@@ -3900,21 +4001,17 @@ export class FulfillmentService {
 
     // Persistent cursor-paginated fair polling over all 'processing' orders ordered by 'createdAt' ASC:
     // - Uses real Firestore `startAfter: { value: createdAt, id: orderId }` cursor pagination (never excludes
-    //   legacy docs without `mystarsLastPolledAt` and never stops at a hard 1000-order cap).
-    // - For small active queues (< pollPageSize on a single page from start), sorts globally with
-    //   legacy/unpolled orders prioritized first.
-    // - For large multi-page queues (>= pollPageSize, e.g. 1,500+ orders), advances a persistent Firestore
-    //   checkpoint (`settings/mystars_poll_cursor`) across ticks and restarts, wrapping cleanly at the tail
-    //   so 100% of active orders are fairly serviced with zero starvation.
+    //   legacy/new docs without `mystarsLastPolledAt` and never stops at a hard 50-order or 1000-order cap).
+    // - Strictly filters candidates via `isMyStarsPollingCandidate` so orders from other providers
+    //   ('manual', 'fragment', 'gifts', or non-MyStars 'ord_*' external references) are never polled.
+    // - Prioritizes unpolled orders (`mystarsLastPolledAt === undefined`) and least-recently-polled orders
+    //   (`mystarsLastPolledAt` oldest first) across both single-page and multi-page windows.
+    // - Advances a persistent Firestore checkpoint (`settings/mystars_poll_cursor`) across ticks and restarts,
+    //   wrapping cleanly at the tail so 100% of active orders are fairly serviced with zero starvation.
     const budget = Math.max(1, this.pollBatchBudget);
     const pageSize = Math.max(1, this.pollPageSize);
     const isMyStarsCandidate = (ord: Order): boolean =>
-      Boolean(
-        ord.mystarsOrderId ||
-          (ord.externalExecutionReference &&
-            (ord.externalExecutionReference.startsWith('ord_') ||
-              ord.externalExecutionReference.startsWith('ms_'))),
-      );
+      this.isMyStarsPollingCandidate(ord);
     const hasActiveExternalLease = (ord: Order, refMs: number): boolean => {
       if (this.inFlightMyStarsPollOrders.has(ord.orderId)) {
         return true;
@@ -3958,28 +4055,102 @@ export class FulfillmentService {
       ...(scanCursor ? { startAfter: scanCursor } : {}),
     });
 
+    const maxDocsToScan = Math.max(pageSize * 5, budget * 10);
+    const wasJustRepairedFromCorruptDoc = this.justRepairedCorruptedCheckpoint;
+    this.justRepairedCorruptedCheckpoint = false;
+    const hasAlreadyPolledInFirstPage =
+      !isMultiPageSweep &&
+      !wasJustRepairedFromCorruptDoc &&
+      firstPage.some((ord) => isMyStarsCandidate(ord) && Boolean(ord.mystarsLastPolledAt));
+
     if (!isMultiPageSweep && firstPage.length < pageSize) {
       // Entire active queue fits in one page -> globally sort with missing mystarsLastPolledAt first
       const candidates = firstPage
         .filter((ord) => isMyStarsCandidate(ord) && !hasActiveExternalLease(ord, nowMs))
-        .sort((a, b) => {
-          const aPolledMs = a.mystarsLastPolledAt ? Date.parse(a.mystarsLastPolledAt) || 0 : 0;
-          const bPolledMs = b.mystarsLastPolledAt ? Date.parse(b.mystarsLastPolledAt) || 0 : 0;
-          if (aPolledMs !== bPolledMs) {
-            return aPolledMs - bPolledMs;
-          }
-          return (a.createdAt || '').localeCompare(b.createdAt || '');
-        });
+        .sort((a, b) => this.compareMyStarsPollPriority(a, b));
       batchToPoll = candidates.slice(0, budget);
       for (const ord of batchToPoll) {
         orderCycleMap.set(ord.orderId, cyclesCompleted);
       }
       reachedTailOnLastScan = true;
-    } else {
+    } else if (!isMultiPageSweep && hasAlreadyPolledInFirstPage) {
+      // Multi-page or full-page queue at head where some head orders were already polled:
+      // Scan bounded pages up to maxDocsToScan so any unpolled (`mystarsLastPolledAt` missing)
+      // or older-polled orders on page 1..N are prioritized ahead of recently-polled head orders.
+      const windowCandidates: Order[] = [];
+      const visitedWindowIds = new Set<string>();
+      let windowScannedDocs = 0;
+      let windowCursor: { value: string; id: string } | undefined = undefined;
+      let windowPage = firstPage;
+      let windowPageIndex = 0;
+      let windowReachedTail = false;
+
+      while (windowScannedDocs < maxDocsToScan) {
+        if (windowPageIndex > 0) {
+          windowPage = await firestoreRepo.queryDocs<Order>('orders', {
+            where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
+            orderBy: { field: 'createdAt', direction: 'asc' },
+            limit: pageSize,
+            ...(windowCursor ? { startAfter: windowCursor } : {}),
+          });
+        }
+        windowPageIndex++;
+
+        if (windowPage.length === 0) {
+          windowReachedTail = true;
+          break;
+        }
+
+        for (const ord of windowPage) {
+          windowScannedDocs += 1;
+          if (visitedWindowIds.has(ord.orderId)) {
+            continue;
+          }
+          visitedWindowIds.add(ord.orderId);
+          if (isMyStarsCandidate(ord) && !hasActiveExternalLease(ord, Date.now())) {
+            windowCandidates.push(ord);
+          }
+        }
+
+        if (windowPage.length < pageSize) {
+          windowReachedTail = true;
+          break;
+        }
+
+        const lastInWindowPage = windowPage[windowPage.length - 1];
+        windowCursor = { value: lastInWindowPage.createdAt, id: lastInWindowPage.orderId };
+      }
+
+      const createdAtSlice = windowCandidates.slice(0, budget);
+      const prioritySortedSlice = [...windowCandidates]
+        .sort((a, b) => this.compareMyStarsPollPriority(a, b))
+        .slice(0, budget);
+      const isReorderedByPriority = prioritySortedSlice.some(
+        (ord, idx) => ord.orderId !== createdAtSlice[idx]?.orderId,
+      );
+
+      if (isReorderedByPriority || (windowReachedTail && windowCandidates.length <= budget)) {
+        batchToPoll = prioritySortedSlice;
+        for (const ord of batchToPoll) {
+          orderCycleMap.set(ord.orderId, cyclesCompleted);
+        }
+        isMultiPageSweep = true;
+        if (windowReachedTail) {
+          reachedTailOnLastScan = true;
+          cyclesCompleted += 1;
+          scanCursor = undefined;
+        } else if (batchToPoll.length > 0) {
+          reachedTailOnLastScan = false;
+          const lastPicked = batchToPoll[batchToPoll.length - 1];
+          scanCursor = { value: lastPicked.createdAt, id: lastPicked.orderId };
+        }
+      }
+    }
+
+    if (batchToPoll.length === 0 && (isMultiPageSweep || firstPage.length >= pageSize)) {
       // Large multi-page queue or resumed mid-sweep from persistent checkpoint
       isMultiPageSweep = true;
       const visitedOrderIds = new Set<string>();
-      const maxDocsToScan = Math.max(pageSize * 5, budget * 10);
       let scannedDocs = 0;
       let currentPage = firstPage;
       let pageIndex = 0;
